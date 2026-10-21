@@ -7,7 +7,9 @@ import { truncateUtf16 } from "./unicode-text.mjs";
 
 export const MAX_INDEX_CONTEXT_CHARS = 3_000;
 const MAX_INDEX_ITEM_CHARS = 1_800;
-const MAX_TOPIC_TRANSCRIPT_BYTES = 1024 * 1024;
+const MAX_TOPIC_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+const TOPIC_TRANSCRIPT_CHUNK_BYTES = 128 * 1024;
+const MAX_TOPIC_RECORD_BYTES = 256 * 1024;
 
 export function recallQuery(value) {
   return truncateUtf16(indexRequestText(cleanUserRequest(value))
@@ -29,34 +31,21 @@ function previousUserTopic(payload, currentQuery, deadline) {
     file = openSync(payload.transcript_path, "r");
     const stat = fstatSync(file);
     if (!stat.isFile()) return "";
-    const offset = Math.max(0, stat.size - MAX_TOPIC_TRANSCRIPT_BYTES);
-    if (offset) {
+    if (Date.now() + 250 >= deadline) return "";
+    {
       // 大きな履歴でも、別sessionのファイルを渡された場合は先頭の識別子で拒否する。
       const header = Buffer.alloc(Math.min(stat.size, 64 * 1024));
       const read = readSync(file, header, 0, header.length, 0);
       const end = header.subarray(0, read).indexOf(10);
-      if (end < 0) return "";
-      try {
-        const row = JSON.parse(header.subarray(0, end).toString("utf8"));
-        if (row.type === "session_meta" && row.payload?.id && row.payload.id !== payload.session_id) return "";
-      } catch { return ""; }
-    }
-    const buffer = Buffer.alloc(Math.min(stat.size, MAX_TOPIC_TRANSCRIPT_BYTES));
-    let read = 0;
-    while (read < buffer.length) {
-      if (Date.now() + 250 >= deadline) return "";
-      const count = readSync(file, buffer, read, buffer.length - read, offset + read);
-      if (!count) break;
-      read += count;
-    }
-    const data = buffer.subarray(0, read);
-    // 末尾の未完行と、tailの先頭に残る途中行を主題の根拠にしない。
-    const start = offset ? data.indexOf(10) + 1 : 0;
-    const end = data.lastIndexOf(10);
-    if (end < start) return "";
-    const records = data.subarray(start, end).toString("utf8").split("\n");
-    if (!offset) {
-      for (const entry of records.slice(0, 10)) {
+      // 従来の1MiB超の履歴では、壊れた先頭行も拒否する。小さい履歴の壊れた行は読み飛ばす。
+      if (stat.size > 1024 * 1024) {
+        if (end < 0) return "";
+        try {
+          const row = JSON.parse(header.subarray(0, end).toString("utf8"));
+          if (row.type === "session_meta" && row.payload?.id && row.payload.id !== payload.session_id) return "";
+        } catch { return ""; }
+      }
+      for (const entry of header.subarray(0, read).toString("utf8").split("\n").slice(0, 10)) {
         try {
           const row = JSON.parse(entry);
           if (row.type === "session_meta" && row.payload?.id && row.payload.id !== payload.session_id) return "";
@@ -64,24 +53,66 @@ function previousUserTopic(payload, currentQuery, deadline) {
       }
     }
     let users = 0;
-    for (let index = records.length - 1; index >= 0; index--) {
-      if (Date.now() + 250 >= deadline) return "";
+    let rejected = false;
+    const topicFromRecord = (entry) => {
       let row;
-      try { row = JSON.parse(records[index]); } catch { continue; }
-      if (row.type === "session_meta" && row.payload?.id && row.payload.id !== payload.session_id) return "";
+      try { row = JSON.parse(entry.toString("utf8")); } catch { return ""; }
+      if (row.type === "session_meta" && row.payload?.id && row.payload.id !== payload.session_id) { rejected = true; return ""; }
       const record = row.payload;
-      if (!record || typeof record !== "object") continue;
+      if (!record || typeof record !== "object") return "";
       let text;
       if (row.type === "event_msg" && record.type === "user_message" && typeof record.message === "string") text = record.message;
       else if (row.type === "response_item" && record.role === "user" && Array.isArray(record.content)) {
         text = record.content.filter((block) => block?.type === "input_text" && typeof block.text === "string").map((block) => block.text).join("\n");
       }
-      if (!text || /^\s*(?:Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)\b|<subagent_notification\b)/u.test(text)) continue;
+      if (!text || /^\s*(?:Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)\b|<subagent_notification\b)/u.test(text)) return "";
       const query = recallQuery(text);
-      if (!query) continue;
-      if (++users > 16) break;
-      if (query === currentQuery) continue;
+      if (!query) return "";
+      if (++users > 16) { rejected = true; return ""; }
+      if (query === currentQuery) return "";
       if (!/^[!/]/u.test(query) && recallTopicTerms(query).length) return query;
+      return "";
+    };
+    const buffer = Buffer.alloc(TOPIC_TRANSCRIPT_CHUNK_BYTES);
+    const lowerBound = Math.max(0, stat.size - MAX_TOPIC_TRANSCRIPT_BYTES);
+    let position = stat.size;
+    let pending = Buffer.alloc(0);
+    let completeEnd = false;
+    let oversized = false;
+    while (position > lowerBound) {
+      if (Date.now() + 250 >= deadline) return "";
+      const start = Math.max(lowerBound, position - buffer.length);
+      const length = position - start;
+      let read = 0;
+      while (read < length) {
+        if (Date.now() + 250 >= deadline) return "";
+        const count = readSync(file, buffer, read, length - read, start + read);
+        if (!count) return "";
+        read += count;
+      }
+      let end = length;
+      for (let index = length - 1; index >= -1; index--) {
+        if (index >= 0 && buffer[index] !== 10) continue;
+        if (Date.now() + 250 >= deadline) return "";
+        // UTF-8は改行で区切った完全な行だけ復号する。巨大な行は連結せず読み飛ばす。
+        if (completeEnd && !oversized) {
+          const segment = buffer.subarray(index + 1, end);
+          if (segment.length + pending.length > MAX_TOPIC_RECORD_BYTES) { pending = Buffer.alloc(0); oversized = true; }
+          else pending = Buffer.concat([segment, pending]);
+        }
+        if (index >= 0 || start === 0) {
+          if (completeEnd && !oversized) {
+            const topic = topicFromRecord(pending);
+            if (rejected) return "";
+            if (topic) return topic;
+          }
+          pending = Buffer.alloc(0);
+          oversized = false;
+          completeEnd = true;
+        }
+        end = index;
+      }
+      position = start;
     }
   } catch { /* 読めない履歴から主題を推測せず、継続指示の検索を省く。 */ }
   finally { if (file !== undefined) { try { closeSync(file); } catch { /* 読取失敗時も閉じる。 */ } } }

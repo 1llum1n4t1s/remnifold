@@ -1,4 +1,5 @@
 // 失敗条件: skill混入、capture ID/part変更、ACK再送、追問の主題誤認、改訂重複、来歴欠落、子プロセス停止漏れ。
+// 主題復元: 1MiBより前の主題消失、UTF-8/途中行の誤読、巨大行の保持、別session混入、8MiB/256KiB/期限の超過。
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -199,6 +200,56 @@ try {
     const before = metrics.searches;
     await hook("UserPromptSubmit", { prompt: "お願い", session_id: session, transcript_path: file, cwd: root });
     assert.equal(metrics.searches, before, "Repeated followups must still count toward the history bound");
+  });
+  await check("followup scans bounded chunks across large tool rows and UTF-8 boundaries", async () => {
+    const topic = "Realtime 音声翻訳";
+    const largeTool = { type: "response_item", payload: { role: "tool", content: "Kubernetes".repeat(130_000) } };
+    const file = await transcript("chunk-followup", [user(topic + " 語".repeat(40_000)), largeTool,
+      user(skill()), user("[$Kubernetes](thread://other-task)"), user("Message Type: MESSAGE\nKubernetes"),
+      user("<subagent_notification>Kubernetes</subagent_notification>"), user("お願い")]);
+    // 改行のない末尾は、たとえJSONとして読めても主題として採用しない。
+    await writeFile(file, await readFile(file, "utf8") + JSON.stringify(user("Kubernetes incomplete-tail-canary")));
+    const before = metrics.searches;
+    await hook("UserPromptSubmit", { prompt: "お願い", session_id: "chunk-followup", transcript_path: file, cwd: root });
+    assert.equal(metrics.searches, before + 1);
+    assert.ok(lastQuery.includes(topic) && !lastQuery.includes("Kubernetes") && !lastQuery.includes("\ufffd"));
+    await hook("UserPromptSubmit", { prompt: "お願い", session_id: "wrong-session", transcript_path: file, cwd: root });
+    assert.equal(metrics.searches, before + 1, "Header mismatch must reject even a recoverable topic");
+    return { topicBeyondBytes: Buffer.byteLength(JSON.stringify(largeTool)), maxScanBytes: 8 * 1024 * 1024, maxRowBytes: 256 * 1024 };
+  });
+  await check("followup byte and row limits reject unavailable topics and deadline stops scanning", async () => {
+    const tooOld = await transcript("too-old-followup", [user("SnowRunner truck settings"),
+      { type: "response_item", payload: { role: "tool", content: "x".repeat(9 * 1024 * 1024) } }, user("お願い")]);
+    const oversized = await transcript("oversized-followup", [user("SnowRunner " + "x".repeat(300 * 1024)), user("お願い")]);
+    const deadlineFile = await transcript("deadline-followup", [user("SnowRunner truck settings"),
+      { type: "response_item", payload: { role: "tool", content: "x".repeat(2 * 1024 * 1024) } }, user("お願い")]);
+    const runs = [];
+    for (const [session, file, forceDeadline] of [["too-old-followup", tooOld, false], ["oversized-followup", oversized, false], ["deadline-followup", deadlineFile, true]]) {
+      const receipt = join(home, `${session}-reads.json`);
+      const preload = join(home, `${session}-read-probe.mjs`);
+      // 実launcherの対象履歴だけを計測する。期限ケースは2chunk目のread後に時計を進める。
+      await writeFile(preload, `import fs from "node:fs"; import { syncBuiltinESMExports } from "node:module";
+const open = fs.openSync, read = fs.readSync, now = Date.now; const files = new Set();
+const metrics = { bytes: 0, reads: 0, maxRead: 0 };
+fs.openSync = function(path, ...args) { const fd = open.call(this, path, ...args); if (path === ${JSON.stringify(file)}) files.add(fd); return fd; };
+fs.readSync = function(fd, buffer, offset, length, position) { const count = read.call(this, fd, buffer, offset, length, position); if (files.has(fd)) { metrics.bytes += count; metrics.reads++; metrics.maxRead = Math.max(metrics.maxRead, length); } return count; };
+Date.now = () => now() + (${forceDeadline} && metrics.reads >= 3 ? 9000 : 0);
+syncBuiltinESMExports(); process.on("exit", () => fs.writeFileSync(${JSON.stringify(receipt)}, JSON.stringify(metrics)));
+`);
+      const before = metrics.searches;
+      const started = performance.now();
+      await run(["--import", pathToFileURL(preload).href, join(runtimeRoot, "scripts", "hook-launcher.mjs"), "UserPromptSubmit"],
+        { prompt: "お願い", session_id: session, transcript_path: file, cwd: root });
+      const elapsedMs = performance.now() - started;
+      assert.equal(metrics.searches, before);
+      const reads = JSON.parse(await readFile(receipt, "utf8"));
+      assert.ok(reads.bytes <= 8 * 1024 * 1024 + 64 * 1024);
+      assert.ok(reads.maxRead <= 128 * 1024);
+      assert.ok(elapsedMs < 9_000, "Bounded local scan must finish before the hook deadline");
+      if (forceDeadline) assert.equal(reads.reads, 3, "Elapsed hook deadline must stop further chunks");
+      runs.push({ session, ...reads, elapsedMs });
+    }
+    return { runs };
   });
   await check("automatic latest revisions preserve separate turns and parts; manual retains history", async () => {
     searchRows = [row("old"), row("latest", 1, 1, "2026-10-20T00:00:00Z"), row("other-turn", 2), row("other-part", 1, 2)];

@@ -1,5 +1,6 @@
 // 失敗条件を先に固定: 取得前の採点を取得後へ流用する、同点順・意味閾値・取得上限が変わる、
 // 自動/手動検索・最新capture・清書の検索語被覆が変わる、計測の組込みprototype変更が漏れる、子処理が停止しない。
+// 明示したプロジェクトの出典を見落とす、短いexcerptに無い主題語を失う、無関係な出典や自動想起まで広げる。
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -81,7 +82,19 @@ async function main() {
   const capped = Array.from({ length: 30 }, (_, i) => legacy(`bounded-${i}`));
   const spaces = Array.from({ length: 5 }, (_, i) => `space-${i}`);
   const many = spaces.flatMap((containerTag) => Array.from({ length: 20 }, (_, i) => legacy(`${containerTag}-${i}`, "alpha beta", { containerTag })));
+  const projectRows = [
+    indexed("old-release", "ReplaceTranslator release", { sm_project_id: "repo_replacetranslator__1234567890abcdef", sourceUpdatedAt: date }, { semanticSimilarity: 0.99 }),
+    indexed("wrong-project", "ReplaceTranslator instructions", { project: "another", sm_project_id: "repo_another__1234567890abcdef" }, { semanticSimilarity: 0.98 }),
+    indexed("recent-project", "依存更新", { project: "replacetranslator", sm_project_id: "repo_replacetranslator__1234567890abcdef", sourceUpdatedAt: "2026-10-21T00:00:00.000Z" },
+      { semanticSimilarity: 0.71, topics: ["ESLint", "Puppeteer"], searchExcerpt: "依存更新 ESLint Puppeteer" }),
+  ];
   const scenarios = [
+    { name: "manual-project-hydration-cap", rows: [
+      ...Array.from({ length: 25 }, (_, i) => ({ ...projectRows[0], id: `old-project-${i}` })), projectRows[2],
+    ], input: { query: "ReplaceTranslator", limit: 3 } },
+    { name: "manual-project-recency", rows: projectRows, input: { query: "ReplaceTranslator", limit: 3 } },
+    { name: "manual-project-topic", rows: projectRows, input: { query: "ReplaceTranslator 依存更新 ESLint Puppeteer", limit: 3 } },
+    { name: "automatic-project-isolation", rows: projectRows, input: { query: "ReplaceTranslator", automatic: true, limit: 3 } },
     { name: "automatic-ranking", rows: ranking, input: { query: "alpha beta", automatic: true, limit: 20 } },
     { name: "manual-ranking", rows: ranking, input: { query: "alpha beta", limit: 20 } },
     { name: "automatic-hydration", rows: hydration, input: { query: "alpha beta", automatic: true } },
@@ -161,6 +174,10 @@ async function main() {
     const current = await run(root, baseUrl);
     const find = (name) => current.find((scenario) => scenario.name === name);
     const ids = (name) => find(name).result.results.map((index) => index.id);
+    assert.equal(ids("manual-project-recency")[0], "recent-project");
+    assert.equal(ids("manual-project-hydration-cap")[0], "recent-project");
+    assert.equal(ids("manual-project-topic")[0], "recent-project");
+    assert.ok(!ids("automatic-project-isolation").includes("recent-project"));
     assert.ok(ids("automatic-ranking").includes("checkpoint"));
     assert.ok(ids("automatic-ranking").includes("uncovered"));
     assert.ok(!ids("automatic-ranking").includes("covered"));

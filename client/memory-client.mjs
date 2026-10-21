@@ -135,18 +135,23 @@ export function recallTopicTerms(query) {
     !AUTOMATIC_ACTION_WORDS.has(segment) && !AUTOMATIC_STOP_WORDS.has(segment) && !STOP_WORDS.has(segment)));
 }
 
-function matchingTerms(index, terms, withExcerpt = true) {
-  return matchingTopicTerms(`${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")} ${withExcerpt ? index.searchExcerpt || "" : ""}`, terms);
+function matchingTerms(index, terms, withExcerpt = true, project = "") {
+  return matchingTopicTerms(`${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")} ${project} ${withExcerpt ? index.searchExcerpt || "" : ""}`, terms);
 }
 
-function scoreSearchCandidates(candidates, terms, withIndexRelevance = false) {
+function scoreSearchCandidates(candidates, terms, withIndexRelevance = false, includeProject = false) {
   const totalWeight = terms.reduce((total, term) => total + Math.min(12, term.length), 0);
   const relevance = (matches) => matches.length
     ? matches.reduce((total, term) => total + Math.min(12, term.length), 0) / totalWeight : 0;
   return candidates.map((candidate) => {
-    const matches = terms.length ? matchingTerms(candidate.index, terms) : [];
+    const provenance = candidate.index.provenance;
+    // 明示検索の出典だけを手掛かりにし、自動想起の主題判定は広げない。
+    const project = includeProject ? provenance?.project || /^repo_(.+)__[a-f0-9]{16}$/i.exec(provenance?.projectId || "")?.[1] || "" : "";
+    const matches = terms.length ? matchingTerms(candidate.index, terms, true, project) : [];
+    const projectOnly = Boolean(project && terms.length && matchingTopicTerms(project, terms).length === terms.length);
     return { ...candidate, matches, relevance: relevance(matches),
-      ...(withIndexRelevance ? { indexRelevance: relevance(terms.length ? matchingTerms(candidate.index, terms, false) : []) } : {}) };
+      projectOnly,
+      ...(withIndexRelevance ? { indexRelevance: relevance(terms.length ? matchingTerms(candidate.index, terms, false, project) : []) } : {}) };
   });
 }
 
@@ -174,12 +179,17 @@ function latestCaptureRevisions(candidates) {
   return candidates.filter((candidate) => !revisionKeys.has(candidate) || latest.get(revisionKeys.get(candidate)) === candidate);
 }
 
+function compareProjectCandidates(a, b) {
+  return Number(b.projectOnly) - Number(a.projectOnly) || (a.projectOnly && b.projectOnly
+    ? String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || "")) : 0);
+}
+
 function rankForHydration(candidates, terms, settings, limit, automatic) {
-  let ranked = scoreSearchCandidates(candidates.filter(({ index }) => index.id && index.containerTag), terms)
+  let ranked = scoreSearchCandidates(candidates.filter(({ index }) => index.id && index.containerTag), terms, false, !automatic)
     .filter(({ row, relevance }) => row.metadata?.memoryIndex?.version !== 1 ||
       semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || relevance > 0);
   if (automatic) ranked = latestCaptureRevisions(ranked);
-  ranked.sort((a, b) => b.relevance - a.relevance ||
+  ranked.sort((a, b) => b.relevance - a.relevance || compareProjectCandidates(a, b) ||
     Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank);
   const hydrateLimit = Math.min(80, Math.max(20, Number(limit) * 8));
   return [...new Map(ranked.map((candidate) => [`${candidate.index.containerTag}:${candidate.index.id}`, candidate])).values()].slice(0, hydrateLimit);
@@ -188,13 +198,13 @@ function rankForHydration(candidates, terms, settings, limit, automatic) {
 function selectSearchDocuments(hydrated, terms, settings, limit, automatic) {
   if (automatic) hydrated = latestCaptureRevisions(hydrated);
   // 詳細取得で索引が変わるため、取得前の採点をここでは再利用しない。
-  const candidates = scoreSearchCandidates(hydrated, terms, true)
+  const candidates = scoreSearchCandidates(hydrated, terms, true, !automatic)
     .filter(({ row, index, relevance }) =>
       (semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || relevance > 0) &&
       (!automatic || index.recallable && relevance > 0));
   candidates.sort((a, b) => {
     const consolidationDifference = automatic ? Number(b.index.consolidation) - Number(a.index.consolidation) : 0;
-    return b.relevance - a.relevance || b.indexRelevance - a.indexRelevance || consolidationDifference ||
+    return b.relevance - a.relevance || compareProjectCandidates(a, b) || b.indexRelevance - a.indexRelevance || consolidationDifference ||
       Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
       String(b.index.consolidationCreatedAt || "").localeCompare(String(a.index.consolidationCreatedAt || "")) ||
       String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || ""));
