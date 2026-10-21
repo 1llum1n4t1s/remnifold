@@ -1,6 +1,6 @@
 {
   "name": "remnifold",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Self-hosted, topic-based memory for Codex on Cloudflare",
   "author": {
     "name": "Kagayoi",
