@@ -9,15 +9,15 @@ import { truncateUtf16 } from "../client/unicode-text.mjs";
 
 const EXPECTED_VECTOR_DIMENSIONS = 1_024;
 const EXPECTED_VECTOR_METRIC = "cosine";
-const DEFAULT_NAME = "kagayoi-memory";
-const LEGACY_RESOURCE_NAME = "cloudflare-supermemory";
+const DEFAULT_NAME = "remnifold";
+const LEGACY_RESOURCE_NAMES = ["kagayoi-memory", "cloudflare-supermemory"];
 const LOCATIONS = new Set(["weur", "eeur", "apac", "oc", "wnam", "enam"]);
 const JURISDICTIONS = new Set(["eu", "fedramp", "us"]);
 
 class SetupError extends Error {}
 
 function usage() {
-  return `Kagayoi Memory server setup
+  return `Remnifold server setup
 
 Usage:
   node scripts/setup-server.mjs [options]
@@ -25,6 +25,8 @@ Usage:
 The default mode performs authenticated, read-only discovery and prints a plan.
 Pass --apply to create or reuse resources, write server/wrangler.jsonc, apply
 migrations, set the Worker secret when supplied, and deploy.
+Without explicit names, reuse priority is remnifold, kagayoi-memory, then
+cloudflare-supermemory. Only create remnifold when no existing resource matches.
 
 Options:
   --apply                       Perform remote and local changes
@@ -34,14 +36,14 @@ Options:
   --location <hint>             D1 location: weur, eeur, apac, oc, wnam, enam
   --jurisdiction <value>        D1 jurisdiction: eu, fedramp, us
   --api-key-env <name>          Environment variable containing the API key
-                                (default: KAGAYOI_MEMORY_API_KEY)
+                                (default: REMNIFOLD_API_KEY)
   --base-url <https-url>        Endpoint to verify after deployment
   --profile <name>              Wrangler authentication profile
   --help                        Show this help
 
 Examples:
   node scripts/setup-server.mjs
-  $env:KAGAYOI_MEMORY_API_KEY = '<secret>'
+  $env:REMNIFOLD_API_KEY = '<secret>'
   node scripts/setup-server.mjs --apply --location apac
 `;
 }
@@ -61,7 +63,7 @@ export function parseArgs(args) {
     workerNameExplicit: false,
     databaseNameExplicit: false,
     vectorIndexNameExplicit: false,
-    apiKeyEnv: "KAGAYOI_MEMORY_API_KEY",
+    apiKeyEnv: "REMNIFOLD_API_KEY",
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -406,7 +408,8 @@ export async function runSetup(args, dependencies = {}) {
   const environment = dependencies.env ?? process.env;
   const apiKey = [
     environment[options.apiKeyEnv],
-    ...(options.apiKeyEnv === "KAGAYOI_MEMORY_API_KEY" ? [environment.CLOUDFLARE_MEMORY_API_KEY] : []),
+    ...(options.apiKeyEnv === "REMNIFOLD_API_KEY" ? [environment.KAGAYOI_MEMORY_API_KEY,
+      environment.SUPERMEMORY_CODEX_API_KEY, environment.CLOUDFLARE_MEMORY_API_KEY] : []),
   ].find((value) => typeof value === "string" && value.trim())?.trim();
   const context = {
     options,
@@ -428,21 +431,27 @@ export async function runSetup(args, dependencies = {}) {
   let vector = findVector(vectors, options.vectorIndexName);
   // 1.x利用者のD1とVectorizeは名称変更後も再利用し、保存済み記憶を分断しない。
   if (!d1 && !options.databaseNameExplicit && options.databaseName === DEFAULT_NAME) {
-    d1 = findD1(databases, LEGACY_RESOURCE_NAME);
-    if (d1) options.databaseName = LEGACY_RESOURCE_NAME;
+    for (const name of LEGACY_RESOURCE_NAMES) {
+      d1 = findD1(databases, name);
+      if (d1) { options.databaseName = name; break; }
+    }
   }
   if (!vector && !options.vectorIndexNameExplicit && options.vectorIndexName === DEFAULT_NAME) {
-    vector = findVector(vectors, LEGACY_RESOURCE_NAME);
-    if (vector) options.vectorIndexName = LEGACY_RESOURCE_NAME;
+    for (const name of LEGACY_RESOURCE_NAMES) {
+      vector = findVector(vectors, name);
+      if (vector) { options.vectorIndexName = name; break; }
+    }
   }
   if (vector) await inspectVector(context, options.vectorIndexName);
   let secret = await inspectSecret(context);
   if (!secret.verifiable && !options.workerNameExplicit && options.workerName === DEFAULT_NAME) {
     const currentWorkerName = options.workerName;
-    options.workerName = LEGACY_RESOURCE_NAME;
-    const legacySecret = await inspectSecret(context);
-    if (legacySecret.verifiable) secret = legacySecret;
-    else options.workerName = currentWorkerName;
+    for (const name of LEGACY_RESOURCE_NAMES) {
+      options.workerName = name;
+      const legacySecret = await inspectSecret(context);
+      if (legacySecret.verifiable) { secret = legacySecret; break; }
+    }
+    if (!secret.verifiable) options.workerName = currentWorkerName;
   }
 
   output(`D1 database: ${d1 ? "reuse" : "create"} ${options.databaseName}`);

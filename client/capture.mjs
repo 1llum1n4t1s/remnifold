@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { captureStage, markCaptureFailure, captureFailureMessage } from "./capture-diagnostics.mjs";
 import { api, loadConfig, getProjectContext, listJsonlFiles, readSessionMeta,
-  chooseCandidates, parseTaskTranscript, readTaskTitles, buildTurnDocuments, sanitizeText } from "./Import-KagayoiMemoryHistory.mjs";
+  chooseCandidates, parseTaskTranscript, readTaskTitles, buildTurnDocuments, sanitizeText } from "./Import-RemnifoldHistory.mjs";
 
 export async function findTranscript(payload, codexHome) {
   if (!payload.session_id) throw new Error("Missing session ID.");
@@ -46,7 +46,7 @@ function readReceiptUnion(...statePaths) {
   return receipts;
 }
 
-async function recordReceipt(statePath, legacyStatePath, customId) {
+async function recordReceipt(statePath, legacyStatePaths, customId) {
   // Node 24標準SQLiteを保存処理の短い排他だけに使い、送信済み記録の正本は既存JSONのまま保つ。
   const { DatabaseSync } = await import("node:sqlite");
   const databasePath = join(dirname(statePath), "capture-coordination.sqlite3");
@@ -60,7 +60,7 @@ async function recordReceipt(statePath, legacyStatePath, customId) {
     transactionOpen = true;
     database.prepare("UPDATE capture_mutex SET touched_at = ? WHERE id = 1").run(Date.now());
     // 初回の新形式書込みでも旧レシートを統合し、次回から旧turnが再送されないようにする。
-    const receipts = readReceiptUnion(statePath, legacyStatePath);
+    const receipts = readReceiptUnion(statePath, ...legacyStatePaths);
     receipts.add(customId);
     const temporary = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
     try {
@@ -92,12 +92,12 @@ export async function capture(payload, { codexHome = process.env.CODEX_HOME || j
   const title = sanitizeText(titles.get(candidate.meta.id) || "", [config.apiKey], { count: 0 });
   const documents = buildTurnDocuments(candidate, transcript, project, title);
   // 応答を確認した文書だけ記録する。中断後の再送も同じcustomIdなので上書き損失は起きない。
-  const stateDirectory = join(codexHome, "kagayoi-memory", "capture-state");
-  const legacyStateDirectory = join(codexHome, "cloudflare-memory", "capture-state");
+  const stateDirectory = join(codexHome, "remnifold", "capture-state");
   const stateId = createHash("sha256").update(`${config.baseUrl}:${project.containerTag}:${candidate.meta.id}`).digest("hex");
   const statePath = join(stateDirectory, `${stateId}.json`);
-  const legacyStatePath = join(legacyStateDirectory, `${stateId}.json`);
-  const receipts = readReceiptUnion(statePath, legacyStatePath);
+  const legacyStatePaths = ["kagayoi-memory", "cloudflare-memory"]
+    .map((name) => join(codexHome, name, "capture-state", `${stateId}.json`));
+  const receipts = readReceiptUnion(statePath, ...legacyStatePaths);
   const pending = documents.filter((document) => !receipts.has(document.customId));
   const started = Date.now();
   let saved = 0;
@@ -105,10 +105,9 @@ export async function capture(payload, { codexHome = process.env.CODEX_HOME || j
     if (Date.now() - started >= budgetMs) break;
     const result = await captureStage("transport", () => send ? send(document) : api(config, "/v3/documents", { method: "POST", body: document }));
     if (!result || typeof result.id !== "string" || !result.id) throw markCaptureFailure(new Error("Memory API did not acknowledge the document."), "acknowledgement");
-    receipts.add(document.customId);
     await captureStage("receipt-write", async () => {
       mkdirSync(stateDirectory, { recursive: true });
-      await recordReceipt(statePath, legacyStatePath, document.customId);
+      await recordReceipt(statePath, legacyStatePaths, document.customId);
     });
     saved += 1;
   }
@@ -120,7 +119,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const payload = await captureStage("payload", () => JSON.parse(readFileSync(0, "utf8")));
     const result = await capture(payload);
     if (result.saved || result.pending) process.stdout.write(JSON.stringify({
-      systemMessage: `Kagayoi Memory: saved ${result.saved} documents; pending ${result.pending}.`,
+      systemMessage: `Remnifold: saved ${result.saved} documents; pending ${result.pending}.`,
     }));
   } catch (error) {
     // 本文・接続設定・HTTP応答をログへ出さず、失敗は呼び出し元に通知する。

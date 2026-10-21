@@ -1,4 +1,4 @@
-# Kagayoi Memory
+# Remnifold
 
 A Codex plugin and self-hosted Cloudflare backend for recalling useful implementation history across project folders.
 
@@ -10,13 +10,13 @@ Use Node.js 24.18.0 or later in the 24 series, pnpm 11.4.0, a Codex installation
 
 ## Connect an existing server
 
-Clone this repository or download and extract the CI package. In Codex, open the repository or extracted plugin folder and ask: “Use plugin-creator to install this Kagayoi Memory plugin in my personal marketplace.” The installer should register the source, validate it, and run `codex plugin add kagayoi-memory@personal`. For updates, replace the local source with the newer checkout or extracted CI package, then ask Codex to refresh that source and reinstall it. Building a distributable from a source checkout is covered in [AGENTS.md](https://github.com/1llum1n4t1s/kagayoi-memory/blob/main/AGENTS.md#validation); the CI package is already built.
+Clone this repository or download and extract the CI package. In Codex, open the repository or extracted plugin folder and ask: “Use plugin-creator to install this Remnifold plugin in my personal marketplace.” The installer should register the source, validate it, and run `codex plugin add remnifold@personal`. For updates, replace the local source with the newer checkout or extracted CI package, then ask Codex to refresh that source and reinstall it. Building a distributable from a source checkout is covered in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#validation); the CI package is already built.
 
 ```powershell
 pwsh -NoProfile -File scripts/setup-client.ps1 -BaseUrl https://your-worker.example.workers.dev
 ```
 
-Enter the API key at the secure prompt if it is not already supplied. The script verifies an authenticated session before writing `kagayoi-memory.json` in the selected Codex home: `-CodexHome`, then `CODEX_HOME`, then the default `~/.codex`. Run Codex with the same home so it reads that connection. To update an existing connection, use `-Force`; unrelated settings are preserved. `KAGAYOI_MEMORY_API_URL` and `KAGAYOI_MEMORY_API_KEY` can supply process-level overrides.
+Enter the API key at the secure prompt if it is not already supplied. The script verifies an authenticated session before writing `remnifold.json` in the selected Codex home: `-CodexHome`, then `CODEX_HOME`, then the default `~/.codex`. Run Codex with the same home so it reads that connection. To update an existing connection, use `-Force`; unrelated settings are preserved. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` can supply process-level overrides.
 
 After installing the plugin, review and trust its four hooks in Codex, then start a new task. Run the plugin's `whoAmI` MCP tool to verify connectivity and space discovery. Installing a plugin alone does not trust its hooks.
 
@@ -28,7 +28,7 @@ pnpm -C server exec wrangler login
 node scripts/setup-server.mjs
 ```
 
-The default command performs read-only discovery and prints the proposed resources. To apply it, supply your chosen API key through the process environment `KAGAYOI_MEMORY_API_KEY`, then run:
+The default command performs read-only discovery and prints the proposed resources. To apply it, supply your chosen API key through the process environment `REMNIFOLD_API_KEY`, then run:
 
 ```powershell
 node scripts/setup-server.mjs --apply --location apac
@@ -45,13 +45,13 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 - Manual `add_memory` saves to the shared collection. To forget a record after reading it, call `add_memory` with `action: "forget"`, its `documentId`, and source `containerTag`; exact stored content remains supported for compatibility. An absolute `sourceFolder` or a single workspace root supplied by the MCP client adds provenance; an explicit `containerTag` overrides storage. The plugin never uses its installation folder as the user's project. `listSpaces` exposes physical spaces for compatibility and diagnostics.
 - Prompt recall searches across spaces by topic. Global search includes spaces beyond the old discovery limit; older servers use a compatibility path capped at 100 spaces and report when discovery is incomplete. Partial searches report unavailable spaces and document indexes while retaining successful results. The initial session event does not inject unrelated recent records.
 - Automatic context contains a title, description, section names, timestamps, and document IDs. A short matching original passage can expose details absent from an index; it remains historical source text to verify before reuse. Codex opens full records with `getDocument` when needed.
-- Recall defaults to at most three records. Set `maxMemories` in `kagayoi-memory.json` to an integer from 1 to 5 to change the limit for automatic recall and manual search; setup preserves an existing value when updating the connection. Automatic context is also limited to 3,000 UTF-16 code units, so fewer records may fit.
-- Automatic context omits unchanged indexes on later prompts when session and transcript information are available. Updated records can appear again, and compaction or clearing the context resets duplicate suppression. Local recall state stays under `kagayoi-memory/recall-state/` in the selected Codex home without copying conversation text; unavailable state leaves normal recall enabled. Query matching and state details are described in [DESIGN.md](https://github.com/1llum1n4t1s/kagayoi-memory/blob/main/DESIGN.md#recall).
+- Recall defaults to at most three records. Set `maxMemories` in `remnifold.json` to an integer from 1 to 5 to change the limit for automatic recall and manual search; setup preserves an existing value when updating the connection. Automatic context is also limited to 3,000 UTF-16 code units, so fewer records may fit.
+- Automatic context omits unchanged indexes on later prompts when session and transcript information are available. Updated records can appear again, and compaction or clearing the context resets duplicate suppression. Local recall state stays under `remnifold/recall-state/` in the selected Codex home without copying conversation text; unavailable state leaves normal recall enabled. Query matching and state details are described in [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md#recall).
 - The server checks projects daily at 03:00 JST. It asks Workers AI to create a consolidated checkpoint when a project has at least 20 unconsolidated records, or when it has unconsolidated records and three days have elapsed since the last successful checkpoint (before the first checkpoint, since the oldest pending record). On a project's first due run, the server automatically drains the entire existing backlog in successive bounded AI batches, so old records do not require a manual backfill command. Original records are retained and linked from the checkpoint. Older checkpoints are superseded, and changing or forgetting a source invalidates the checkpoint that depended on it.
 - Use the `consolidate_memory` MCP tool to advance the current workspace checkpoint by one batch immediately without waiting for the daily check. Pass `projectId` to target a known provenance ID, or `sourceFolder` when the MCP client does not provide exactly one workspace root. Each call handles at most 40 new records; repeat it if a larger backlog remains. Manual execution still requires at least one unconsolidated source record.
 - Automatic recall prefers a current checkpoint at equal topic relevance and avoids repeating originals covered by a selected checkpoint. Specific matching details absent from the checkpoint still expose their originals. Manual search continues to expose the original records.
 - Checkpoint content and metadata cannot be edited directly: updates return HTTP 409. Edit the original records and regenerate the checkpoint instead. Re-enrichment and deletion remain available.
-- Capture redacts the configured memory API key and common secret patterns, and retries unacknowledged records. Local capture state stays under `kagayoi-memory/capture-state/` in the selected Codex home.
+- Capture redacts the configured memory API key and common secret patterns, and retries unacknowledged records. Local capture state stays under `remnifold/capture-state/` in the selected Codex home.
 
 Capture failures include fixed `stage`, `cause`, and `action` codes without printing exception text or credentials. An `action=repair-required` result, such as `stage=receipt; cause=invalid`, requires repairing the corresponding local capture state; retries alone will keep failing. `action=retry-or-repair` retains the normal retry behavior while allowing a persistent connection or response problem to be investigated. To check API reachability separately, run this from the repository or extracted plugin folder:
 
@@ -73,10 +73,10 @@ The API key grants access to the records in one server installation. Use separat
 
 ## Upgrading from 1.x names
 
-Replace an installed 1.x `cloudflare-supermemory` plugin with `kagayoi-memory`. During this transition, the client retains compatibility readers for `supermemory.json` in the selected Codex home, `SUPERMEMORY_API_URL`, `SUPERMEMORY_CODEX_API_KEY`, and `CLOUDFLARE_MEMORY_API_KEY`. Run `scripts/setup-client.ps1` to migrate an existing connection to `kagayoi-memory.json` in that home, then use `KAGAYOI_MEMORY_API_URL`, `KAGAYOI_MEMORY_API_KEY`, and the `kagayoi-memory` plugin name for normal operation. For resource names left at their defaults, server setup prefers existing `kagayoi-memory` resources and falls back to a matching 1.x `cloudflare-supermemory` resource only when the current-name counterpart is absent; explicit names always win. Storage compatibility details are in [DESIGN.md](https://github.com/1llum1n4t1s/kagayoi-memory/blob/main/DESIGN.md#storage-and-provenance).
+Replace an installed `kagayoi-memory` or 1.x `cloudflare-supermemory` plugin with `remnifold`, enabling only the new plugin. The client reads `remnifold.json` first, then `kagayoi-memory.json` and `supermemory.json` in the selected Codex home. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` are the normal environment variables; the former `KAGAYOI_MEMORY_*`, `SUPERMEMORY_API_URL`, `SUPERMEMORY_CODEX_API_KEY`, and `CLOUDFLARE_MEMORY_API_KEY` readers remain for compatibility. Run `scripts/setup-client.ps1` to write the normal `remnifold.json` while keeping the previous files. Existing capture receipts and recall state remain readable from the former product folders. Server setup reuses resources named `remnifold`, then `kagayoi-memory`, then `cloudflare-supermemory`; explicit resource names always win. Renaming the plugin does not deploy a Worker or move a remote database. Existing document IDs, capture IDs, project provenance and persisted `sm_*` metadata remain unchanged. Storage compatibility details are in [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md#storage-and-provenance).
 
-Kagayoi Memory implements its own self-hosted API. It is independent of the hosted Supermemory service and does not read or modify Codex's built-in local memory files.
+Remnifold implements its own self-hosted API. It is independent of the hosted Supermemory service and does not read or modify Codex's built-in local memory files.
 
-For architecture and repository layout, see the repository's [DESIGN.md](https://github.com/1llum1n4t1s/kagayoi-memory/blob/main/DESIGN.md). Contributor constraints, validation, and packaging commands are in [AGENTS.md](https://github.com/1llum1n4t1s/kagayoi-memory/blob/main/AGENTS.md).
+For architecture and repository layout, see the repository's [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md). Contributor constraints, validation, and packaging commands are in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md).
 
 Licensed under the [MIT License](LICENSE).

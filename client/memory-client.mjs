@@ -3,9 +3,10 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
-import { CONFIG_FILE_NAME, LEGACY_CONFIG_FILE_NAME, getProjectContext, loadConfig } from "./Import-KagayoiMemoryHistory.mjs";
+import { CONFIG_FILE_NAME, LEGACY_CONFIG_FILE_NAMES, getProjectContext, loadConfig } from "./Import-RemnifoldHistory.mjs";
 import { documentIndex, formatIndexItem, matchingTopicTerms, publicIndex } from "./memory-index.mjs";
 import { truncateUtf16 } from "./unicode-text.mjs";
+import { projectDocumentContent } from "./request-projection.mjs";
 
 const hash = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
 const unique = (values) => [...new Set(values.filter((v) => typeof v === "string" && v.trim()).map((v) => v.trim()))];
@@ -16,16 +17,13 @@ function git(args, cwd) {
 
 export function readSettings(codexHome = process.env.CODEX_HOME || join(homedir(), ".codex")) {
   let config = {};
-  try {
-    config = JSON.parse(readFileSync(join(codexHome, CONFIG_FILE_NAME), "utf8"));
-    if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("invalid configuration");
-  }
-  catch {
+  for (const name of [CONFIG_FILE_NAME, ...LEGACY_CONFIG_FILE_NAMES]) {
     try {
-      config = JSON.parse(readFileSync(join(codexHome, LEGACY_CONFIG_FILE_NAME), "utf8"));
-      if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("invalid configuration");
-    }
-    catch { config = {}; /* 認証のエラーはAPI接続時に通知する。 */ }
+      const candidate = JSON.parse(readFileSync(join(codexHome, name), "utf8"));
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      config = candidate;
+      break;
+    } catch { /* 認証のエラーはAPI接続時に通知する。 */ }
   }
   return {
     codexHome,
@@ -65,12 +63,13 @@ export async function api(path, { body, method = body ? "POST" : "GET", timeoutM
   const response = await fetchImpl(`${config.baseUrl}${path}`, {
     method,
     redirect: "error",
+    // 既存サーバーのprovenance識別子との互換性を保つ。
     headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", "x-sm-source": "codex-kagayoi-memory" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) {
-    const error = new Error(`Kagayoi Memory API request failed (HTTP ${response.status})`);
+    const error = new Error(`Remnifold API request failed (HTTP ${response.status})`);
     error.status = response.status;
     if (response.status === 400) {
       const detail = await response.json().catch(() => null);
@@ -83,6 +82,8 @@ export async function api(path, { body, method = body ? "POST" : "GET", timeoutM
 
 const STOP_WORDS = new Set(["memory", "memories", "codex", "情報", "こと", "もの", "これ", "それ", "この", "その", "あの", "どの", "ここ", "そこ", "this", "that", "ため", "よう", "です", "ます", "ください", "する", "した", "して", "れる", "ある", "いる", "確認", "対応", "作業", "実装", "調査"]);
 const AUTOMATIC_STOP_WORDS = new Set(["修正", "改善", "最適化", "機能", "部分", "発見", "でき", "出来", "てい", "いた", "たら", "そう", "お願い", "お願いします", "please", "fix", "improve", "optimize", "optimization", "implement", "implementation", "investigate"]);
+const AUTOMATIC_ACTION_WORDS = new Set(["ので", "なので", "から", "ない", "時に", "とき", "って", "うん", "けど", "だけ", "まだ", "もう", "また", "同じ", "今回", "前回", "こちら", "それで", "続き", "続け", "再度", "問題", "チェック", "試行", "再試行", "発生", "検索", "調べ", "大丈夫", "再開", "実行", "結果", "原因", "みたい", "おかしい", "思う"]);
+const AUTOMATIC_CONTEXT_WORDS = new Set(["タイムアウト", "timeout", "入力", "エラー", "error", "動作", "現象", "状態", "必要", "とき", "場合", "発生", "問題", "チェック", "再試行", "過去", "最新", "履歴", "記憶", "全部", "全体", "内容", "情報", "日間", "ヶ月", "か月", "以前", "以降"]);
 const querySegmenter = new Intl.Segmenter("ja", { granularity: "word" });
 const SEARCH_CONCURRENCY = 8;
 function automaticSearchText(query) {
@@ -107,7 +108,7 @@ export function queryTerms(query, { automatic = false } = {}) {
   const words = [...querySegmenter.segment(query)].filter((segment) => segment.isWordLike &&
     !identifiers.some((identifier) => segment.index >= identifier.index && segment.index < identifier.index + identifier[0].length))
     .map((segment) => ({ value: segment.segment.toLowerCase(), index: segment.index, end: segment.index + segment.segment.length }));
-  const stopped = (value) => STOP_WORDS.has(value) || automatic && AUTOMATIC_STOP_WORDS.has(value);
+  const stopped = (value) => STOP_WORDS.has(value) || automatic && (AUTOMATIC_STOP_WORDS.has(value) || AUTOMATIC_ACTION_WORDS.has(value));
   const useful = words.filter(({ value }) => value.length >= 2 && !stopped(value));
   const japanese = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}ー]+$/u;
   const compounds = [];
@@ -125,15 +126,28 @@ export function queryTerms(query, { automatic = false } = {}) {
     .filter((value) => !stopped(value)).slice(0, 30);
 }
 
+// 継続指示や一般的な症状だけでは、別案件の履歴を選ぶ根拠にしない。
+export function recallTopicTerms(query) {
+  // 単語そのものを指定した検索と、状況報告だけの継続発話を区別する。
+  if (/^(?:timeout|タイムアウト)$/iu.test(query.trim())) return queryTerms(query, { automatic: true });
+  return queryTerms(query, { automatic: true }).filter((term) => !AUTOMATIC_CONTEXT_WORDS.has(term) && [...querySegmenter.segment(term)].some(({ segment, isWordLike }) =>
+    isWordLike && segment.length >= 2 && !/^\d+$/u.test(segment) && !AUTOMATIC_CONTEXT_WORDS.has(segment) &&
+    !AUTOMATIC_ACTION_WORDS.has(segment) && !AUTOMATIC_STOP_WORDS.has(segment) && !STOP_WORDS.has(segment)));
+}
+
 function matchingTerms(index, terms, withExcerpt = true) {
   return matchingTopicTerms(`${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")} ${withExcerpt ? index.searchExcerpt || "" : ""}`, terms);
 }
 
-function topicRelevance(index, terms, withExcerpt = true) {
-  if (!terms.length) return 0;
-  const matches = matchingTerms(index, terms, withExcerpt);
-  if (!matches.length) return 0;
-  return matches.reduce((total, term) => total + Math.min(12, term.length), 0) / terms.reduce((total, term) => total + Math.min(12, term.length), 0);
+function scoreSearchCandidates(candidates, terms, withIndexRelevance = false) {
+  const totalWeight = terms.reduce((total, term) => total + Math.min(12, term.length), 0);
+  const relevance = (matches) => matches.length
+    ? matches.reduce((total, term) => total + Math.min(12, term.length), 0) / totalWeight : 0;
+  return candidates.map((candidate) => {
+    const matches = terms.length ? matchingTerms(candidate.index, terms) : [];
+    return { ...candidate, matches, relevance: relevance(matches),
+      ...(withIndexRelevance ? { indexRelevance: relevance(terms.length ? matchingTerms(candidate.index, terms, false) : []) } : {}) };
+  });
 }
 
 function semanticEligible(row, minimumSimilarity) {
@@ -145,14 +159,70 @@ function lexicalEligible(row) {
   return typeof row.lexicalSimilarity === "number" && Number.isFinite(row.lexicalSimilarity);
 }
 
+function latestCaptureRevisions(candidates) {
+  const latest = new Map();
+  const revisionKeys = new Map();
+  for (const candidate of candidates) {
+    const index = candidate.index;
+    if (index.consolidation || !index.sessionId || !Number.isInteger(index.turn) || !Number.isInteger(index.part)) continue;
+    const key = JSON.stringify([index.provenance?.projectId || index.containerTag, index.sessionId, index.turn, index.part]);
+    revisionKeys.set(candidate, key);
+    const previous = latest.get(key);
+    const revision = (item) => [item.index.sourceUpdatedAt || "", item.index.createdAt || "", item.index.updatedAt || ""].join("\n");
+    if (!previous || revision(candidate) > revision(previous)) latest.set(key, candidate);
+  }
+  return candidates.filter((candidate) => !revisionKeys.has(candidate) || latest.get(revisionKeys.get(candidate)) === candidate);
+}
+
+function rankForHydration(candidates, terms, settings, limit, automatic) {
+  let ranked = scoreSearchCandidates(candidates.filter(({ index }) => index.id && index.containerTag), terms)
+    .filter(({ row, relevance }) => row.metadata?.memoryIndex?.version !== 1 ||
+      semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || relevance > 0);
+  if (automatic) ranked = latestCaptureRevisions(ranked);
+  ranked.sort((a, b) => b.relevance - a.relevance ||
+    Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank);
+  const hydrateLimit = Math.min(80, Math.max(20, Number(limit) * 8));
+  return [...new Map(ranked.map((candidate) => [`${candidate.index.containerTag}:${candidate.index.id}`, candidate])).values()].slice(0, hydrateLimit);
+}
+
+function selectSearchDocuments(hydrated, terms, settings, limit, automatic) {
+  if (automatic) hydrated = latestCaptureRevisions(hydrated);
+  // 詳細取得で索引が変わるため、取得前の採点をここでは再利用しない。
+  const candidates = scoreSearchCandidates(hydrated, terms, true)
+    .filter(({ row, index, relevance }) =>
+      (semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || relevance > 0) &&
+      (!automatic || index.recallable && relevance > 0));
+  candidates.sort((a, b) => {
+    const consolidationDifference = automatic ? Number(b.index.consolidation) - Number(a.index.consolidation) : 0;
+    return b.relevance - a.relevance || b.indexRelevance - a.indexRelevance || consolidationDifference ||
+      Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
+      String(b.index.consolidationCreatedAt || "").localeCompare(String(a.index.consolidationCreatedAt || "")) ||
+      String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || ""));
+  });
+  const selected = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const { index, matches } = candidate;
+    const key = `${index.containerTag}:${index.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // 最終選択済みの清書が検索語も覆うときだけ、同じ原文の重複を抑える。
+    if (automatic && !index.consolidation && selected.some((checkpoint) => checkpoint.index.consolidation &&
+      checkpoint.index.sourceMemoryIds.includes(index.id) && matches.every((term) => checkpoint.matches.includes(term)))) continue;
+    selected.push(candidate);
+    if (selected.length >= Math.min(20, Math.max(1, limit))) break;
+  }
+  return selected.map(({ index }) => index);
+}
+
 export async function discoverSearchContainers(request = api) {
   let response;
   try {
     response = await request("/v3/container-tags");
   } catch (error) {
-    throw new Error("Kagayoi Memory space discovery failed; global topic search was not performed", { cause: error });
+    throw new Error("Remnifold space discovery failed; global topic search was not performed", { cause: error });
   }
-  if (!Array.isArray(response?.spaces)) throw new Error("Kagayoi Memory space discovery returned an invalid response; global topic search was not performed");
+  if (!Array.isArray(response?.spaces)) throw new Error("Remnifold space discovery returned an invalid response; global topic search was not performed");
   const tags = unique(response.spaces.filter((space) => {
     if (!space || typeof space !== "object" || typeof space.containerTag !== "string") return false;
     return space.memoryCount === undefined || Number(space.memoryCount) > 0;
@@ -177,6 +247,8 @@ async function mapConcurrent(values, concurrency, task) {
 export async function searchIndex({ query = "", containerTag, cwd, settings = readSettings(), context, limit = settings.maxMemories, request = api, automatic = false } = {}) {
   query = typeof query === "string" ? truncateUtf16(query.trim(), 1_000) : "";
   if (automatic) query = automaticSearchText(query);
+  const terms = automatic ? recallTopicTerms(query) : queryTerms(query);
+  if (automatic && !terms.length) query = "";
   if (!query) return { query, containerTag: containerTag || null, searchScope: "none", searchedContainers: [], failedContainers: [], failedDocuments: [], spaceDiscoveryComplete: true, results: [], total: 0 };
   let globalResponse;
   if (!containerTag) {
@@ -208,19 +280,9 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
     return response.results.map((row, rank) => ({ row, rank, index: documentIndex(row, tag) }));
   });
   const failedTags = globalResponse ? [] : tags.filter((_, i) => results[i].status === "rejected");
-  if (tags.length && failedTags.length === tags.length) throw new Error("Kagayoi Memory search unavailable for all requested spaces");
-  const terms = queryTerms(query, { automatic });
-  const rawCandidates = results.flatMap((r) => r.status === "fulfilled" ? r.value : []).filter(({ row, index }) => {
-    if (!index.id || !index.containerTag) return false;
-    // indexOnly応答では旧文書の本文が無いため、関連度は詳細取得後に判定する。
-    if (row.metadata?.memoryIndex?.version !== 1) return true;
-    const relevance = topicRelevance(index, terms);
-    return semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || relevance > 0;
-  });
-  rawCandidates.sort((a, b) => topicRelevance(b.index, terms) - topicRelevance(a.index, terms) ||
-    Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank);
-  const hydrateLimit = Math.min(80, Math.max(20, Number(limit) * 8));
-  const distinct = [...new Map(rawCandidates.map((c) => [`${c.index.containerTag}:${c.index.id}`, c])).values()].slice(0, hydrateLimit);
+  if (tags.length && failedTags.length === tags.length) throw new Error("Remnifold search unavailable for all requested spaces");
+  // indexOnly応答の旧文書は、関連度がなくても詳細取得の候補に残す。
+  const distinct = rankForHydration(results.flatMap((r) => r.status === "fulfilled" ? r.value : []), terms, settings, limit, automatic);
   const failedDocuments = [];
   // 旧文書の検索excerptには見出しの直前に別話題が混ざる。索引metadataが無い場合は原文を確認してから入口を作る。
   const hydratedResults = await mapConcurrent(distinct, SEARCH_CONCURRENCY, async (candidate) => {
@@ -235,30 +297,7 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
     }
   });
   const hydrated = hydratedResults.filter((result) => result.status === "fulfilled").map((result) => result.value);
-  const eligible = hydrated.filter(({ row, index }) =>
-    semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || topicRelevance(index, terms) > 0);
-  const candidates = eligible.filter(({ index }) =>
-    !automatic || index.recallable && topicRelevance(index, terms) > 0);
-  candidates.sort((a, b) => {
-    const topicDifference = topicRelevance(b.index, terms) - topicRelevance(a.index, terms);
-    const indexDifference = topicRelevance(b.index, terms, false) - topicRelevance(a.index, terms, false);
-    const consolidationDifference = automatic ? Number(b.index.consolidation) - Number(a.index.consolidation) : 0;
-    return topicDifference || indexDifference || consolidationDifference || Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
-      String(b.index.consolidationCreatedAt || "").localeCompare(String(a.index.consolidationCreatedAt || "")) ||
-      String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || ""));
-  });
-  const documents = [];
-  const seen = new Set();
-  for (const { index } of candidates) {
-    const key = `${index.containerTag}:${index.id}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    // 最終選択済みの清書が検索語も覆うときだけ、同じ原文の重複を抑える。
-    if (automatic && !index.consolidation && documents.some((checkpoint) => checkpoint.consolidation &&
-      checkpoint.sourceMemoryIds.includes(index.id) && matchingTerms(index, terms).every((term) => matchingTerms(checkpoint, terms).includes(term)))) continue;
-    documents.push(index);
-    if (documents.length >= Math.min(20, Math.max(1, limit))) break;
-  }
+  const documents = selectSearchDocuments(hydrated, terms, settings, limit, automatic);
   return {
     query,
     containerTag: containerTag || null,
@@ -294,7 +333,7 @@ export async function listIndex({ containerTag, topic, page = 1, limit = 10, req
 }
 
 function sanitizedDocumentContent(document) {
-  const content = String(document.content || document.summary || "");
+  const content = projectDocumentContent(String(document.content || document.summary || ""));
   const metadata = document.metadata && typeof document.metadata === "object" ? document.metadata : {};
   if (metadata.captureVersion !== 2 || typeof metadata.title !== "string" ||
       typeof metadata.sessionId !== "string" || !Number.isInteger(metadata.turn)) return content;

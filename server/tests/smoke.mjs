@@ -9,7 +9,7 @@ import { runHook } from "../../client/memory-hooks.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const wrangler = join(root, "node_modules", "wrangler", "bin", "wrangler.js");
-const state = mkdtempSync(join(tmpdir(), "kagayoi-memory-test-"));
+const state = mkdtempSync(join(tmpdir(), "remnifold-test-"));
 const token = "sm_cf_test_only";
 const port = 8900 + (process.pid % 500);
 const baseUrl = `http://127.0.0.1:${port}`;
@@ -69,7 +69,7 @@ async function request(path, options = {}) {
 async function callMcp() {
   const child = spawn(process.execPath, [join(root, "..", "client", "mcp-server.mjs")], {
     cwd: root,
-    env: { ...process.env, KAGAYOI_MEMORY_API_URL: baseUrl, KAGAYOI_MEMORY_API_KEY: token },
+    env: { ...process.env, REMNIFOLD_API_URL: baseUrl, REMNIFOLD_API_KEY: token },
     stdio: ["pipe", "pipe", "inherit"],
   });
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -83,14 +83,14 @@ async function callMcp() {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
   }
   await stopChild(child);
-  assert.equal(responses.find((item) => item.id === 1)?.result?.serverInfo?.name, "kagayoi-memory");
+  assert.equal(responses.find((item) => item.id === 1)?.result?.serverInfo?.name, "remnifold");
   assert.ok(responses.find((item) => item.id === 2)?.result?.tools?.some((tool) => tool.name === "whoAmI"));
   assert.equal(responses.find((item) => item.id === 3)?.result?.isError, undefined);
 }
 
 let worker;
 try {
-  run(["d1", "migrations", "apply", "kagayoi-memory", "--local", "--persist-to", state]);
+  run(["d1", "migrations", "apply", "remnifold", "--local", "--persist-to", state]);
   worker = spawn(
     process.execPath,
     [
@@ -271,7 +271,7 @@ try {
   const update = await request("/v3/documents", {
     method: "POST",
     body: JSON.stringify({
-      content: "記憶データはKagayoi MemoryからCloudflare D1へ保存する",
+      content: "記憶データはRemnifoldからCloudflare D1へ保存する",
       containerTag,
       customId: "session-1",
       metadata: {
@@ -316,7 +316,7 @@ try {
   assert.equal(profile.status, 200);
   const profileBody = await profile.json();
   assert.equal(profileBody.searchResults.results.length, 1);
-  assert.match(profileBody.searchResults.results[0].memory, /Kagayoi MemoryからCloudflare D1/);
+  assert.match(profileBody.searchResults.results[0].memory, /RemnifoldからCloudflare D1/);
   assert.deepEqual(profileBody.searchResults.results[0].topics, ["Cloudflare D1", "データベース"]);
 
   const list = await request("/v3/documents/list", {
@@ -411,7 +411,7 @@ try {
 
   const forgotten = await request("/v4/memories", {
     method: "DELETE",
-    body: JSON.stringify({ containerTag, content: "記憶データはKagayoi MemoryからCloudflare D1へ保存する" }),
+    body: JSON.stringify({ containerTag, content: "記憶データはRemnifoldからCloudflare D1へ保存する" }),
   });
   assert.equal(forgotten.status, 200);
   const forgetSecond = await request("/v4/memories", {
@@ -454,7 +454,7 @@ try {
     recallHttpRequests: 1, fullSourcePreserved: true, capacity: { records: 50, sourceCharactersEach: longSource.length, legacyRecords: 25,
       responseBytes: Buffer.byteLength(capacityText), elapsedMs: performance.now() - capacityStarted, cloudflareProductionLatencyMeasured: false } }, null, 2)}\n`);
 
-  console.log("Kagayoi Memory smoke tests passed: auth, save/upsert, search, topics, list, graph, MCP, forget");
+  console.log("Remnifold smoke tests passed: auth, save/upsert, search, topics, list, graph, MCP, forget");
 } finally {
   await stopChild(worker);
   rmSync(state, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

@@ -4,13 +4,12 @@ import { isAbsolute } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { api, getReadContext, searchIndex, listIndex, listTopics, readDocument, formatSearchResult, discoverSearchContainers } from "./memory-client.mjs";
-import { DEFAULT_MEMORY_CONTAINER } from "./Import-KagayoiMemoryHistory.mjs";
+import { DEFAULT_MEMORY_CONTAINER } from "./Import-RemnifoldHistory.mjs";
 import { buildMemoryIndex } from "./memory-index.mjs";
 
 const SERVER_VERSION = JSON.parse(readFileSync(new URL("../.codex-plugin/plugin.json", import.meta.url), "utf8")).version;
 const PROTOCOL_VERSION = "2025-06-18";
 const RUNTIME_PLUGIN_ROOT = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
-const UNRESOLVED_CONTEXT = { containerTag: undefined, projectName: undefined, projectTags: [], sharedTags: [], readTags: [] };
 const pathKey = (value) => process.platform === "win32" ? value.toLowerCase() : value;
 
 const stringSchema = { type: "string", minLength: 1 };
@@ -25,7 +24,7 @@ const sourceFolderProperty = {
 const tools = [
   {
     name: "search_memory",
-    description: "Search concise memory indexes by topic across every nonempty Kagayoi Memory space, independent of the current work folder. Returns document IDs, source spaces and dates; use getDocument for details. An explicit containerTag restricts the search to that space.",
+    description: "Search concise memory indexes by topic across every nonempty Remnifold space, independent of the current work folder. Returns document IDs, source spaces and dates; use getDocument for details. An explicit containerTag restricts the search to that space.",
     inputSchema: {
       type: "object",
       properties: {
@@ -115,7 +114,7 @@ const tools = [
   },
   {
     name: "whoAmI",
-    description: "Show the active self-hosted Kagayoi Memory context. sourceFolder can identify the current workspace when client roots are unavailable.",
+    description: "Show the active self-hosted Remnifold context. sourceFolder can identify the current workspace when client roots are unavailable.",
     inputSchema: { type: "object", properties: { sourceFolder: sourceFolderProperty }, additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -156,7 +155,7 @@ export async function callTool(name, args, { request = api, context, settings, r
   if (name === "search_memory") {
     if (typeof args.query !== "string" || !args.query.trim() || args.query.length > 1_000) throw new Error("query must be a nonempty string of at most 1000 characters.");
     // 通常検索は全保存先を横断するため、作業場所を解決できなくても安全に実行できる。
-    const result = await searchIndex({ query: args.query, containerTag: explicitTag, context: explicitContext || UNRESOLVED_CONTEXT, request, settings });
+    const result = await searchIndex({ query: args.query, containerTag: explicitTag, request, settings });
     const structured = { ...result, ...(args.includeProfile === true ? { profile: { type: "space-index", containers: result.searchedContainers } } : {}) };
     return textResult(formatSearchResult(result), structured);
   }
@@ -293,7 +292,7 @@ let nextServerRequestId = 1;
 const pendingClientRequests = new Map();
 
 function requestClient(method, params, timeoutMs = 1_000) {
-  const id = `kagayoi-memory-${nextServerRequestId++}`;
+  const id = `remnifold-${nextServerRequestId++}`;
   return new Promise((resolveRequest, reject) => {
     const timeout = setTimeout(() => {
       pendingClientRequests.delete(id);
@@ -378,7 +377,7 @@ async function handle(message) {
       result = {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "kagayoi-memory", version: SERVER_VERSION },
+        serverInfo: { name: "remnifold", version: SERVER_VERSION },
       };
     } else if (message.method === "ping") {
       result = {};
@@ -398,7 +397,7 @@ async function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        content: [{ type: "text", text: error instanceof Error ? error.message : "Kagayoi Memory request failed" }],
+        content: [{ type: "text", text: error instanceof Error ? error.message : "Remnifold request failed" }],
         isError: true,
       },
     });

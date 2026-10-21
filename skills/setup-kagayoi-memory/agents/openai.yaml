@@ -1,4 +1,0 @@
-interface:
-  display_name: "Setup Kagayoi Memory"
-  short_description: "Connect Codex to your self-hosted memory server"
-  default_prompt: "Use $setup-kagayoi-memory to set up or verify my self-hosted Kagayoi Memory connection."

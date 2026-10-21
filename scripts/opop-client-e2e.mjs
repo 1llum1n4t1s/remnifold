@@ -1,27 +1,5 @@
 import * as cleanupFs from "node:fs";
-import * as cleanupPath from "node:path";
-
-// 許可rootの境界とリンクを検査してから標準APIへ渡す。
-function assertCleanupPath(target, allowedRoot) {
-  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
-  const resolved = cleanupPath.resolve(target);
-  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
-  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
-  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
-    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (cleanupPath.dirname(current) === current) break;
-  }
-  const pending = [resolved];
-  while (pending.length) {
-    const current = pending.pop();
-    let stat;
-    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
-    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
-  }
-  return resolved;
-}
+import { assertCleanupPath } from "./lib/cleanup.mjs";
 // 失敗条件を先に固定: 非object設定/入力による例外、旧設定fallback喪失、
 // 一部文書取得失敗の隠蔽、全成功/全失敗通知の変化、既読・順位・サイズ契約の変化、
 // PreToolUseでの不要なclient読込み、Stop診断/権限/秘密の漏れ。実データは使わない。
@@ -37,7 +15,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const baseline = process.argv.includes("--baseline");
 const artifact = join(root, "dist", "opop-client-validation.json");
-const fixture = await mkdtemp(join(tmpdir(), "kagayoi-opop-client-e2e-"));
+const fixture = await mkdtemp(join(tmpdir(), "remnifold-opop-client-e2e-"));
 const key = "fixture-opop-key-do-not-print";
 const marker = "fixture-sensitive-error-do-not-print";
 const checks = [];
@@ -65,8 +43,8 @@ function check(name, condition, detail = {}) {
   if (!baseline) assert.ok(condition, name);
 }
 async function run(event, input, home, extra = []) {
-  const env = { ...process.env, CODEX_HOME: home, NODE_NO_WARNINGS: "1", KAGAYOI_MEMORY_API_URL: `http://127.0.0.1:${server.address().port}`, KAGAYOI_MEMORY_API_KEY: key };
-  for (const name of ["SUPERMEMORY_API_URL", "SUPERMEMORY_CODEX_API_KEY", "CLOUDFLARE_MEMORY_API_KEY", "NODE_OPTIONS"]) delete env[name];
+  const env = { ...process.env, CODEX_HOME: home, NODE_NO_WARNINGS: "1", REMNIFOLD_API_URL: `http://127.0.0.1:${server.address().port}`, REMNIFOLD_API_KEY: key };
+  for (const name of ["KAGAYOI_MEMORY_API_URL", "KAGAYOI_MEMORY_API_KEY", "SUPERMEMORY_API_URL", "SUPERMEMORY_CODEX_API_KEY", "CLOUDFLARE_MEMORY_API_KEY", "NODE_OPTIONS"]) delete env[name];
   return new Promise((done, reject) => {
     const child = spawn(process.execPath, [...extra, join(root, "scripts", "hook-launcher.mjs"), event], { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
     children.add(child);
@@ -83,7 +61,7 @@ try {
   await new Promise((done, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", done); });
   const home = join(fixture, "home");
   await mkdir(home);
-  const current = join(home, "kagayoi-memory.json");
+  const current = join(home, "remnifold.json");
   const legacy = join(home, "supermemory.json");
   const settingsProbe = join(fixture, "settings-probe.mjs");
   await writeFile(settingsProbe, `import { readSettings } from ${JSON.stringify(pathToFileURL(join(root, "client", "memory-client.mjs")).href)}; console.log(JSON.stringify(readSettings(process.argv[2])));`);
@@ -119,23 +97,23 @@ try {
   check("partial hydration count is visible", context.includes("Incomplete search: 0 spaces and 1 document indexes were unavailable."));
   check("partial context preserves source and size", context.includes("good-index") && context.length <= 3000 && partial.code === 0 && partial.stderr === "");
   check("partial failure does not expose IDs or error/key", ![marker, key].some(secret => context.includes(secret)));
-  const statePath = join(home, "kagayoi-memory", "recall-state", `${createHash("sha256").update(payload.session_id).digest("hex")}.json`);
+  const statePath = join(home, "remnifold", "recall-state", `${createHash("sha256").update(payload.session_id).digest("hex")}.json`);
   const state = JSON.parse(await readFile(statePath, "utf8"));
   check("only selected document saved as read", Object.keys(state.documents).length === 1);
   const repeated = await run("UserPromptSubmit", payload, home);
-  check("read suppression keeps existing partial system message", JSON.parse(repeated.stdout).systemMessage === "◪ Kagayoi Memory のトピック索引検索は一部の保存先を取得できませんでした。");
+  check("read suppression keeps existing partial system message", JSON.parse(repeated.stdout).systemMessage === "◪ Remnifold のトピック索引検索は一部の保存先を取得できませんでした。");
   mode = "success";
   const success = await run("UserPromptSubmit", { prompt: "orchard" }, home);
   const completeContext = JSON.parse(success.stdout).hookSpecificOutput.additionalContext;
   check("successful recall has no failure annotation", success.code === 0 && success.stderr === "" && !/Incomplete search|Partial search/.test(completeContext));
   mode = "all-failed";
   const failure = await run("UserPromptSubmit", { prompt: "orchard" }, home);
-  check("all failed keeps existing system message", failure.code === 0 && failure.stderr === "" && JSON.parse(failure.stdout).systemMessage === "◪ Kagayoi Memory のトピック索引検索は一部の保存先を取得できませんでした。");
+  check("all failed keeps existing system message", failure.code === 0 && failure.stderr === "" && JSON.parse(failure.stdout).systemMessage === "◪ Remnifold のトピック索引検索は一部の保存先を取得できませんでした。");
   check("real transport uses authenticated global index search and raw document GET", requests.some(row => row.body?.allContainers && row.body.indexOnly) && requests.some(row => row.path.startsWith("/v3/documents/")));
   const loader = join(fixture, "module-probe.mjs");
   const loadedPath = join(fixture, "loaded.json");
   await writeFile(loader, `import { registerHooks } from "node:module"; import { writeFileSync } from "node:fs"; const loaded = []; registerHooks({ load(url, context, nextLoad) { const result = nextLoad(url, context); if (url.startsWith("file:")) loaded.push(url); return result; } }); process.on("exit", () => writeFileSync(${JSON.stringify(loadedPath)}, JSON.stringify(loaded)));`);
-  const permission = await run("PreToolUse", { tool_name: "mcp__kagayoi_memory__getDocument", tool_input: { id: "fixture" } }, home, ["--import", pathToFileURL(loader).href]);
+  const permission = await run("PreToolUse", { tool_name: "mcp__remnifold__getDocument", tool_input: { id: "fixture" } }, home, ["--import", pathToFileURL(loader).href]);
   check("trusted read-only tool permission preserved", permission.code === 0 && permission.stderr === "" && JSON.parse(permission.stdout).hookSpecificOutput.permissionDecision === "allow" && JSON.parse(permission.stdout).hookSpecificOutput.updatedInput.id === "fixture", { code: permission.code, diagnostic: permission.stderr.replaceAll(fixture, "<fixture>") });
   const files = JSON.parse(await readFile(loadedPath, "utf8"));
   const clientFiles = files.filter(url => url.includes("/client/"));
@@ -144,7 +122,7 @@ try {
   check("PreToolUse avoids client graph", clientFiles.length === 0);
   const unknown = await run("Unknown", {}, home, ["--import", pathToFileURL(loader).href]);
   check("unknown event avoids client graph", unknown.code === 0 && unknown.stdout === "" && unknown.stderr === "" && !JSON.parse(await readFile(loadedPath, "utf8")).some(url => url.includes("/client/")));
-  const writeTool = await run("PreToolUse", { tool_name: "mcp__kagayoi_memory__deleteDocument" }, home);
+  const writeTool = await run("PreToolUse", { tool_name: "mcp__remnifold__deleteDocument" }, home);
   check("write tool does not receive allow", writeTool.code === 0 && writeTool.stdout === "" && writeTool.stderr === "");
   const stop = await run("Stop", { session_id: "missing-transcript", transcript_path: join(home, "missing.jsonl") }, home);
   check("Stop retains fixed transcript failure classification", stop.code === 1 && stop.stdout === "" && stop.stderr.includes("[stage=transcript; cause=unavailable; action=repair-required]") && !stop.stderr.includes(home));

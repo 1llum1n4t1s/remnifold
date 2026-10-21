@@ -44,7 +44,7 @@ test("MCP初期化は実装済みprotocolとplugin manifestのversionを返す",
   const response = await exchange({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2099-01-01" } });
   assert.equal(response.result.protocolVersion, "2025-06-18");
   assert.equal(response.result.serverInfo.version, manifest.version);
-  assert.equal(response.result.serverInfo.name, "kagayoi-memory");
+  assert.equal(response.result.serverInfo.name, "remnifold");
 });
 
 test("tools/listは作業場所が必要なツールだけにsourceFolderを公開する", async () => {
@@ -202,6 +202,8 @@ test("roots対応クライアントでは単一のworkspace rootを遅延取得�
   const environment = {
     ...process.env,
     CODEX_HOME: codexHome,
+    REMNIFOLD_API_URL: "",
+    REMNIFOLD_API_KEY: "",
     KAGAYOI_MEMORY_API_URL: "",
     KAGAYOI_MEMORY_API_KEY: "",
   };
@@ -268,8 +270,8 @@ test("並行呼び出しはroots取得を共有し、取得中の更新後は全
   const environment = {
     ...process.env,
     CODEX_HOME: codexHome,
-    KAGAYOI_MEMORY_API_URL: baseUrl,
-    KAGAYOI_MEMORY_API_KEY: "concurrent-test-key",
+    REMNIFOLD_API_URL: baseUrl,
+    REMNIFOLD_API_KEY: "concurrent-test-key",
   };
 
   await new Promise((resolveTest, reject) => {

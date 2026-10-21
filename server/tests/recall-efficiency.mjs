@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import worker from "../src/index.ts";
 import { api as clientApi, searchIndex, listIndex, readDocument } from "../../client/memory-client.mjs";
-import { buildTurnDocuments, sanitizeText } from "../../client/Import-KagayoiMemoryHistory.mjs";
+import { buildTurnDocuments, sanitizeText } from "../../client/Import-RemnifoldHistory.mjs";
 import { runHook } from "../../client/memory-hooks.mjs";
 import { callTool } from "../../client/mcp-server.mjs";
 import { buildMemoryIndex } from "../../client/memory-index.mjs";
@@ -148,12 +148,12 @@ const ids = (result) => result.results.map((row) => row.id);
 const index = (title, request = title) => ({ memoryIndex: buildMemoryIndex({ title, request, sourceUpdatedAt: sourceDate }) });
 
 scenario("automatic project-path recall excludes machine prefixes and generic request noise", async (f) => {
-  const wanted = await f.seed("other-folder", "# Kagayoi Memory\n索引の読込", index("Kagayoi Memory", "索引の読込"));
+  const wanted = await f.seed("other-folder", "# Remnifold\n索引の読込", index("Remnifold", "索引の読込"));
   const noise = [];
   for (const [title, request] of [["Kagayoi.Support", String.raw`C:\Users\IMT\dev\Kagayoi.Support`], ["請求書", "修正してください"], ["Release", "Developer release"]]) {
     noise.push(await f.seed("unrelated-folder", `# ${title}\n${request}`, index(title, request)));
   }
-  f.reset(); const hook = await f.hook(String.raw`"C:\Users\IMT\dev\kagayoi-memory" メモリー機能側で修正で最適化が出来そうな部分が発見できていたら修正してください`);
+  f.reset(); const hook = await f.hook(String.raw`"C:\Users\IMT\dev\remnifold" メモリー機能側で修正で最適化が出来そうな部分が発見できていたら修正してください`);
   const text = hook.hookSpecificOutput?.additionalContext || "";
   assert.ok(text.includes(wanted)); assert.ok(noise.every((id) => !text.includes(id)));
   assert.equal(f.metrics.requests.length, 1);
@@ -175,12 +175,12 @@ scenario("ASCII word fragments stay out of automatic recall while manual semanti
   assert.ok(ids(versioned).includes(dotnet)); assert.ok(!ids(versioned).includes(wrongVersion));
 });
 scenario("file paths preserve the project without recalling another project README", async (f) => {
-  const wanted = await f.seed("other-folder", "# Kagayoi Memory\n索引の読込", index("Kagayoi Memory", "索引の読込"));
+  const wanted = await f.seed("other-folder", "# Remnifold\n索引の読込", index("Remnifold", "索引の読込"));
   const unrelated = await f.seed("other-project", "# README.md\nDocumentation changes", index("README.md"));
-  f.reset(); const result = await f.hook(String.raw`"C:\Users\IMT\dev\kagayoi-memory\client\memory-client.mjs" を修正してください`);
+  f.reset(); const result = await f.hook(String.raw`"C:\Users\IMT\dev\remnifold\client\memory-client.mjs" を修正してください`);
   const text = result.hookSpecificOutput?.additionalContext || "";
   assert.ok(text.includes(wanted)); assert.ok(!text.includes(unrelated));
-  assert.match(f.metrics.requests[0].body.q, /kagayoi-memory/u);
+  assert.match(f.metrics.requests[0].body.q, /remnifold/u);
   assert.doesNotMatch(f.metrics.requests[0].body.q, /Users|IMT|\bdev\b|memory-client/u);
   const support = await f.seed("support-folder", "# Kagayoi.Support\nSupport service", index("Kagayoi.Support"));
   const code = await f.seed("code-folder", "# Code\nCode samples", index("Code"));
@@ -190,10 +190,10 @@ scenario("file paths preserve the project without recalling another project READ
   }
 });
 scenario("legacy hydration uses the same identifier matching for the selected heading", async (f) => {
-  const wanted = await f.seed("legacy", "## Gardening\nFlower care\n\n## Kagayoi Memory\n索引の読込", { sm_project_id: "legacy-source", sourceTimestamp: sourceDate });
-  f.legacy(); f.reset(); const result = await f.search("kagayoi-memory", { automatic: true });
+  const wanted = await f.seed("legacy", "## Gardening\nFlower care\n\n## Remnifold\n索引の読込", { sm_project_id: "legacy-source", sourceTimestamp: sourceDate });
+  f.legacy(); f.reset(); const result = await f.search("remnifold", { automatic: true });
   const row = result.results.find((candidate) => candidate.id === wanted);
-  assert.ok(row); assert.equal(row.title, "Kagayoi Memory"); assert.doesNotMatch(row.description, /Flower/u);
+  assert.ok(row); assert.equal(row.title, "Remnifold"); assert.doesNotMatch(row.description, /Flower/u);
   assert.equal(row.provenance.projectId, "legacy-source"); assert.equal(row.sourceUpdatedAt, sourceDate);
   assert.ok(f.metrics.requests.some((request) => request.path === `/v3/documents/${wanted}`));
 });

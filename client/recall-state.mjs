@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const digest = (value) => createHash("sha256").update(value).digest("hex");
@@ -9,11 +9,13 @@ export function recallState(payload, codexHome, event) {
   if (!codexHome || typeof payload.session_id !== "string" || !payload.session_id.trim()) return null;
   // compact後の回復経路がない入力では、必要な索引を抑止しない。
   if (typeof payload.transcript_path !== "string" || !payload.transcript_path.trim()) return null;
-  const directory = join(codexHome, "kagayoi-memory", "recall-state");
+  const directory = join(codexHome, "remnifold", "recall-state");
   const path = join(directory, `${digest(payload.session_id)}.json`);
+  const readPath = [path, ...["kagayoi-memory", "cloudflare-memory"]
+    .map((name) => join(codexHome, name, "recall-state", `${digest(payload.session_id)}.json`))].find(existsSync);
   let state = { version: 1, documents: {}, offset: 0 };
   try {
-    try { state = JSON.parse(readFileSync(path, "utf8")); }
+    try { if (readPath) state = JSON.parse(readFileSync(readPath, "utf8")); }
     catch (error) { if (error.code !== "ENOENT") return null; }
     if (state.version !== 1 || !state.documents || typeof state.documents !== "object" || Array.isArray(state.documents)) return null;
     if ("remainder" in state) {

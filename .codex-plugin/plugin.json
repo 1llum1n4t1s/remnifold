@@ -1,5 +1,5 @@
 {
-  "name": "kagayoi-memory",
+  "name": "remnifold",
   "version": "1.0.7",
   "description": "Self-hosted, topic-based memory for Codex on Cloudflare",
   "author": {
@@ -8,7 +8,7 @@
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Kagayoi Memory",
+    "displayName": "Remnifold",
     "shortDescription": "Recall relevant work across projects from your own Cloudflare server.",
     "longDescription": "Save completed Codex work to a self-hosted Cloudflare Worker, recall concise indexes by topic across project folders, and open source records only when details are needed.",
     "developerName": "Kagayoi",

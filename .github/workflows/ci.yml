@@ -45,19 +45,19 @@ jobs:
         run: pnpm run package:plugin
 
       - name: Create plugin archive
-        run: tar -czf dist/kagayoi-memory.tar.gz -C dist kagayoi-memory
+        run: tar -czf dist/remnifold.tar.gz -C dist remnifold
 
       - name: Upload plugin archive
         uses: actions/upload-artifact@v7
         with:
-          name: kagayoi-memory
-          path: dist/kagayoi-memory.tar.gz
+          name: remnifold
+          path: dist/remnifold.tar.gz
           if-no-files-found: error
 
       - name: Upload reproducible validation results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kagayoi-memory-validation
+          name: remnifold-validation
           path: dist/*validation.json
           if-no-files-found: warn

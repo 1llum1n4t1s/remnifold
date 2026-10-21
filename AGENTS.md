@@ -1,6 +1,6 @@
 # Repository guidance
 
-This repository packages the Kagayoi Memory self-hosted Cloudflare server and its Codex plugin.
+This repository packages the Remnifold self-hosted Cloudflare server and its Codex plugin.
 
 - Keep `client/` compatible with Node.js 24 and avoid runtime dependencies unless they materially improve reliability.
 - Keep `server/` deployable with Wrangler. Never commit API keys, generated resource IDs, `.dev.vars`, or `.wrangler/` state.
@@ -27,6 +27,10 @@ node scripts/client-repair-e2e.mjs
 node scripts/capture-diagnostics-e2e.mjs
 node scripts/opop-client-e2e.mjs
 node scripts/recall-hook-e2e.mjs
+node scripts/memory-quality-e2e.mjs
+node scripts/remnifold-rename-e2e.mjs
+node scripts/loopback-connection-e2e.mjs
+node scripts/client-ranking-e2e.mjs
 pnpm -C server install --frozen-lockfile
 pnpm -C server check
 node scripts/validate-plugin.mjs
@@ -42,7 +46,7 @@ Server tests use local D1 and deterministic AI/vector fixtures. Provisioning tes
 
 `scripts/opop-client-e2e.mjs` checks invalid configuration and stdin roots, legacy settings fallback, partial document-fetch notifications, and event-specific hook imports through actual launcher processes and an authenticated loopback API. Inspect the checks and module-load counts in `dist/opop-client-validation.json`.
 
-`scripts/recall-hook-e2e.mjs` verifies current [recall contracts](DESIGN.md#recall) through actual hook subprocesses without depending on Git HEAD. It checks duplicate suppression, revisions, compaction, context-budget skipping and later recall, default and explicit recall counts through client setup, browser-state and structured-reply projection, legacy index repair without extra document fetches, and Git discovery counts. It writes `dist/recall-hook-validation.json` and runs with the script checks. Use `--runtime-root dist/kagayoi-memory` to check the packaged launcher; both subprocess waits and fixture cleanup must remain bounded and portable.
+`scripts/recall-hook-e2e.mjs` verifies current [recall contracts](DESIGN.md#recall) through actual hook subprocesses without depending on Git HEAD. It checks duplicate suppression, revisions, compaction, context-budget skipping and later recall, default and explicit recall counts through client setup, browser-state and structured-reply projection, legacy index repair without extra document fetches, and Git discovery counts. It writes `dist/recall-hook-validation.json` and runs with the script checks. Use `--runtime-root dist/remnifold` to check the packaged launcher; both subprocess waits and fixture cleanup must remain bounded and portable.
 
 When changing asynchronous enrichment, preserve revision guards and project-scoped fact relationships; validate stale topic/vector work and update/forget races in `server/tests/races.test.mjs`, plus the API coverage in `server/tests/smoke.mjs`. Vector changes must also cover bounded Vectorize lookups, forgotten-vector cleanup even when AI enrichment is disabled, and repair after late upserts or deletion races. Topic API changes must retain unclassified browsing and exact-topic filtering across legacy and shared spaces.
 
@@ -50,6 +54,12 @@ For recall changes, validate the [recall contracts](DESIGN.md#recall) through `s
 
 `server/tests/opop-performance.mjs` compares current and former display projections and ranking through authenticated Worker APIs on migration-backed SQLite. It verifies identical public JSON, stable ties, checkpoint selection, scopes, and retained semantic embeddings, and measures actual D1 row bytes and bounded ranking computation. It runs with server checks and writes `dist/opop-performance-validation.json`; its synthetic CPU timings do not measure deployed API latency.
 
+`server/tests/opop-projection-e2e.mjs` compares consolidation, profile fallback, enrichment retry, and PATCH reads against their former full-row queries through authenticated Worker APIs on migration-backed SQLite. Preserve Unicode and embedded-NUL behavior, excerpt suffixes, scope and order, consolidation and enrichment revision guards, and PATCH conflicts. It writes `dist/opop-projection-validation.json` and measures returned row bytes rather than deployed latency.
+
+`scripts/loopback-connection-e2e.mjs` verifies setup, MCP, Stop capture, and history import against an authenticated loopback fixture, including setup/runtime endpoint agreement and deterministic capture IDs. It writes `dist/loopback-connection-validation.json`; `REMNIFOLD_VALIDATION_DIR` selects an absolute external output directory for this check and the projection E2E.
+
+`scripts/client-ranking-e2e.mjs` verifies ranking, hydration, capture revisions, and checkpoint selection through the real client and an authenticated loopback API. It writes `dist/client-ranking-validation.json` and measures matching and normalization counts. `server/tests/structure-performance-e2e.mjs` verifies document projections, search, vector reconciliation, and enrichment through authenticated Worker APIs backed by migration-based SQLite. It writes `dist/structure-performance-validation.json` and measures repeated string, row lookup, and digest work. Both support `--comparison-root <repository>` for an exact pre-change source comparison and `REMNIFOLD_VALIDATION_DIR` for an absolute external artifact directory. Their operation counts do not measure deployed latency.
+
 Consolidation changes must preserve the [project consolidation contracts](DESIGN.md#project-consolidation). Cover them in `client/mcp-server.test.mjs`, `server/tests/races.test.mjs`, and the authenticated API path in `server/tests/smoke.mjs`. Validate truncated-output retry, publication races, stale checkpoint recovery, and enrichment/scheduled failure diagnostics in `server/tests/log-regressions.mjs`; inspect `dist/server-log-validation.json`. Both artifact-producing checks run as part of `pnpm -C server check`. Preserve both cron definitions in `server/wrangler.example.jsonc`, and apply migration `0005_memory_consolidations.sql` before installing a client that depends on consolidation.
 
-`pnpm run package:plugin` builds and validates `dist/kagayoi-memory`. CI runs the client, script, server, and plugin checks and uploads the package as an artifact; `git diff --check` remains a local check. Release tagging and publication are separate operations.
+`pnpm run package:plugin` builds and validates `dist/remnifold`. CI runs the client, script, server, and plugin checks and uploads the package as an artifact; `git diff --check` remains a local check. Release tagging and publication are separate operations.

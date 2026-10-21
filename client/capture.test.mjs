@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cleanUserRequest, parseTaskTranscript, buildTurnDocuments, readSessionMeta, getProjectContext } from "./Import-KagayoiMemoryHistory.mjs";
+import { cleanUserRequest, parseTaskTranscript, buildTurnDocuments, readSessionMeta, getProjectContext } from "./Import-RemnifoldHistory.mjs";
 import { capture, findTranscript } from "./capture.mjs";
 
 const user = (text, timestamp) => ({ ...(timestamp ? { timestamp } : {}), type: "response_item", payload: { role: "user", content: [{ type: "input_text", text }] } });
@@ -48,7 +48,7 @@ async function listen(t, handler) {
 
 function runHistoryImport(args) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(process.execPath, [fileURLToPath(new URL("./Import-KagayoiMemoryHistory.mjs", import.meta.url)), ...args], {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./Import-RemnifoldHistory.mjs", import.meta.url)), ...args], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -64,7 +64,7 @@ test("自動注入文を除き、同じメッセージ内の実要求は保持�
   assert.equal(cleanUserRequest("# AGENTS.md instructions\n\n<INSTRUCTIONS>legacy rules</INSTRUCTIONS>"), "");
   assert.equal(cleanUserRequest("# AGENTS.md instructions for C:\\test\n<INSTRUCTIONS>rules</INSTRUCTIONS>"), "");
   assert.equal(cleanUserRequest("<recommended_plugins>plugins</recommended_plugins>\n# AGENTS.md instructions for C:\\test\n<INSTRUCTIONS>rules</INSTRUCTIONS>\n<environment_context>env</environment_context>"), "");
-  for (const tag of ["recommended_plugins", "environment_context", "codex_internal_context", "supermemory-context", "supermemory-recall", "supermemory-index"]) {
+  for (const tag of ["recommended_plugins", "environment_context", "codex_internal_context", "remnifold-context", "remnifold-recall", "remnifold-index", "kagayoi-memory-context", "kagayoi-memory-recall", "kagayoi-memory-index", "supermemory-context", "supermemory-recall", "supermemory-index"]) {
     assert.equal(cleanUserRequest(`<${tag}>injected\nnoise</${tag}>\n直して`), "直して");
   }
   assert.equal(cleanUserRequest("## Referenced chats with Codex:\nwrapper\n## My request:\nタスクを探して"), "タスクを探して");
@@ -197,7 +197,7 @@ test("履歴importは全space一覧から旧containerの同じcaptureKeyを検�
       }));
     });
   });
-  writeFileSync(join(f.home, "kagayoi-memory.json"), JSON.stringify({ baseUrl, apiKey: "history-test-key" }));
+  writeFileSync(join(f.home, "remnifold.json"), JSON.stringify({ baseUrl, apiKey: "history-test-key" }));
   const result = await runHistoryImport(["--codex-home", f.home, "--include-recent", "--session-id", "task-a"]);
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(listBodies, [{ page: 1, limit: 50, projection: "capture" }]);
@@ -268,12 +268,12 @@ test("途中失敗後は成功分を保持して残りを送る", async (t) => {
 test("1.xの保存レシートを新しいturnと統合し、名称変更後も旧文書を再送しない", async (t) => {
   const f = fixture(t, [user("依頼"), assistant("結果")]);
   await capture(f.payload, { ...f.options, send: async (document) => ({ id: document.customId }) });
-  const currentDirectory = join(f.home, "kagayoi-memory", "capture-state");
+  const currentDirectory = join(f.home, "remnifold", "capture-state");
   const legacyDirectory = join(f.home, "cloudflare-memory", "capture-state");
   const receiptName = readdirSync(currentDirectory).find((name) => name.endsWith(".json"));
   mkdirSync(legacyDirectory, { recursive: true });
   writeFileSync(join(legacyDirectory, receiptName), readFileSync(join(currentDirectory, receiptName)));
-  rmSync(join(f.home, "kagayoi-memory"), { recursive: true, force: true });
+  rmSync(join(f.home, "remnifold"), { recursive: true, force: true });
   appendFileSync(f.path, [user("次の依頼"), assistant("次の結果")].map(JSON.stringify).join("\n") + "\n");
 
   const sent = [];
@@ -292,7 +292,7 @@ test("1.xの保存レシートを新しいturnと統合し、名称変更後も�
 test("レシート更新失敗でもSQLite transactionを解放して次回再試行できる", async (t) => {
   const f = fixture(t, [user("依頼"), assistant("結果")]);
   const project = getProjectContext(f.home);
-  const stateDirectory = join(f.home, "kagayoi-memory", "capture-state");
+  const stateDirectory = join(f.home, "remnifold", "capture-state");
   const stateId = createHash("sha256").update(`${f.options.config.baseUrl}:${project.containerTag}:${f.meta.id}`).digest("hex");
   const statePath = join(stateDirectory, `${stateId}.json`);
   await assert.rejects(capture(f.payload, { ...f.options, send: async (document) => {

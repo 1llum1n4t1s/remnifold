@@ -1,27 +1,5 @@
 import * as cleanupFs from "node:fs";
-import * as cleanupPath from "node:path";
-
-// 許可rootの境界とリンクを検査してから標準APIへ渡す。
-function assertCleanupPath(target, allowedRoot) {
-  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
-  const resolved = cleanupPath.resolve(target);
-  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
-  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
-  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
-    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (cleanupPath.dirname(current) === current) break;
-  }
-  const pending = [resolved];
-  while (pending.length) {
-    const current = pending.pop();
-    let stat;
-    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
-    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
-  }
-  return resolved;
-}
+import { assertCleanupPath } from "./lib/cleanup.mjs";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -33,7 +11,7 @@ import { parseArgs, runSetup } from "./setup-server.mjs";
 const API_KEY = "test-only-api-key-that-must-not-appear";
 
 async function fixture(existingConfig) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "kagayoi-memory-setup-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "remnifold-setup-"));
   const serverDir = path.join(root, "server");
   const wranglerBin = path.join(serverDir, "node_modules", "wrangler", "bin", "wrangler.js");
   await mkdir(path.dirname(wranglerBin), { recursive: true });
@@ -45,7 +23,7 @@ async function fixture(existingConfig) {
     path.join(serverDir, "wrangler.example.jsonc"),
     JSON.stringify({
       $schema: "./node_modules/wrangler/config-schema.json",
-      name: "kagayoi-memory",
+      name: "remnifold",
       main: "src/index.ts",
       compatibility_date: "2026-09-02",
       workers_dev: true,
@@ -70,8 +48,8 @@ function mockCloudflare(overrides = {}) {
     d1CreateCode: overrides.d1CreateCode ?? 0,
     vectorCreateCode: overrides.vectorCreateCode ?? 0,
     secretPutCode: overrides.secretPutCode ?? 0,
-    resourceName: overrides.resourceName ?? "kagayoi-memory",
-    workerName: overrides.workerName ?? "kagayoi-memory",
+    resourceName: overrides.resourceName ?? "remnifold",
+    workerName: overrides.workerName ?? "remnifold",
   };
   const calls = [];
   const runner = async ({ args, input }) => {
@@ -81,14 +59,14 @@ function mockCloudflare(overrides = {}) {
     if (command.startsWith("d1 list --json")) {
       return { code: 0, stdout: JSON.stringify(state.d1 ? [{ name: state.resourceName, uuid: state.d1 }] : []), stderr: "" };
     }
-    if (command.startsWith("d1 create kagayoi-memory")) {
+    if (command.startsWith("d1 create remnifold")) {
       state.d1 = state.d1 ?? "11111111-1111-1111-1111-111111111111";
       return { code: state.d1CreateCode, stdout: "created", stderr: state.d1CreateCode ? "already exists" : "" };
     }
     if (command.startsWith("vectorize list --json")) {
       return { code: 0, stdout: JSON.stringify(state.vector ? [{ name: state.resourceName }] : []), stderr: "" };
     }
-    if (command.startsWith("vectorize create kagayoi-memory")) {
+    if (command.startsWith("vectorize create remnifold")) {
       state.vector = state.vector ?? { dimensions: 1024, metric: "cosine" };
       return { code: state.vectorCreateCode, stdout: "{}", stderr: state.vectorCreateCode ? "already exists" : "" };
     }
@@ -114,7 +92,7 @@ function mockCloudflare(overrides = {}) {
     }
     if (command.startsWith("d1 migrations apply DB --remote")) return { code: 0, stdout: "migrated", stderr: "" };
     if (command.startsWith("deploy --minify")) {
-      return { code: 0, stdout: "Deployed https://kagayoi-memory.example.workers.dev", stderr: "" };
+      return { code: 0, stdout: "Deployed https://remnifold.example.workers.dev", stderr: "" };
     }
     throw new Error(`Unexpected mock Wrangler command: ${command}`);
   };
@@ -143,7 +121,7 @@ test("default dry run performs discovery without creating resources or writing c
   assert.equal(cloudflare.calls.some(({ args }) => args.includes("create") || args.includes("deploy")), false);
   await assert.rejects(readFile(path.join(files.serverDir, "wrangler.jsonc")), { code: "ENOENT" });
   assert.match(lines.join("\n"), /pass --apply/);
-  assert.match(lines.join("\n"), /set KAGAYOI_MEMORY_API_KEY/);
+  assert.match(lines.join("\n"), /set REMNIFOLD_API_KEY/);
 });
 
 test("apply creates missing resources, writes config, migrates, deploys, and verifies", async (t) => {
@@ -154,7 +132,7 @@ test("apply creates missing resources, writes config, migrates, deploys, and ver
   const requests = [];
   const result = await runSetup(["--apply", "--location", "apac"], {
     ...files,
-    env: { KAGAYOI_MEMORY_API_KEY: API_KEY },
+    env: { REMNIFOLD_API_KEY: API_KEY },
     runner: cloudflare.runner,
     output: (line) => lines.push(line),
     fetchImpl: async (url, init) => {
@@ -168,14 +146,14 @@ test("apply creates missing resources, writes config, migrates, deploys, and ver
   assert.equal(result.mode, "apply");
   const config = JSON.parse(await readFile(path.join(files.serverDir, "wrangler.jsonc"), "utf8"));
   assert.equal(config.d1_databases[0].database_id, "11111111-1111-1111-1111-111111111111");
-  assert.equal(config.vectorize[0].index_name, "kagayoi-memory");
+  assert.equal(config.vectorize[0].index_name, "remnifold");
   assert.equal("secrets" in config, false);
-  assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").includes("d1 create kagayoi-memory --location apac")));
+  assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").includes("d1 create remnifold --location apac")));
   assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").startsWith("d1 migrations apply DB --remote")));
   assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").startsWith("deploy --minify")));
   assert.deepEqual(requests, [
-    { url: "https://kagayoi-memory.example.workers.dev/health", authorization: undefined },
-    { url: "https://kagayoi-memory.example.workers.dev/v3/session", authorization: `Bearer ${API_KEY}` },
+    { url: "https://remnifold.example.workers.dev/health", authorization: undefined },
+    { url: "https://remnifold.example.workers.dev/v3/session", authorization: `Bearer ${API_KEY}` },
   ]);
   assert.doesNotMatch(lines.join("\n"), new RegExp(API_KEY));
 });
@@ -225,34 +203,36 @@ test("existing resources and secret are reused while custom config fields are pr
 });
 
 test("1.x resource names are reused instead of creating an empty replacement store", async (t) => {
-  const files = await fixture();
-  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
-  const cloudflare = mockCloudflare({
-    resourceName: "cloudflare-supermemory",
-    workerName: "cloudflare-supermemory",
-    d1: "44444444-4444-4444-4444-444444444444",
-    vector: { dimensions: 1024, metric: "cosine" },
-    secretVerifiable: true,
-    secretPresent: true,
-  });
+  for (const legacyName of ["kagayoi-memory", "cloudflare-supermemory"]) {
+    const files = await fixture();
+    t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
+    const cloudflare = mockCloudflare({
+      resourceName: legacyName,
+      workerName: legacyName,
+      d1: "44444444-4444-4444-4444-444444444444",
+      vector: { dimensions: 1024, metric: "cosine" },
+      secretVerifiable: true,
+      secretPresent: true,
+    });
 
-  await runSetup(["--apply"], {
-    ...files,
-    env: {},
-    runner: cloudflare.runner,
-    output: () => {},
-    fetchImpl: async () => ({ ok: true, status: 200 }),
-    nodeVersion: "24.0.0",
-  });
+    await runSetup(["--apply"], {
+      ...files,
+      env: {},
+      runner: cloudflare.runner,
+      output: () => {},
+      fetchImpl: async () => ({ ok: true, status: 200 }),
+      nodeVersion: "24.0.0",
+    });
 
-  const config = JSON.parse(await readFile(path.join(files.serverDir, "wrangler.jsonc"), "utf8"));
-  assert.equal(config.d1_databases[0].database_name, "cloudflare-supermemory");
-  assert.equal(config.vectorize[0].index_name, "cloudflare-supermemory");
-  assert.equal(config.name, "cloudflare-supermemory");
-  assert.equal(cloudflare.calls.some(({ args }) => args.includes("create")), false);
+    const config = JSON.parse(await readFile(path.join(files.serverDir, "wrangler.jsonc"), "utf8"));
+    assert.equal(config.d1_databases[0].database_name, legacyName);
+    assert.equal(config.vectorize[0].index_name, legacyName);
+    assert.equal(config.name, legacyName);
+    assert.equal(cloudflare.calls.some(({ args }) => args.includes("create")), false);
+  }
 });
 
-test("explicit Kagayoi Memory resource names are not replaced by discovered 1.x resources", async (t) => {
+test("explicit Remnifold resource names are not replaced by discovered 1.x resources", async (t) => {
   const files = await fixture();
   t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare({
@@ -266,9 +246,9 @@ test("explicit Kagayoi Memory resource names are not replaced by discovered 1.x 
 
   const lines = [];
   const result = await runSetup([
-    "--worker-name", "kagayoi-memory",
-    "--database-name", "kagayoi-memory",
-    "--vector-index-name", "kagayoi-memory",
+    "--worker-name", "remnifold",
+    "--database-name", "remnifold",
+    "--vector-index-name", "remnifold",
   ], {
     ...files,
     env: {},
@@ -280,8 +260,8 @@ test("explicit Kagayoi Memory resource names are not replaced by discovered 1.x 
   assert.equal(result.d1, false);
   assert.equal(result.vector, false);
   assert.equal(result.secret.verifiable, false);
-  assert.match(lines.join("\n"), /D1 database: create kagayoi-memory/);
-  assert.match(lines.join("\n"), /Vectorize index: create kagayoi-memory/);
+  assert.match(lines.join("\n"), /D1 database: create remnifold/);
+  assert.match(lines.join("\n"), /Vectorize index: create remnifold/);
 });
 
 test("apply fails before mutations when no existing or supplied Worker secret is available", async (t) => {
@@ -297,7 +277,7 @@ test("apply fails before mutations when no existing or supplied Worker secret is
       output: () => {},
       nodeVersion: "24.0.0",
     }),
-    /Set KAGAYOI_MEMORY_API_KEY/,
+    /Set REMNIFOLD_API_KEY/,
   );
   assert.equal(cloudflare.calls.some(({ args }) => args.includes("create") || args.includes("deploy")), false);
 });
@@ -313,7 +293,7 @@ test("an incompatible existing Vectorize index is rejected before changes", asyn
   await assert.rejects(
     runSetup(["--apply"], {
       ...files,
-      env: { KAGAYOI_MEMORY_API_KEY: API_KEY },
+      env: { REMNIFOLD_API_KEY: API_KEY },
       runner: cloudflare.runner,
       output: () => {},
       nodeVersion: "24.0.0",
@@ -349,7 +329,7 @@ test("a failed secret update never includes the secret value in the error", asyn
   try {
     await runSetup(["--apply"], {
       ...files,
-      env: { KAGAYOI_MEMORY_API_KEY: API_KEY },
+      env: { REMNIFOLD_API_KEY: API_KEY },
       runner: cloudflare.runner,
       output: () => {},
       sleep: async () => {},

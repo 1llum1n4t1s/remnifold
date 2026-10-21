@@ -1,27 +1,5 @@
 import * as cleanupFs from "node:fs";
-import * as cleanupPath from "node:path";
-
-// 許可rootの境界とリンクを検査してから標準APIへ渡す。
-function assertCleanupPath(target, allowedRoot) {
-  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
-  const resolved = cleanupPath.resolve(target);
-  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
-  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
-  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
-    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (cleanupPath.dirname(current) === current) break;
-  }
-  const pending = [resolved];
-  while (pending.length) {
-    const current = pending.pop();
-    let stat;
-    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
-    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
-  }
-  return resolved;
-}
+import { assertCleanupPath } from "./lib/cleanup.mjs";
 // 失敗条件を先に固定する: 短い設定キー漏れ、UTF-16境界破壊、旧ID変化、本文欠落、
 // 旧receipt/旧canonical再送、履歴stream全件同時生成、重複候補/sort/limitの変化、検索query破壊。
 // 実CLIと実hookだけをauthenticated loopback APIへ接続し、架空のfixtureだけを保存する。
@@ -36,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const phase = process.argv[2] || "after";
 if (!["before", "after"].includes(phase) || process.argv.length > 3) throw new Error("Usage: node scripts/client-repair-e2e.mjs [before|after]");
-const home = await mkdtemp(join(tmpdir(), "kagayoi-client-repair-e2e-"));
+const home = await mkdtemp(join(tmpdir(), "remnifold-client-repair-e2e-"));
 const artifact = join(root, "dist", `client-repair-${phase}-validation.json`);
 const checks = [], documents = [], searches = [];
 const check = (name, passed, details = {}) => checks.push({ name, passed, ...details });
@@ -85,7 +63,7 @@ function legacy(title, id, user, assistant, maxChars) {
 }
 try {
   await new Promise((done, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", done); });
-  environment = { ...process.env, CODEX_HOME: home, KAGAYOI_MEMORY_API_URL: `http://127.0.0.1:${server.address().port}`, KAGAYOI_MEMORY_API_KEY: configuredKey };
+  environment = { ...process.env, CODEX_HOME: home, REMNIFOLD_API_URL: `http://127.0.0.1:${server.address().port}`, REMNIFOLD_API_KEY: configuredKey };
   const sessions = join(home, "sessions");
   await mkdir(sessions);
   const id = "000-unicode", title = "T".repeat(199) + "😀𠮷 title";
@@ -102,7 +80,7 @@ try {
   await writeFile(join(home, "session_index.jsonl"), JSON.stringify({ id, thread_name: title }) + "\n");
   const observer = join(home, "observe-streams.mjs"), metrics = join(home, "streams.json");
   await writeFile(observer, `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';\nconst original = fs.createReadStream; let active = 0, maximum = 0, opened = 0;\nfs.createReadStream = function(...args) { const stream = original.apply(this,args); active++; opened++; maximum=Math.max(maximum,active); stream.once('close',()=>active--); if(process.env.FIXTURE_STREAM_FAILURE && opened===1) setImmediate(()=>stream.destroy(new Error('Fixture metadata stream failure'))); return stream; }; syncBuiltinESMExports();\nprocess.once('exit',()=>fs.writeFileSync(process.env.FIXTURE_STREAM_METRICS,JSON.stringify({active,maximum,opened})));\n`);
-  const historyArgs = [join(root, "client", "Import-KagayoiMemoryHistory.mjs"), "--codex-home", home, "--state-path", join(home, "history-state.json"), "--include-recent", "--root-only", "--limit", "1", "--max-document-chars", "10000", "--apply"];
+  const historyArgs = [join(root, "client", "Import-RemnifoldHistory.mjs"), "--codex-home", home, "--state-path", join(home, "history-state.json"), "--include-recent", "--root-only", "--limit", "1", "--max-document-chars", "10000", "--apply"];
   const first = await run(["--import", pathToFileURL(observer).href, ...historyArgs], { env: { ...environment, FIXTURE_STREAM_METRICS: metrics } });
   check("actual history CLI succeeds", first.code === 0, { stderr: first.stderr });
   if (first.code !== 0) throw new Error("History CLI failed");
@@ -127,7 +105,7 @@ try {
   await transcript(join(asciiHome, "sessions", "ascii.jsonl"), asciiId, asciiUser, asciiAssistant);
   await writeFile(join(asciiHome, "session_index.jsonl"), JSON.stringify({ id: asciiId, thread_name: asciiTitle }) + "\n");
   const beforeAscii = documents.length;
-  const ascii = await run([join(root, "client", "Import-KagayoiMemoryHistory.mjs"), "--codex-home", asciiHome, "--state-path", join(asciiHome, "state.json"), "--include-recent", "--max-document-chars", "10000", "--apply"]);
+  const ascii = await run([join(root, "client", "Import-RemnifoldHistory.mjs"), "--codex-home", asciiHome, "--state-path", join(asciiHome, "state.json"), "--include-recent", "--max-document-chars", "10000", "--apply"]);
   const asciiDocuments = documents.slice(beforeAscii);
   check("ASCII output and every old ID remain identical", ascii.code === 0 && asciiDocuments.length === asciiExpected.ids.length && asciiDocuments.every((doc, index) => doc.customId === asciiExpected.ids[index] && doc.content === `# ${asciiTitle}\n\n${asciiExpected.body.slice(index * asciiExpected.width, (index + 1) * asciiExpected.width)}`));
   const stopPath = join(home, "stop-unicode.jsonl"), stopId = "stop-unicode";
@@ -147,7 +125,7 @@ try {
   const receiptHome = join(home, "old-receipts");
   await mkdir(join(receiptHome, "cloudflare-memory", "capture-state"), { recursive: true });
   await writeFile(join(receiptHome, "session_index.jsonl"), JSON.stringify({ id: stopId, thread_name: title }) + "\n");
-  const receiptName = (await readdir(join(home, "kagayoi-memory", "capture-state"))).find((name) => name.endsWith(".json"));
+  const receiptName = (await readdir(join(home, "remnifold", "capture-state"))).find((name) => name.endsWith(".json"));
   await writeFile(join(receiptHome, "cloudflare-memory", "capture-state", receiptName), JSON.stringify(stopExpected.ids));
   const oldReceipt = await run(stopArgs, { stdin: payload, env: { ...environment, CODEX_HOME: receiptHome } });
   check("old JSON receipts suppress Unicode resend", oldReceipt.code === 0 && documents.length === beforeStop + stoppedDocuments.length);
@@ -159,20 +137,20 @@ try {
     await transcript(shortPath, shortId, `ordinary text ${key} with preserved discussion`, `answer uses ${key} and preserved result`);
     await writeFile(join(shortHome, "session_index.jsonl"), JSON.stringify({ id: shortId, thread_name: `ordinary ${key} title` }) + "\n");
     const count = documents.length;
-    const result = await run(stopArgs, { stdin: { session_id: shortId, transcript_path: shortPath, cwd: root }, env: { ...environment, CODEX_HOME: shortHome, KAGAYOI_MEMORY_API_KEY: key } });
+    const result = await run(stopArgs, { stdin: { session_id: shortId, transcript_path: shortPath, cwd: root }, env: { ...environment, CODEX_HOME: shortHome, REMNIFOLD_API_KEY: key } });
     const doc = documents[count];
     check(`configured key length ${key.length} redacted in ordinary content and title`, result.code === 0 && Boolean(doc) && !doc.content.includes(key) && !doc.metadata.title.includes(key) && doc.content.includes("preserved discussion") && doc.content.includes("[REDACTED]"));
     const unsafeId = legacy(`ordinary ${key} title`, shortId, `ordinary text ${key} with preserved discussion`, `answer uses ${key} and preserved result`, 120000).ids[0];
     check(`redaction changes unsafe prior identity for key length ${key.length}`, Boolean(doc) && doc.customId !== unsafeId);
   }
-  configuredKey = environment.KAGAYOI_MEMORY_API_KEY;
+  configuredKey = environment.REMNIFOLD_API_KEY;
   searchRows = [{ id: "unicode-index", containerTag: "memories", metadata: { memoryIndex: { version: 1, title: "recall " + "t".repeat(92) + "😀 title", description: "recall " + "d".repeat(151) + "𠮷 description", recallable: true } } }];
   const recalled = await run([join(root, "scripts", "hook-launcher.mjs"), "UserPromptSubmit"], { stdin: { session_id: "recall-unicode", cwd: root, prompt: "recall " + "r".repeat(992) + "😀 remaining" } });
   const recalledContext = recalled.stdout ? JSON.parse(recalled.stdout).hookSpecificOutput?.additionalContext : "";
   check("actual recall query and formatted index remain well formed", recalled.code === 0 && searches.length > 0 && searches.at(-1).q.isWellFormed() && Boolean(recalledContext) && recalledContext.isWellFormed(), { queryLength: searches.at(-1)?.q.length, contextLength: recalledContext?.length });
   // 隣接callerも本物のAPI transportを使用する。hookでの先行切断による見逃しを防ぐ。
   const { searchIndex, api } = await import("../client/memory-client.mjs");
-  await searchIndex({ query: "recall " + "r".repeat(992) + "😀 tail", settings: { maxMemories: 5, minimumSimilarity: 0.7 }, request: (path, options) => api(path, { ...options, config: { baseUrl: environment.KAGAYOI_MEMORY_API_URL, apiKey: configuredKey } }) });
+  await searchIndex({ query: "recall " + "r".repeat(992) + "😀 tail", settings: { maxMemories: 5, minimumSimilarity: 0.7 }, request: (path, options) => api(path, { ...options, config: { baseUrl: environment.REMNIFOLD_API_URL, apiKey: configuredKey } }) });
   check("direct search query preserves UTF-16 boundary", searches.at(-1).q.isWellFormed() && searches.at(-1).q.length <= 1000);
   const { runSetup } = await import("./setup-server.mjs");
   const fixtureServer = join(home, "setup-server");
@@ -182,10 +160,10 @@ try {
   const dummyWrangler = join(fixtureServer, "dummy-wrangler.mjs");
   await writeFile(dummyWrangler, "// Never executed\n");
   let setupError;
-  try { await runSetup([], { serverDir: fixtureServer, wranglerBin: dummyWrangler, env: { KAGAYOI_MEMORY_API_KEY: configuredKey }, output: () => {}, runner: async () => ({ code: 1, stderr: "x".repeat(1999) + "😀tail", stdout: "" }) }); }
+  try { await runSetup([], { serverDir: fixtureServer, wranglerBin: dummyWrangler, env: { REMNIFOLD_API_KEY: configuredKey }, output: () => {}, runner: async () => ({ code: 1, stderr: "x".repeat(1999) + "😀tail", stdout: "" }) }); }
   catch (error) { setupError = error; }
   check("setup diagnostic caller preserves UTF-16 boundary", Boolean(setupError) && setupError.message.isWellFormed() && setupError.message.includes("x".repeat(1999)) && !setupError.message.includes("tail"));
-  const sourceHashes = Object.fromEntries(await Promise.all(["client/Import-KagayoiMemoryHistory.mjs", "client/memory-index.mjs", "client/memory-hooks.mjs", "client/unicode-text.mjs", "client/memory-client.mjs", "scripts/setup-server.mjs", "scripts/client-repair-e2e.mjs"].map(async (path) => [path, hash(await readFile(join(root, path)))])));
+  const sourceHashes = Object.fromEntries(await Promise.all(["client/Import-RemnifoldHistory.mjs", "client/memory-index.mjs", "client/memory-hooks.mjs", "client/unicode-text.mjs", "client/memory-client.mjs", "scripts/setup-server.mjs", "scripts/client-repair-e2e.mjs"].map(async (path) => [path, hash(await readFile(join(root, path)))])));
   report = { phase, command: `node scripts/client-repair-e2e.mjs ${phase}`, node: process.version, sourceHashes, transports: ["actual history CLI -> authenticated loopback API", "actual Stop/UserPromptSubmit -> authenticated loopback API"], checks, passed: checks.every(({ passed }) => passed) };
 } catch (error) { report = { phase, checks, passed: false, error: error.message }; }
 finally {

@@ -12,7 +12,7 @@ export async function showStatus() {
     catch { /* 一覧取得の失敗は状態行で明示する。 */ }
   }
   process.stdout.write([
-    "Kagayoi Memory status",
+    "Remnifold status",
     `API reachability: ${connected ? "connected" : "unavailable"}`,
     "Storage: configured Cloudflare D1",
     "Default storage container: memories",

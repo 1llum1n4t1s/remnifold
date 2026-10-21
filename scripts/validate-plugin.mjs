@@ -1,9 +1,8 @@
 import { access, lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { collectPackageFiles, isAllowedPackagePath, REPOSITORY_ROOT } from "./package-plugin.mjs";
 
-const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const EXPECTED_HOOKS = new Set(["PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"]);
 const TEXT_EXTENSIONS = new Set([".js", ".json", ".jsonc", ".md", ".mjs", ".ps1", ".sql", ".ts", ".yaml", ".yml"]);
 
@@ -46,7 +45,6 @@ async function listFiles(root, relativeDirectory = "") {
   for (const entry of entries) {
     const relativePath = path.posix.join(relativeDirectory.replaceAll("\\", "/"), entry.name);
     if (entry.isDirectory()) files.push(...await listFiles(root, relativePath));
-    else if (entry.isFile()) files.push(relativePath);
     else files.push(relativePath);
   }
   return files;
@@ -55,6 +53,7 @@ async function listFiles(root, relativeDirectory = "") {
 function validatePluginManifest(plugin, errors) {
   if (!plugin || typeof plugin !== "object") return;
   if (!/^[a-z0-9-]+$/u.test(plugin.name ?? "")) errors.push(".codex-plugin/plugin.json: name must be lowercase kebab-case");
+  if (plugin.name !== "remnifold") errors.push(".codex-plugin/plugin.json: name must be remnifold");
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(plugin.version ?? "")) errors.push(".codex-plugin/plugin.json: version must be SemVer");
   for (const field of ["description", "skills", "mcpServers"]) {
     if (typeof plugin[field] !== "string" || !plugin[field].trim()) errors.push(`.codex-plugin/plugin.json: ${field} is required`);
@@ -62,10 +61,12 @@ function validatePluginManifest(plugin, errors) {
   if (typeof plugin.interface?.displayName !== "string" || typeof plugin.interface?.shortDescription !== "string") {
     errors.push(".codex-plugin/plugin.json: interface displayName and shortDescription are required");
   }
+  if (plugin.interface?.displayName !== "Remnifold") errors.push(".codex-plugin/plugin.json: interface displayName must be Remnifold");
 }
 
 function validateMcpManifest(mcp, errors) {
   const servers = mcp?.mcpServers;
+  if (servers && (Object.keys(servers).length !== 1 || !servers.remnifold)) errors.push(".mcp.json: the MCP server namespace must be remnifold");
   if (!servers || typeof servers !== "object" || Array.isArray(servers) || !Object.keys(servers).length) {
     errors.push(".mcp.json: at least one MCP server is required");
     return;
@@ -213,7 +214,7 @@ export async function validatePlugin(root = REPOSITORY_ROOT) {
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  const target = process.argv[2] ? path.resolve(process.argv[2]) : path.dirname(path.dirname(SCRIPT_PATH));
+  const target = process.argv[2] ? path.resolve(process.argv[2]) : REPOSITORY_ROOT;
   try {
     const result = await validatePlugin(target);
     process.stdout.write(`Validated ${result.filesChecked} packaged files in ${result.root}\n`);

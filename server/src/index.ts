@@ -11,23 +11,9 @@ const MAX_TOPICS_PER_MEMORY = 5;
 const MAX_TOPIC_LENGTH = 80;
 const UNCLASSIFIED_TOPIC = "__unclassified__";
 const MAX_EMBEDDING_CONTENT_LENGTH = 60_000;
-const MAX_FACT_CONTENT_LENGTH = 24_000;
-const MAX_D1_VECTOR_SCAN = 200;
 const MAX_VECTOR_GET_IDS = 20;
-const MAX_VECTOR_DELETE_REPAIR_ATTEMPTS = 3;
-const MAX_FORGOTTEN_VECTOR_SCAN = 100;
-const MAX_INDEX_LEXICAL_SCAN = 1_000;
 const EMBEDDING_MODEL = "@cf/baai/bge-m3" as const;
 const FACT_MODEL = "@cf/zai-org/glm-4.7-flash" as const;
-const CONSOLIDATION_MODEL = "@cf/zai-org/glm-4.7-flash" as const;
-const CONSOLIDATION_CRON = "0 18 * * *";
-const CONSOLIDATION_MIN_MEMORIES = 20;
-const CONSOLIDATION_AFTER_MS = 3 * 24 * 60 * 60 * 1_000;
-const CONSOLIDATION_LEASE_MS = 15 * 60 * 1_000;
-const MAX_NEW_CONSOLIDATION_SOURCES = 40;
-const MAX_CONSOLIDATION_INPUT_LENGTH = 90_000;
-const MAX_STORED_CONSOLIDATION_SOURCE_IDS = 1_000;
-const MAX_STORED_CONSOLIDATION_SOURCE_CONTAINERS = 50;
 
 type JsonObject = Record<string, unknown>;
 
@@ -58,6 +44,8 @@ type MemoryRow = {
   created_at: string;
   updated_at: string;
 };
+
+type DocumentUpdateRow = Pick<MemoryRow, "container_tag" | "content" | "metadata_json" | "updated_at" | "topic_revision">;
 
 // 表示APIはベクトル値を公開しない。状態・モデル・日時は従来どおり取得する。
 const DOCUMENT_DISPLAY_COLUMNS = `m.id, m.custom_id, m.container_tag, m.content, m.metadata_json, m.entity_context,
@@ -620,11 +608,12 @@ function memoryResult(
       "sourceMemoryIdsTruncated", "consolidationCreatedAt"]
       .filter((key) => metadata[key] !== undefined).map((key) => [key, metadata[key]]),
   ) : metadata;
+  const content = indexOnly ? undefined : excerpt(row.content, query, 4_000);
   return {
     id: row.id,
     ...(indexOnly ? {} : {
-      memory: excerpt(row.content, query, 4_000),
-      content: excerpt(row.content, query, 4_000),
+      memory: content,
+      content,
     }),
     ...(indexOnly && !hasMemoryIndex ? { summary: excerpt(row.content, query, 4_000) } : {}),
     ...(row.searchExcerpt ? { searchExcerpt: row.searchExcerpt } : {}),
@@ -660,6 +649,7 @@ async function embedText(text: string, env: Env): Promise<number[]> {
 }
 
 async function extractEnrichment(content: string, env: Env): Promise<ExtractedEnrichment> {
+  const MAX_FACT_CONTENT_LENGTH = 24_000;
   const output = await env.AI.run(FACT_MODEL, {
     messages: [
       {
@@ -804,6 +794,8 @@ async function extractConsolidation(
   sources: ConsolidationSource[],
   env: Env,
 ): Promise<ConsolidationPayload> {
+  const MAX_CONSOLIDATION_INPUT_LENGTH = 90_000;
+  const CONSOLIDATION_MODEL = "@cf/zai-org/glm-4.7-flash" as const;
   const baseline = previousSummary ? truncateUtf16(previousSummary, 20_000) : null;
   const overhead = 250;
   const available = Math.max(1_000, MAX_CONSOLIDATION_INPUT_LENGTH - (baseline?.length ?? 0));
@@ -891,6 +883,8 @@ const CONSOLIDATION_PROJECT_KEY_SQL = `CASE
 END`;
 
 async function consolidationTargets(env: Env, now: Date, projectKey?: string): Promise<ConsolidationTarget[]> {
+  const CONSOLIDATION_AFTER_MS = 3 * 24 * 60 * 60 * 1_000;
+  const CONSOLIDATION_MIN_MEMORIES = 20;
   const result = await env.DB.prepare(
     `WITH raw AS (
        SELECT m.id, m.container_tag, m.created_at,
@@ -953,6 +947,7 @@ async function acquireConsolidationLease(
   env: Env,
   now: Date,
 ): Promise<string | null> {
+  const CONSOLIDATION_LEASE_MS = 15 * 60 * 1_000;
   const token = crypto.randomUUID();
   const nowIso = now.toISOString();
   await env.DB.prepare(
@@ -988,8 +983,12 @@ async function releaseConsolidationLease(projectKey: string, token: string, env:
 }
 
 async function newConsolidationSources(projectKey: string, env: Env): Promise<ConsolidationSource[]> {
+  const MAX_NEW_CONSOLIDATION_SOURCES = 40;
+  // AI入力は最大5000 UTF-16単位。SQLのNUL終端だけは全文を渡し、既存の切詰めに任せる。
   const result = await env.DB.prepare(
-    `SELECT m.id, m.container_tag AS containerTag, m.content, m.metadata_json AS metadataJson,
+    `SELECT m.id, m.container_tag AS containerTag,
+            CASE WHEN instr(m.content, char(0)) > 0 THEN m.content ELSE substr(m.content, 1, 5000) END AS content,
+            m.metadata_json AS metadataJson,
             m.created_at AS createdAt, COALESCE(m.topic_revision, m.updated_at) AS sourceRevision
      FROM memories AS m
      WHERE m.is_forgotten = 0
@@ -1016,8 +1015,10 @@ type ActiveConsolidation = {
 };
 
 async function activeConsolidation(projectKey: string, env: Env): Promise<ActiveConsolidation | null> {
+  // 旧checkpointもAIへ渡す最大20000 UTF-16単位だけを取得する。NULはSQL切詰めを避ける。
   return await env.DB.prepare(
-    `SELECT consolidation.id, consolidation.memory_id AS memoryId, memory.content,
+    `SELECT consolidation.id, consolidation.memory_id AS memoryId,
+            CASE WHEN instr(memory.content, char(0)) > 0 THEN memory.content ELSE substr(memory.content, 1, 20000) END AS content,
             memory.metadata_json AS metadataJson, consolidation.revision
      FROM memory_consolidations AS consolidation
      JOIN memories AS memory ON memory.id = consolidation.memory_id AND memory.is_forgotten = 0
@@ -1053,6 +1054,8 @@ async function persistConsolidation(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<ConsolidationOutcome> {
+  const MAX_STORED_CONSOLIDATION_SOURCE_CONTAINERS = 50;
+  const MAX_STORED_CONSOLIDATION_SOURCE_IDS = 1_000;
   const state = await env.DB.prepare(
     "SELECT revision FROM memory_consolidation_projects WHERE project_key = ? AND lease_token = ?",
   ).bind(target.projectKey, leaseToken).first<{ revision: number }>();
@@ -1721,25 +1724,11 @@ function diagnosticError(error: unknown, env: Env): string {
   return truncateUtf16(secret ? message.replaceAll(secret, "[redacted]") : message, 2_000);
 }
 
-async function runMemoryEnrichment(memory: EnrichmentMemory, env: Env): Promise<void> {
-  if (!enrichmentEnabled(env) || !(await memoryStillCurrent(memory, env))) return;
-  await env.DB.prepare(
-    `UPDATE memories
-     SET embedding_status = 'processing',
-         fact_status = CASE WHEN ? = 1 THEN fact_status ELSE 'processing' END,
-         topic_status = CASE WHEN ? = 1 THEN topic_status ELSE 'processing' END,
-         enrichment_error = NULL
-     WHERE id = ? AND updated_at = ? AND topic_revision = ?`,
-  )
-    .bind(memory.skipFacts ? 1 : 0, memory.explicitTopics ? 1 : 0, memory.id, memory.updatedAt, memory.topicRevision)
-    .run();
-
-  const [embeddingResult, enrichmentResult] = await Promise.allSettled([
-    embedText(memory.content, env),
-    extractEnrichment(memory.content, env),
-  ]);
-  if (!(await memoryStillCurrent(memory, env))) return;
-
+async function persistMemoryEmbedding(
+  memory: EnrichmentMemory,
+  env: Env,
+  embeddingResult: PromiseSettledResult<number[]>,
+): Promise<string[]> {
   const errors: string[] = [];
   if (embeddingResult.status === "fulfilled") {
     const attemptedAt = new Date().toISOString();
@@ -1804,6 +1793,30 @@ async function runMemoryEnrichment(memory: EnrichmentMemory, env: Env): Promise<
       .bind(memory.id, memory.updatedAt, memory.topicRevision)
       .run();
   }
+
+  return errors;
+}
+
+async function runMemoryEnrichment(memory: EnrichmentMemory, env: Env): Promise<void> {
+  if (!enrichmentEnabled(env) || !(await memoryStillCurrent(memory, env))) return;
+  await env.DB.prepare(
+    `UPDATE memories
+     SET embedding_status = 'processing',
+         fact_status = CASE WHEN ? = 1 THEN fact_status ELSE 'processing' END,
+         topic_status = CASE WHEN ? = 1 THEN topic_status ELSE 'processing' END,
+         enrichment_error = NULL
+     WHERE id = ? AND updated_at = ? AND topic_revision = ?`,
+  )
+    .bind(memory.skipFacts ? 1 : 0, memory.explicitTopics ? 1 : 0, memory.id, memory.updatedAt, memory.topicRevision)
+    .run();
+
+  const [embeddingResult, enrichmentResult] = await Promise.allSettled([
+    embedText(memory.content, env),
+    extractEnrichment(memory.content, env),
+  ]);
+  if (!(await memoryStillCurrent(memory, env))) return;
+
+  const errors = await persistMemoryEmbedding(memory, env, embeddingResult);
 
   if (memory.skipFacts) {
     // Consolidated checkpoints derive from source memories, so publishing their
@@ -1965,6 +1978,7 @@ function indexQueryPatterns(query: string): string {
 
 async function indexedMemories(query: string, containerTag: string | undefined, scope: string | undefined, env: Env, indexOnly: boolean): Promise<RankedMemoryRow[]> {
   const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m");
+  const patterns = indexQueryPatterns(query);
   // 分類・索引だけの一致はVectorize topKや本文FTSの順位に依存させない。
   const result = await env.DB.prepare(
     `SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at, m.topic_revision
@@ -1972,7 +1986,7 @@ async function indexedMemories(query: string, containerTag: string | undefined, 
      ORDER BY (SELECT COALESCE(SUM(json_extract(term.value, '$.weight')), 0) FROM json_each(?) AS term
                WHERE ${indexTermPredicate("m")}) DESC,
               m.updated_at DESC LIMIT ?`,
-  ).bind(...parameters, indexQueryPatterns(query), indexQueryPatterns(query), MAX_LIMIT).all<RankedMemoryRow>();
+  ).bind(...parameters, patterns, patterns, MAX_LIMIT).all<RankedMemoryRow>();
   return result.results.map((row) => ({ ...row, lexicalMatch: true }));
 }
 
@@ -2033,6 +2047,7 @@ async function semanticMemories(
   env: Env,
   indexOnly = false,
 ): Promise<RankedMemoryRow[]> {
+  const MAX_D1_VECTOR_SCAN = 200;
   if (!enrichmentEnabled(env)) return [];
   try {
     const vector = await embedText(query, env);
@@ -2180,7 +2195,8 @@ function querySearchExcerpt(content: string, terms: string[]): string {
     let start = Math.max(0, at - 60);
     if (start > 0 && /[\uD800-\uDBFF]/u.test(content[start - 1]!) && /[\uDC00-\uDFFF]/u.test(content[start]!)) start += 1;
     const text = truncateUtf16(content.slice(start), 236);
-    const score = terms.reduce((sum, value) => sum + (text.toLowerCase().includes(value) ? Math.min(12, value.length) : 0), 0);
+    const lowerText = text.toLowerCase();
+    const score = terms.reduce((sum, value) => sum + (lowerText.includes(value) ? Math.min(12, value.length) : 0), 0);
     if (score > bestScore) {
       bestScore = score;
       best = `${start > 0 ? "…" : ""}${text}${start + text.length < content.length ? "…" : ""}`;
@@ -2249,6 +2265,7 @@ function sortByQueryCoverage(
 }
 
 async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & { results: JsonObject[]; timing: number }> {
+  const MAX_INDEX_LEXICAL_SCAN = 1_000;
   const startedAt = performance.now();
   if (body.indexOnly !== undefined && typeof body.indexOnly !== "boolean") {
     throw new HttpError(400, "indexOnly must be a boolean");
@@ -2571,8 +2588,14 @@ async function profile(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  const rows = await recentMemories(env, containerTag, DEFAULT_LIMIT, scopeFilter(body));
-  const dynamic = rows.map((row) => excerpt(row.content, "", 1_200));
+  const { clause, parameters } = searchConditions(containerTag, scopeFilter(body), false);
+  // SQLはコードポイント単位。末尾判定用の1文字とNUL時の全文でUTF-16のexcerpt契約を保つ。
+  const rows = await env.DB.prepare(
+    `SELECT CASE WHEN instr(content, char(0)) > 0 THEN content ELSE substr(content, 1, 1201) END AS content
+     FROM memories WHERE ${clause}
+     ORDER BY updated_at DESC LIMIT ?`,
+  ).bind(...parameters, DEFAULT_LIMIT).all<Pick<MemoryRow, "content">>();
+  const dynamic = rows.results.map((row) => excerpt(row.content, "", 1_200));
   return json({ profile: { static: [], dynamic } });
 }
 
@@ -2614,8 +2637,11 @@ async function retryEnrichment(
   if (!enrichmentEnabled(env)) throw new HttpError(409, "AI enrichment is disabled");
   const body = await readJson(request);
   const id = stringValue(body.id, "id", 64);
+  // 本文は埋め込み(最大60000 UTF-16単位)と事実・トピック抽出だけが消費する。
   const row = await env.DB.prepare(
-    `SELECT id, container_tag, content, metadata_json, updated_at, topic_revision
+    `SELECT id, container_tag,
+            CASE WHEN instr(content, char(0)) > 0 THEN content ELSE substr(content, 1, ${MAX_EMBEDDING_CONTENT_LENGTH}) END AS content,
+            metadata_json, updated_at, topic_revision
      FROM memories WHERE id = ? AND is_forgotten = 0`,
   )
     .bind(id)
@@ -2726,6 +2752,7 @@ async function getVectorsByIds(env: Env, ids: string[]): Promise<VectorizeVector
 }
 
 async function reconcileForgottenVectors(env: Env): Promise<void> {
+  const MAX_FORGOTTEN_VECTOR_SCAN = 100;
   const result = await env.DB.prepare(
     `SELECT id FROM memories
      WHERE is_forgotten = 1
@@ -2859,24 +2886,31 @@ async function reconcileVectors(env: Env): Promise<void> {
     return !Number.isFinite(attemptedAt) || attemptedAt <= retryBefore;
   });
   const vectors: VectorizeVector[] = [];
+  const namespaces = new Map<string, string>();
   for (const row of stale) {
     const values = parseEmbedding(row.embedding_json);
     if (!values) continue;
+    let namespace = namespaces.get(row.container_tag);
+    if (namespace === undefined) {
+      namespace = await vectorNamespace(row.container_tag);
+      namespaces.set(row.container_tag, namespace);
+    }
     vectors.push({
       id: row.id,
       values,
-      namespace: await vectorNamespace(row.container_tag),
+      namespace,
       metadata: { topic_revision: vectorRevision(row.topic_revision) },
     });
   }
 
   if (vectors.length > 0) {
+    const rowsById = new Map(result.results.map((row) => [row.id, row]));
     try {
       const mutation = await env.MEMORY_VECTORS.upsert(vectors);
       const attemptedAt = now.toISOString();
       const statusUpdates: Array<{ id: string; statement: D1PreparedStatement }> = [];
       for (const vector of vectors) {
-        const row = result.results.find((candidate) => candidate.id === vector.id);
+        const row = rowsById.get(vector.id);
         if (!row) continue;
         statusUpdates.push({
           id: vector.id,
@@ -2906,7 +2940,7 @@ async function reconcileVectors(env: Env): Promise<void> {
       );
     } catch (error) {
       for (const vector of vectors) {
-        const row = result.results.find((candidate) => candidate.id === vector.id);
+        const row = rowsById.get(vector.id);
         if (!row) continue;
         updates.push(
           env.DB.prepare(
@@ -2992,6 +3026,29 @@ async function listTopics(request: Request, env: Env): Promise<Response> {
       hasMore: page * limit < total,
     },
   });
+}
+
+function documentDisplay(
+  row: Pick<MemoryRow, "id" | "container_tag" | "status" | "created_at" | "updated_at">,
+  metadata: JsonObject,
+  topics: string[],
+  summary: string,
+  content?: string,
+): JsonObject {
+  return {
+    id: row.id,
+    title: metadata.title ?? `Memory ${row.id.slice(0, 8)}`,
+    type: "text",
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    summary,
+    ...(content === undefined ? {} : { content }),
+    containerTags: [row.container_tag],
+    metadata,
+    topics,
+    provenance: provenance(row, metadata),
+  };
 }
 
 async function listDocuments(request: Request, env: Env): Promise<Response> {
@@ -3080,17 +3137,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
     documents = rows.map((row) => {
       const metadata = parseMetadata(row.metadata_json);
       return {
-        id: row.id,
-        title: metadata.title ?? `Memory ${row.id.slice(0, 8)}`,
-        type: "text",
-        status: row.status,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        summary: row.content_preview,
-        containerTags: [row.container_tag],
-        metadata,
-        topics: topics.get(row.id) ?? [],
-        provenance: provenance(row, metadata),
+        ...documentDisplay(row, metadata, topics.get(row.id) ?? [], row.content_preview),
         isForgotten: false,
         isLatest: true,
       };
@@ -3101,18 +3148,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
     documents = rows.map((row) => {
       const metadata = parseMetadata(row.metadata_json);
       return {
-        id: row.id,
-        title: metadata.title ?? `Memory ${row.id.slice(0, 8)}`,
-        type: "text",
-        status: row.status,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        summary: excerpt(row.content, "", 300),
-        content: row.content,
-        containerTags: [row.container_tag],
-        metadata,
-        topics: topics.get(row.id) ?? [],
-        provenance: provenance(row, metadata),
+        ...documentDisplay(row, metadata, topics.get(row.id) ?? [], excerpt(row.content, "", 300), row.content),
         enrichment: {
           embeddingStatus: row.embedding_status,
           factStatus: row.fact_status,
@@ -3161,18 +3197,7 @@ async function getDocument(id: string, env: Env): Promise<Response> {
   const metadata = parseMetadata(row.metadata_json);
   const topics = await topicsByMemory([row], env);
   return json({
-    id: row.id,
-    title: metadata.title ?? `Memory ${row.id.slice(0, 8)}`,
-    type: "text",
-    status: row.status,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    summary: excerpt(row.content, "", 300),
-    content: row.content,
-    containerTags: [row.container_tag],
-    metadata,
-    topics: topics.get(row.id) ?? [],
-    provenance: provenance(row, metadata),
+    ...documentDisplay(row, metadata, topics.get(row.id) ?? [], excerpt(row.content, "", 300), row.content),
     enrichment: {
       embeddingStatus: row.embedding_status,
       factStatus: row.fact_status,
@@ -3203,9 +3228,11 @@ async function updateDocument(
     ? undefined
     : explicitTopicsFromMetadata(body.metadata as JsonObject);
   if (content === undefined && metadata === undefined) throw new HttpError(400, "No update supplied");
-  const current = await env.DB.prepare("SELECT * FROM memories WHERE id = ? AND is_forgotten = 0")
+  const current = await env.DB.prepare(
+    "SELECT container_tag, content, metadata_json, updated_at, topic_revision FROM memories WHERE id = ? AND is_forgotten = 0",
+  )
     .bind(id)
-    .first<MemoryRow>();
+    .first<DocumentUpdateRow>();
   if (!current) throw new HttpError(404, "Document not found");
   // メタデータの差し替えでも生成物の識別を迂回できないよう正本を照合する。
   if (await env.DB.prepare("SELECT id FROM memory_consolidations WHERE memory_id = ?").bind(id).first()) {
@@ -3337,6 +3364,7 @@ async function repairActiveVectorAfterDelete(
   env: Env,
   lastMutation: "delete" | "upsert" = "delete",
 ): Promise<void> {
+  const MAX_VECTOR_DELETE_REPAIR_ATTEMPTS = 3;
 
   for (let attempt = 0; attempt < MAX_VECTOR_DELETE_REPAIR_ATTEMPTS; attempt += 1) {
     const current = await env.DB.prepare(
@@ -3490,7 +3518,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (url.pathname === "/v3/session" && request.method === "GET") {
     return json({
       user: { id: "cloudflare-self-hosted", name: "Cloudflare self-hosted" },
-      org: { name: "Kagayoi Memory" },
+      org: { name: "Remnifold" },
       role: "owner",
       accessType: "full",
       scope: "private",
@@ -3559,6 +3587,7 @@ export default {
     }
   },
   scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): void {
+    const CONSOLIDATION_CRON = "0 18 * * *";
     const task = controller.cron === CONSOLIDATION_CRON
         ? runScheduledConsolidations(env, ctx)
         : reconcileVectors(env);

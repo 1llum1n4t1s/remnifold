@@ -1,5 +1,5 @@
 {
-  "name": "kagayoi-memory",
+  "name": "remnifold",
   "version": "1.0.7",
   "private": true,
   "type": "module",
@@ -10,10 +10,10 @@
   "scripts": {
     "test": "pnpm run test:client && pnpm run test:scripts && pnpm run test:server",
     "test:client": "node --test client/*.test.mjs",
-    "test:scripts": "node --test scripts/*.test.mjs && node scripts/capture-redaction-e2e.mjs && node scripts/client-repair-e2e.mjs && node scripts/capture-diagnostics-e2e.mjs && node scripts/opop-client-e2e.mjs && node scripts/recall-hook-e2e.mjs",
+    "test:scripts": "node --test scripts/*.test.mjs && node scripts/capture-redaction-e2e.mjs && node scripts/client-repair-e2e.mjs && node scripts/capture-diagnostics-e2e.mjs && node scripts/opop-client-e2e.mjs && node scripts/recall-hook-e2e.mjs && node scripts/memory-quality-e2e.mjs && node scripts/remnifold-rename-e2e.mjs && node scripts/loopback-connection-e2e.mjs && node scripts/client-ranking-e2e.mjs",
     "test:server": "pnpm -C server test",
     "validate:plugin": "node scripts/validate-plugin.mjs",
-    "package:plugin": "node scripts/package-plugin.mjs && node scripts/validate-plugin.mjs dist/kagayoi-memory",
+    "package:plugin": "node scripts/package-plugin.mjs && node scripts/validate-plugin.mjs dist/remnifold",
     "check": "pnpm run test && pnpm run validate:plugin && pnpm run package:plugin && pnpm -C server build"
   }
 }

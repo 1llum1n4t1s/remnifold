@@ -8,7 +8,7 @@ param(
 
 # 検証済みの作業対象だけを標準APIで削除する。
 function Remove-LocalWorkItem {
-    param([string[]]$LiteralPath, [string]$AllowedRoot, [switch]$IgnoreMissing, [switch]$AllowLeafJunction)
+    param([string[]]$LiteralPath, [string]$AllowedRoot)
     if ([string]::IsNullOrWhiteSpace($AllowedRoot) -or -not [IO.Path]::IsPathRooted($AllowedRoot)) { throw 'Cleanup root must be absolute.' }
     $boundary = [IO.Path]::GetFullPath($AllowedRoot).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
     foreach ($target in $LiteralPath) {
@@ -19,11 +19,11 @@ function Remove-LocalWorkItem {
         while ($ancestor) {
             if (Test-Path -LiteralPath $ancestor) {
                 $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
-                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not ($AllowLeafJunction -and $ancestor -eq $resolved -and $item.LinkType -eq 'Junction')) { throw 'Cleanup path contains a reparse point.' }
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Cleanup path contains a reparse point.' }
             }
             $ancestor = Split-Path $ancestor -Parent
         }
-        if (-not (Test-Path -LiteralPath $resolved)) { if ($IgnoreMissing) { continue }; throw "Cleanup target is missing: $resolved" }
+        if (-not (Test-Path -LiteralPath $resolved)) { throw "Cleanup target is missing: $resolved" }
         $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
         $leafLink = [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
         if ($item.PSIsContainer -and -not $leafLink) {
@@ -48,9 +48,10 @@ if (-not (Test-Path -LiteralPath $resolvedHome -PathType Container)) {
     New-Item -ItemType Directory -Path $resolvedHome | Out-Null
 }
 
-$configPath = Join-Path $resolvedHome 'kagayoi-memory.json'
+$configPath = Join-Path $resolvedHome 'remnifold.json'
+$previousConfigPath = Join-Path $resolvedHome 'kagayoi-memory.json'
 $legacyConfigPath = Join-Path $resolvedHome 'supermemory.json'
-$sourceConfigPath = if (Test-Path -LiteralPath $configPath -PathType Leaf) { $configPath } elseif (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf) { $legacyConfigPath } else { $configPath }
+$sourceConfigPath = if (Test-Path -LiteralPath $configPath -PathType Leaf) { $configPath } elseif (Test-Path -LiteralPath $previousConfigPath -PathType Leaf) { $previousConfigPath } elseif (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf) { $legacyConfigPath } else { $configPath }
 $existingConfig = [ordered]@{}
 if (Test-Path -LiteralPath $sourceConfigPath -PathType Leaf) {
     try {
@@ -64,6 +65,9 @@ if (Test-Path -LiteralPath $sourceConfigPath -PathType Leaf) {
 }
 
 if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
+    $BaseUrl = [Environment]::GetEnvironmentVariable('REMNIFOLD_API_URL', 'Process')
+}
+if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
     $BaseUrl = [Environment]::GetEnvironmentVariable('KAGAYOI_MEMORY_API_URL', 'Process')
 }
 if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
@@ -72,7 +76,7 @@ if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
 if ([string]::IsNullOrWhiteSpace($BaseUrl) -and $existingConfig.Contains('baseUrl')) {
     $BaseUrl = [string]$existingConfig.baseUrl
 }
-if ([string]::IsNullOrWhiteSpace($BaseUrl)) { throw 'BaseUrl or KAGAYOI_MEMORY_API_URL is required.' }
+if ([string]::IsNullOrWhiteSpace($BaseUrl)) { throw 'BaseUrl or REMNIFOLD_API_URL is required.' }
 
 try { $endpoint = [Uri]$BaseUrl } catch { throw 'BaseUrl must be an absolute URL.' }
 $endpointHost = $endpoint.DnsSafeHost.Trim('[', ']').ToLowerInvariant()
@@ -86,7 +90,10 @@ if (-not $endpoint.IsAbsoluteUri -or $endpoint.UserInfo -or $endpoint.Query -or 
 }
 $normalizedUrl = $endpoint.AbsoluteUri.TrimEnd('/')
 
-$apiKey = [Environment]::GetEnvironmentVariable('KAGAYOI_MEMORY_API_KEY', 'Process')
+$apiKey = [Environment]::GetEnvironmentVariable('REMNIFOLD_API_KEY', 'Process')
+if ([string]::IsNullOrWhiteSpace($apiKey)) {
+    $apiKey = [Environment]::GetEnvironmentVariable('KAGAYOI_MEMORY_API_KEY', 'Process')
+}
 if ([string]::IsNullOrWhiteSpace($apiKey)) {
     $apiKey = [Environment]::GetEnvironmentVariable('SUPERMEMORY_CODEX_API_KEY', 'Process')
 }
@@ -125,9 +132,6 @@ $temporaryPath = "$configPath.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
 try {
     [System.IO.File]::WriteAllText($temporaryPath, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::Move($temporaryPath, $configPath, $true)
-    if ($sourceConfigPath -eq $legacyConfigPath -and (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf)) {
-        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {  Remove-LocalWorkItem -LiteralPath ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($legacyConfigPath)) -AllowedRoot $resolvedHome } else { Remove-Item -LiteralPath $legacyConfigPath -Force }
-    }
 } finally {
     if (Test-Path -LiteralPath $temporaryPath) { if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {  Remove-LocalWorkItem -LiteralPath ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($temporaryPath)) -AllowedRoot $resolvedHome } else { Remove-Item -LiteralPath $temporaryPath -Force } }
 }

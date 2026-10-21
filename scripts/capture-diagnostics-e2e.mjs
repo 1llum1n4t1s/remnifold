@@ -1,27 +1,5 @@
 import * as cleanupFs from "node:fs";
-import * as cleanupPath from "node:path";
-
-// 許可rootの境界とリンクを検査してから標準APIへ渡す。
-function assertCleanupPath(target, allowedRoot) {
-  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
-  const resolved = cleanupPath.resolve(target);
-  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
-  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
-  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
-    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (cleanupPath.dirname(current) === current) break;
-  }
-  const pending = [resolved];
-  while (pending.length) {
-    const current = pending.pop();
-    let stat;
-    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
-    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
-  }
-  return resolved;
-}
+import { assertCleanupPath } from "./lib/cleanup.mjs";
 // 失敗条件を先に固定: 設定不備、transcript不一致、現行/旧receipt破損、read/write障害、
 // transport障害、不正ack、秘密/パス/応答漏れ、exit/retry/ID契約の変化。実データは使わない。
 import assert from "node:assert/strict";
@@ -32,10 +10,10 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getProjectContext } from "../client/Import-KagayoiMemoryHistory.mjs";
+import { getProjectContext } from "../client/Import-RemnifoldHistory.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const fixture = await mkdtemp(join(tmpdir(), "kagayoi-capture-diagnostics-e2e-"));
+const fixture = await mkdtemp(join(tmpdir(), "remnifold-capture-diagnostics-e2e-"));
 const artifact = join(root, "dist", "capture-diagnostics-validation.json");
 const key = "fixture-diagnostics-key-do-not-print";
 const marker = "fixture-sensitive-response-do-not-print";
@@ -84,12 +62,12 @@ try {
         { type: "response_item", payload: { role: "assistant", channel: "final", content: [{ type: "output_text", text: "Fixture completed turn" }] } },
       ].map(JSON.stringify).join("\n") + "\n");
       const environment = { ...process.env, CODEX_HOME: home, NODE_NO_WARNINGS: "1",
-        KAGAYOI_MEMORY_API_URL: baseUrl, KAGAYOI_MEMORY_API_KEY: key };
-      for (const variable of ["SUPERMEMORY_API_URL", "SUPERMEMORY_CODEX_API_KEY", "CLOUDFLARE_MEMORY_API_KEY"]) delete environment[variable];
-      if (name === "configuration") { delete environment.KAGAYOI_MEMORY_API_KEY; }
+        REMNIFOLD_API_URL: baseUrl, REMNIFOLD_API_KEY: key };
+      for (const variable of ["KAGAYOI_MEMORY_API_URL", "KAGAYOI_MEMORY_API_KEY", "SUPERMEMORY_API_URL", "SUPERMEMORY_CODEX_API_KEY", "CLOUDFLARE_MEMORY_API_KEY"]) delete environment[variable];
+      if (name === "configuration") { delete environment.REMNIFOLD_API_KEY; }
       const payload = { session_id: name === "transcript" ? "wrong-session" : session, transcript_path: transcript, cwd: root };
       const stateId = createHash("sha256").update(`${baseUrl}:${getProjectContext(root).containerTag}:${session}`).digest("hex");
-      const receiptDirectory = join(home, name === "legacy-receipt-malformed" ? "cloudflare-memory" : "kagayoi-memory", "capture-state");
+      const receiptDirectory = join(home, name === "legacy-receipt-malformed" ? "cloudflare-memory" : "remnifold", "capture-state");
       const receiptPath = join(receiptDirectory, `${stateId}.json`);
       if (name.startsWith("receipt-") || name === "legacy-receipt-malformed") {
         await mkdir(receiptDirectory, { recursive: true });
@@ -123,7 +101,7 @@ try {
         checks.push({ caller, scenario: name, passed: true, retrySuppressed: true });
       } else {
         assert.equal(result.code, 1); assert.equal(result.stdout, "");
-        const expected = `Kagayoi Memory capture failed; unacknowledged records will be retried. [stage=${stage}; cause=${cause}; action=${action}]\n`;
+        const expected = `Remnifold capture failed; unacknowledged records will be retried. [stage=${stage}; cause=${cause}; action=${action}]\n`;
         assert.equal(result.stderr, expected);
         for (const sensitive of [key, marker, home, transcript, baseUrl]) assert.ok(!result.stderr.includes(sensitive));
         const preSend = ["configuration", "transcript", "receipt-malformed", "receipt-shape", "legacy-receipt-malformed", "receipt-read"].includes(name);

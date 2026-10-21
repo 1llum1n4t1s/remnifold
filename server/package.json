@@ -1,5 +1,5 @@
 {
-  "name": "@kagayoi/memory-server",
+  "name": "@kagayoi/remnifold-server",
   "version": "1.0.7",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy --minify",
     "migrate:local": "wrangler d1 migrations apply DB --local",
     "migrate:remote": "wrangler d1 migrations apply DB --remote",
-    "test": "node --experimental-transform-types --test tests/auth.test.mjs tests/topics.test.mjs tests/races.test.mjs && node --experimental-transform-types tests/log-regressions.mjs && node --experimental-transform-types tests/recall-efficiency.mjs && node --experimental-transform-types tests/review-fixes-e2e.mjs && node --experimental-transform-types tests/opop-performance.mjs && node tests/smoke.mjs",
+    "test": "node --experimental-transform-types --test tests/auth.test.mjs tests/topics.test.mjs tests/races.test.mjs && node --experimental-transform-types tests/log-regressions.mjs && node --experimental-transform-types tests/recall-efficiency.mjs && node --experimental-transform-types tests/review-fixes-e2e.mjs && node --experimental-transform-types tests/opop-performance.mjs && node --experimental-transform-types tests/opop-projection-e2e.mjs && node --experimental-transform-types tests/structure-performance-e2e.mjs && node tests/smoke.mjs",
     "test:live": "node tests/live-smoke.mjs"
   },
   "devDependencies": {

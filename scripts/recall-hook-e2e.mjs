@@ -1,27 +1,5 @@
 import * as cleanupFs from "node:fs";
-import * as cleanupPath from "node:path";
-
-// 許可rootの境界とリンクを検査してから標準APIへ渡す。
-function assertCleanupPath(target, allowedRoot) {
-  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
-  const resolved = cleanupPath.resolve(target);
-  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
-  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
-  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
-    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (cleanupPath.dirname(current) === current) break;
-  }
-  const pending = [resolved];
-  while (pending.length) {
-    const current = pending.pop();
-    let stat;
-    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
-    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
-  }
-  return resolved;
-}
+import { assertCleanupPath } from "./lib/cleanup.mjs";
 // 実hookプロセスとローカルHTTP APIを接続する再現用E2E。秘密・外部APIは使わない。
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
@@ -39,7 +17,7 @@ if (process.argv.length > 2 && (process.argv[2] !== "--runtime-root" || process.
   throw new Error("Usage: node scripts/recall-hook-e2e.mjs [--runtime-root plugin-directory]");
 }
 const runtimeRoot = process.argv[3] ? resolve(process.argv[3]) : root;
-const temporary = await mkdtemp(join(tmpdir(), "kagayoi-recall-e2e-"));
+const temporary = await mkdtemp(join(tmpdir(), "remnifold-recall-e2e-"));
 const artifact = join(root, "dist", runtimeRoot === root ? "recall-hook-validation.json" : "recall-hook-installed-validation.json");
 const checks = [];
 // 失敗条件: 重複注入、更新/compact見逃し、出力超過、Git/API過剰呼出し、子の停止漏れ、fixtureの認証漏れ。
@@ -74,7 +52,7 @@ const server = createServer(async (request, response) => {
   }));
 });
 const environment = { ...process.env, CODEX_HOME: temporary,
-  KAGAYOI_MEMORY_API_KEY: configuredKey };
+  REMNIFOLD_API_KEY: configuredKey };
 const transcript = join(temporary, "rollout.jsonl");
 const payload = { prompt: "Chrome extension implementation", cwd: root, session_id: "fixture-session", transcript_path: transcript };
 const count = (output) => output.hookSpecificOutput?.additionalContext?.length || 0;
@@ -103,7 +81,7 @@ async function check(name, operation) {
 }
 try {
   await new Promise((done, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", done); });
-  environment.KAGAYOI_MEMORY_API_URL = `http://127.0.0.1:${server.address().port}`;
+  environment.REMNIFOLD_API_URL = `http://127.0.0.1:${server.address().port}`;
   await writeFile(transcript, `${JSON.stringify({ type: "session_meta", payload: { id: "fixture-session" } })}\n`);
   await check("default three and explicit five through launcher and setup", async () => {
     fixtureRows = Array.from({ length: 5 }, (_, index) => ({ ...rows()[0], id: `small-${index}` }));
@@ -111,8 +89,8 @@ try {
     const items = (output) => (output.hookSpecificOutput.additionalContext.match(/\n  id=/gu) || []).length;
     const defaultItems = items(await hook(input));
     assert.equal(defaultItems, 3);
-    const configPath = join(temporary, "kagayoi-memory.json");
-    const setup = () => promisify(execFile)("pwsh", ["-NoProfile", "-File", join(runtimeRoot, "scripts", "setup-client.ps1"), "-CodexHome", temporary, "-BaseUrl", environment.KAGAYOI_MEMORY_API_URL, "-Force"], { env: environment, windowsHide: true, timeout: 20_000 });
+    const configPath = join(temporary, "remnifold.json");
+    const setup = () => promisify(execFile)("pwsh", ["-NoProfile", "-File", join(runtimeRoot, "scripts", "setup-client.ps1"), "-CodexHome", temporary, "-BaseUrl", environment.REMNIFOLD_API_URL, "-Force"], { env: environment, windowsHide: true, timeout: 20_000 });
     await setup();
     assert.equal(JSON.parse(await readFile(configPath, "utf8")).maxMemories, 3);
     assert.equal(items(await hook(input)), 3);
@@ -178,32 +156,32 @@ try {
   await check("project identifier excludes account, action and partial-word noise", async () => {
     const row = (id, title, description, searchExcerpt) => ({ id, containerTag: "other-folder-space", updatedAt: revision, semanticSimilarity: 0.99,
       metadata: { memoryIndex: { version: 1, title, description, sections: [], recallable: true } }, ...(searchExcerpt ? { searchExcerpt } : {}) });
-    fixtureRows = [row("wanted-memory", "Kagayoi Memory", "索引の読込"),
+    fixtureRows = [row("wanted-memory", "Remnifold", "索引の読込"),
       row("support-noise", "Kagayoi.Support", String.raw`C:\Users\IMT\dev\Kagayoi.Support`),
       row("invoice-noise", "請求書", "修正してください"), row("release-noise", "Release", "Developer release"),
       row("excerpt-noise", "Other task", "別の話題", String.raw`C:\Users\IMT\dev\Other を修正してください`)];
     try {
-      const prompt = String.raw`"C:\Users\IMT\dev\kagayoi-memory" メモリー機能側で修正で最適化が出来そうな部分が発見できていたら修正してください`;
+      const prompt = String.raw`"C:\Users\IMT\dev\remnifold" メモリー機能側で修正で最適化が出来そうな部分が発見できていたら修正してください`;
       const input = { ...payload, prompt, session_id: "topic-noise-session" };
       const after = await hook(input);
       const text = after.hookSpecificOutput.additionalContext;
       assert.match(text, /id=wanted-memory/u);
       assert.doesNotMatch(text, /id=(?:support|invoice|release|excerpt)-noise/u);
       assert.doesNotMatch(lastSearchQuery, /Users|IMT|\bdev\b/u);
-      assert.match(lastSearchQuery, /kagayoi-memory/u);
+      assert.match(lastSearchQuery, /remnifold/u);
       return { indexItems: (text.match(/\n  id=/gu) || []).length, characters: count(after), crossFolderMatch: true };
     } finally { fixtureRows = null; }
   });
   await check("POSIX, UNC and nested file paths preserve their project identifier", async () => {
     fixtureRows = [{ id: "wanted-path", containerTag: "other-folder-space", updatedAt: revision,
-      metadata: { memoryIndex: { version: 1, title: "Kagayoi Memory", description: "索引の読込", sections: [], recallable: true } } },
+      metadata: { memoryIndex: { version: 1, title: "Remnifold", description: "索引の読込", sections: [], recallable: true } } },
       { id: "unrelated-readme", containerTag: "other-project", updatedAt: revision,
         metadata: { memoryIndex: { version: 1, title: "README.md", description: "Documentation", sections: [], recallable: true } } }];
     try {
-      for (const [session_id, path] of [["posix-path", '"/Users/IMT/dev/kagayoi-memory"'], ["unc-path", String.raw`"\\server\share\kagayoi-memory"`],
-        ["windows-file", String.raw`"C:\Users\IMT\dev\kagayoi-memory\README.md"`],
-        ["nested-file", String.raw`C:\Users\IMT\dev\kagayoi-memory\client\memory-client.mjs`],
-        ["home-file", '"/home/imt/projects/kagayoi-memory/client/memory-client.mjs"']]) {
+      for (const [session_id, path] of [["posix-path", '"/Users/IMT/dev/remnifold"'], ["unc-path", String.raw`"\\server\share\remnifold"`],
+        ["windows-file", String.raw`"C:\Users\IMT\dev\remnifold\README.md"`],
+        ["nested-file", String.raw`C:\Users\IMT\dev\remnifold\client\memory-client.mjs`],
+        ["home-file", '"/home/imt/projects/remnifold/client/memory-client.mjs"']]) {
         const output = await hook({ ...payload, session_id, prompt: `${path} を最適化してください` });
         assert.match(output.hookSpecificOutput.additionalContext, /id=wanted-path/u);
         assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /id=unrelated-readme/u);
@@ -238,7 +216,7 @@ try {
     await appendFile(transcript, `${JSON.stringify({ type: "event_msg", payload: { type: "context_compacted" } })}\n`);
     assert.ok(count(await hook()));
   });
-  const stateDirectory = join(temporary, "kagayoi-memory", "recall-state");
+  const stateDirectory = join(temporary, "remnifold", "recall-state");
   const stateFile = join(stateDirectory, `${createHash("sha256").update(payload.session_id).digest("hex")}.json`);
   await check("large complete compaction row resets without a following event", async () => {
     assert.equal(count(await hook()), 0);
@@ -343,7 +321,7 @@ try {
   await Promise.all([...children].map((child) => new Promise((done) => { child.once("close", done); child.kill("SIGKILL"); })));
   await new Promise((done) => server.close(done));
   // mkdtempが今回作った専用ディレクトリだけを清掃する。
-  assert.ok(temporary.startsWith(join(tmpdir(), "kagayoi-recall-e2e-")));
+  assert.ok(temporary.startsWith(join(tmpdir(), "remnifold-recall-e2e-")));
   if (process.platform === "win32") await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(temporary, { allowedRoot: resolve(tmpdir()), recursive: true });
   else {
     assert.equal(dirname(temporary), resolve(tmpdir()));

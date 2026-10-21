@@ -150,7 +150,10 @@ test("same-millisecond retry cannot restore stale topics after a content patch",
 
     let intercepted = false;
     DB.interceptFirst(async (sql, row) => {
-      if (intercepted || !sql.includes("SELECT id, container_tag, content, metadata_json, updated_at, topic_revision")) {
+      const isRetryRead = sql.includes("SELECT id, container_tag,") &&
+        sql.includes("metadata_json, updated_at, topic_revision") &&
+        sql.includes("FROM memories WHERE id = ? AND is_forgotten = 0");
+      if (intercepted || !isRetryRead) {
         return row;
       }
       intercepted = true;
@@ -892,7 +895,7 @@ test("patch loses to a same-millisecond forget after its initial read", async ()
     let intercepted = false;
     let rowAfterForget;
     DB.interceptFirst(async (sql, row) => {
-      if (intercepted || !sql.includes("SELECT * FROM memories WHERE id = ? AND is_forgotten = 0")) {
+      if (intercepted || !sql.includes("SELECT container_tag, content, metadata_json, updated_at, topic_revision FROM memories WHERE id = ? AND is_forgotten = 0")) {
         return row;
       }
       intercepted = true;

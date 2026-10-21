@@ -6,9 +6,9 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { api as clientApi } from "./memory-client.mjs";
-import { loadConfig, normalizeEndpoint } from "./Import-KagayoiMemoryHistory.mjs";
+import { loadConfig, normalizeEndpoint } from "./Import-RemnifoldHistory.mjs";
 
-const environmentNames = ["KAGAYOI_MEMORY_API_URL", "KAGAYOI_MEMORY_API_KEY", "SUPERMEMORY_API_URL", "SUPERMEMORY_CODEX_API_KEY", "CLOUDFLARE_MEMORY_API_KEY"];
+const environmentNames = ["REMNIFOLD_API_URL", "REMNIFOLD_API_KEY", "KAGAYOI_MEMORY_API_URL", "KAGAYOI_MEMORY_API_KEY", "SUPERMEMORY_API_URL", "SUPERMEMORY_CODEX_API_KEY", "CLOUDFLARE_MEMORY_API_KEY"];
 
 function isolatedEnvironment(t) {
   const original = new Map(environmentNames.map((name) => [name, process.env[name]]));
@@ -24,7 +24,7 @@ function isolatedEnvironment(t) {
 function temporaryHome(t, config) {
   const home = mkdtempSync(join(tmpdir(), "memory-config-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  if (config !== undefined) writeFileSync(join(home, "kagayoi-memory.json"), JSON.stringify(config));
+  if (config !== undefined) writeFileSync(join(home, "remnifold.json"), JSON.stringify(config));
   return home;
 }
 
@@ -63,15 +63,15 @@ test("設定ファイルと環境変数を項目単位で統合し利用者設�
     recallMode: "off",
     readContainerTags: ["shared-team"],
   });
-  process.env.KAGAYOI_MEMORY_API_URL = "https://override.example/api/";
+  process.env.REMNIFOLD_API_URL = "https://override.example/api/";
   const fromUrlOverride = loadConfig(home);
   assert.equal(fromUrlOverride.baseUrl, "https://override.example/api");
   assert.equal(fromUrlOverride.apiKey, "file-key");
   assert.equal(fromUrlOverride.recallMode, "off");
   assert.deepEqual(fromUrlOverride.readContainerTags, ["shared-team"]);
 
-  delete process.env.KAGAYOI_MEMORY_API_URL;
-  process.env.KAGAYOI_MEMORY_API_KEY = "environment-key";
+  delete process.env.REMNIFOLD_API_URL;
+  process.env.REMNIFOLD_API_KEY = "environment-key";
   const fromKeyOverride = loadConfig(home);
   assert.equal(fromKeyOverride.baseUrl, "https://file.example/api");
   assert.equal(fromKeyOverride.apiKey, "environment-key");
@@ -80,13 +80,13 @@ test("設定ファイルと環境変数を項目単位で統合し利用者設�
 test("完全な環境設定があれば壊れたローカル接続ファイルへ依存しない", (t) => {
   isolatedEnvironment(t);
   const home = temporaryHome(t);
-  writeFileSync(join(home, "kagayoi-memory.json"), "{invalid");
-  process.env.KAGAYOI_MEMORY_API_URL = "https://environment.example/";
-  process.env.KAGAYOI_MEMORY_API_KEY = "environment-key";
+  writeFileSync(join(home, "remnifold.json"), "{invalid");
+  process.env.REMNIFOLD_API_URL = "https://environment.example/";
+  process.env.REMNIFOLD_API_KEY = "environment-key";
   assert.deepEqual(loadConfig(home), { baseUrl: "https://environment.example", apiKey: "environment-key" });
 });
 
-test("1.xの接続設定を読み込み、セットアップ時にKagayoi Memory設定へ移行する", async (t) => {
+test("1.xの接続設定を読み込み、セットアップ時にRemnifold設定へ移行する", async (t) => {
   isolatedEnvironment(t);
   const baseUrl = await listen(t, (_request, response) => {
     response.writeHead(200, { "Content-Type": "application/json" });
@@ -94,14 +94,14 @@ test("1.xの接続設定を読み込み、セットアップ時にKagayoi Memory
   });
   const home = temporaryHome(t);
   const legacyPath = join(home, "supermemory.json");
-  const currentPath = join(home, "kagayoi-memory.json");
+  const currentPath = join(home, "remnifold.json");
   writeFileSync(legacyPath, JSON.stringify({ baseUrl, apiKey: "legacy-key", recallMode: "off" }));
   assert.equal(loadConfig(home).recallMode, "off");
 
   const result = await runSetup(["-CodexHome", home], {});
   assert.equal(result.code, 0, result.stderr);
   assert.equal(JSON.parse(readFileSync(currentPath, "utf8")).apiKey, "legacy-key");
-  assert.equal(existsSync(legacyPath), false);
+  assert.equal(existsSync(legacyPath), true);
 });
 
 test("接続先はHTTPSまたはloopbackのHTTPだけを受け付ける", () => {
@@ -149,12 +149,12 @@ test("セットアップ再実行は接続だけを更新し既存の検索設�
   });
   const secret = "replacement-test-secret";
   const result = await runSetup(["-BaseUrl", baseUrl, "-CodexHome", home, "-Force"], {
-    KAGAYOI_MEMORY_API_KEY: secret,
+    REMNIFOLD_API_KEY: secret,
   });
   assert.equal(result.code, 0, result.stderr);
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(secret));
   assert.deepEqual(received, [`Bearer ${secret}`]);
-  const config = JSON.parse(readFileSync(join(home, "kagayoi-memory.json"), "utf8"));
+  const config = JSON.parse(readFileSync(join(home, "remnifold.json"), "utf8"));
   assert.equal(config.baseUrl, baseUrl);
   assert.equal(config.apiKey, secret);
   assert.equal(config.recallMode, "off");
@@ -170,13 +170,13 @@ test("セットアップはCODEX_HOMEを使い明示引数を優先する", asyn
   });
   const environmentHome = temporaryHome(t);
   const explicitHome = temporaryHome(t);
-  const environment = { CODEX_HOME: environmentHome, KAGAYOI_MEMORY_API_KEY: "home-test-key" };
+  const environment = { CODEX_HOME: environmentHome, REMNIFOLD_API_KEY: "home-test-key" };
   const inherited = await runSetup(["-BaseUrl", baseUrl], environment);
   assert.equal(inherited.code, 0, inherited.stderr);
-  assert.equal(JSON.parse(readFileSync(join(environmentHome, "kagayoi-memory.json"), "utf8")).baseUrl, baseUrl);
+  assert.equal(JSON.parse(readFileSync(join(environmentHome, "remnifold.json"), "utf8")).baseUrl, baseUrl);
   const explicit = await runSetup(["-BaseUrl", baseUrl, "-CodexHome", explicitHome], environment);
   assert.equal(explicit.code, 0, explicit.stderr);
-  assert.equal(JSON.parse(readFileSync(join(explicitHome, "kagayoi-memory.json"), "utf8")).baseUrl, baseUrl);
+  assert.equal(JSON.parse(readFileSync(join(explicitHome, "remnifold.json"), "utf8")).baseUrl, baseUrl);
 });
 
 test("セットアップは認証ヘッダーをredirect先へ送らない", async (t) => {
@@ -195,7 +195,7 @@ test("セットアップは認証ヘッダーをredirect先へ送らない", asy
   const home = temporaryHome(t);
   const secret = "redirect-test-secret";
   const result = await runSetup(["-BaseUrl", redirector, "-CodexHome", home], {
-    KAGAYOI_MEMORY_API_KEY: secret,
+    REMNIFOLD_API_KEY: secret,
   });
   assert.notEqual(result.code, 0);
   assert.equal(redirectedRequests, 0);

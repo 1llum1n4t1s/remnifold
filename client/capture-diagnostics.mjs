@@ -26,5 +26,5 @@ export async function captureStage(code, operation) {
 export function captureFailureMessage(error) {
   const [stage, cause, action] = diagnostics.get(error && (typeof error === "object" || typeof error === "function") ? failures.get(error) : undefined)
     || ["capture", "unknown", "retry-or-repair"];
-  return `Kagayoi Memory capture failed; unacknowledged records will be retried. [stage=${stage}; cause=${cause}; action=${action}]\n`;
+  return `Remnifold capture failed; unacknowledged records will be retried. [stage=${stage}; cause=${cause}; action=${action}]\n`;
 }

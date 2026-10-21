@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "kagayoi-memory",
+  "name": "remnifold",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-02",
   "workers_dev": true,
@@ -14,7 +14,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "kagayoi-memory",
+      "database_name": "remnifold",
       "database_id": "replace-with-your-d1-database-id",
       "migrations_dir": "migrations"
     }

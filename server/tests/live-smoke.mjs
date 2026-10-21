@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-const baseUrl = process.env.KAGAYOI_MEMORY_API_URL;
-const apiKeyFile = process.env.KAGAYOI_MEMORY_API_KEY_FILE;
+const baseUrl = process.env.REMNIFOLD_API_URL || process.env.KAGAYOI_MEMORY_API_URL;
+const apiKeyFile = process.env.REMNIFOLD_API_KEY_FILE || process.env.KAGAYOI_MEMORY_API_KEY_FILE;
 if (!baseUrl || !apiKeyFile) {
-  throw new Error("KAGAYOI_MEMORY_API_URL and KAGAYOI_MEMORY_API_KEY_FILE are required");
+  throw new Error("REMNIFOLD_API_URL and REMNIFOLD_API_KEY_FILE are required");
 }
 
 const apiKey = readFileSync(apiKeyFile, "utf8").trim();

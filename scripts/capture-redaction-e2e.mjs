@@ -1,27 +1,5 @@
 import * as cleanupFs from "node:fs";
-import * as cleanupPath from "node:path";
-
-// 許可rootの境界とリンクを検査してから標準APIへ渡す。
-function assertCleanupPath(target, allowedRoot) {
-  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
-  const resolved = cleanupPath.resolve(target);
-  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
-  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
-  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
-    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (cleanupPath.dirname(current) === current) break;
-  }
-  const pending = [resolved];
-  while (pending.length) {
-    const current = pending.pop();
-    let stat;
-    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
-    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
-  }
-  return resolved;
-}
+import { assertCleanupPath } from "./lib/cleanup.mjs";
 // 実Stop hookからローカルHTTPまでの秘匿・再送を検証する。値はすべて架空。
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
@@ -36,7 +14,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const phase = process.argv[2] || "after";
 if (!["before", "after"].includes(phase) || process.argv.length > 3) throw new Error("Usage: node scripts/capture-redaction-e2e.mjs [before|after]");
 // 失敗条件: secret漏れ、説明消失、ID変化、receipt消失/重複、並行Stopの未到達、子/待機の終了漏れ。
-const home = await mkdtemp(join(tmpdir(), "kagayoi-capture-redaction-e2e-"));
+const home = await mkdtemp(join(tmpdir(), "remnifold-capture-redaction-e2e-"));
 const artifact = join(root, "dist", `capture-redaction-${phase}-validation.json`);
 const documents = [];
 const children = new Set();
@@ -103,7 +81,7 @@ let report;
 try {
   await new Promise((done, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", done); });
   const environment = { ...process.env, CODEX_HOME: home,
-    KAGAYOI_MEMORY_API_URL: `http://127.0.0.1:${server.address().port}`, KAGAYOI_MEMORY_API_KEY: configuredKey };
+    REMNIFOLD_API_URL: `http://127.0.0.1:${server.address().port}`, REMNIFOLD_API_KEY: configuredKey };
   const transcript = join(home, "rollout.jsonl");
   await writeFile(transcript, [
     { type: "session_meta", payload: { id: "redaction-e2e", cwd: root } },
@@ -133,7 +111,7 @@ try {
   check("quoted complete title values redacted", !stored.includes("fixture title space secret") && !stored.includes("fixture title,comma") && documents[0].metadata.title.includes('password="[REDACTED]"') && documents[0].metadata.title.includes("secret='[REDACTED]'"));
   check("configured and prefix keys redacted", !stored.includes(configuredKey) && !stored.includes("sk-proj-fixture0123456789abcdef"));
   check("discussion identifiers preserved", documents[0].content.includes(discussion));
-  const receiptDirectory = join(home, "kagayoi-memory", "capture-state");
+  const receiptDirectory = join(home, "remnifold", "capture-state");
   const receiptFiles = (await readdir(receiptDirectory)).filter((name) => name.endsWith(".json"));
   check("acknowledged ID recorded", receiptFiles.length === 1 && JSON.parse(await readFile(join(receiptDirectory, receiptFiles[0]), "utf8")).includes(documents[0].customId));
   const retry = await stop(payload, environment);
@@ -172,7 +150,7 @@ try {
   assert.equal(sent[0].customId, sent[1].customId);
   assert.equal(sent[2].customId, sent[3].customId);
   assert.notEqual(sent[0].customId, sent[2].customId);
-  const concurrentDirectory = join(concurrentHome, "kagayoi-memory", "capture-state");
+  const concurrentDirectory = join(concurrentHome, "remnifold", "capture-state");
   const concurrentReceipts = (await readdir(concurrentDirectory)).filter((name) => name.endsWith(".json"));
   assert.equal(concurrentReceipts.length, 1);
   const receipt = JSON.parse(await readFile(join(concurrentDirectory, concurrentReceipts[0]), "utf8"));
@@ -214,9 +192,10 @@ try {
   const projectionResult = await stop(projectionPayload, projectionEnvironment);
   const projected = documents.slice(projectionStart);
   assert.equal(projectionResult.code, 0); assert.equal(projected.length, 2);
-  check("ambient UI state is omitted from the captured index while source evidence is retained",
+  check("ambient UI state is omitted from new capture content while the actual request is retained",
     projected[0].metadata.memoryIndex.description === "Chrome extension implementationを確認してください。" &&
-    projected[0].content.includes("automatically supplied ambient UI state"));
+    !projected[0].content.includes("automatically supplied ambient UI state") &&
+    projected[0].content.includes("Chrome extension implementationを確認してください。"));
   check("question replies retain the actual answer without internal routing IDs in the index",
     projected[1].metadata.memoryIndex.description.includes("失敗時だけ再送してください") &&
     !/questionItemId|request_user_input_async|call_fixture/u.test(projected[1].metadata.memoryIndex.description) &&
@@ -239,7 +218,7 @@ try {
   if (process.platform === "win32") {
     await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(home, { allowedRoot: resolve(tmpdir()), recursive: true });
   } else {
-    if (dirname(home) !== resolve(tmpdir()) || !/^kagayoi-capture-redaction-e2e-[A-Za-z0-9]{6}$/u.test(home.slice(home.lastIndexOf("/") + 1))) throw new Error("Unexpected cleanup target");
+    if (dirname(home) !== resolve(tmpdir()) || !/^remnifold-capture-redaction-e2e-[A-Za-z0-9]{6}$/u.test(home.slice(home.lastIndexOf("/") + 1))) throw new Error("Unexpected cleanup target");
     async function verify(path) {
       const item = await lstat(path);
       assert.ok(!item.isSymbolicLink(), "Linked temporary item");

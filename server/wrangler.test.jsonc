@@ -1,18 +1,18 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "kagayoi-memory-test",
+  "name": "remnifold-test",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-02",
   "triggers": { "crons": ["*/15 * * * *", "0 18 * * *"] },
   "vars": { "AI_ENRICHMENT_MODE": "off" },
   "ai": { "binding": "AI" },
   "vectorize": [
-    { "binding": "MEMORY_VECTORS", "index_name": "kagayoi-memory-test" }
+    { "binding": "MEMORY_VECTORS", "index_name": "remnifold-test" }
   ],
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "kagayoi-memory",
+      "database_name": "remnifold",
       "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }

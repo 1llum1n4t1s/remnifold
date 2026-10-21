@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "kagayoi_memory": {
+    "remnifold": {
       "command": "node",
       "args": [
         "./scripts/mcp-launcher.mjs"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Setup Remnifold"
+  short_description: "Connect Codex to your self-hosted memory server"
+  default_prompt: "Use $setup-remnifold to set up or verify my self-hosted Remnifold connection."

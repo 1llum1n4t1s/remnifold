@@ -12,11 +12,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { isIP } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import { buildMemoryIndex } from "./memory-index.mjs";
 import { truncateUtf16 } from "./unicode-text.mjs";
+import { projectRequestText, requestProjectionEdits, projectTextSlice } from "./request-projection.mjs";
 
 const IMPORT_VERSION = 2;
 const DEFAULT_MAX_DOCUMENT_CHARS = 120_000;
@@ -25,13 +27,19 @@ const DEFAULT_LIST_LIMIT = 50;
 const RECENT_TRANSCRIPT_WINDOW_MS = 10 * 60 * 1000;
 const REDACTED = "[REDACTED]";
 const RENAMED_REPOSITORY_IDENTITIES = new Map([
+  ["github.com/1llum1n4t1s/remnifold", {
+    identity: "github.com/1llum1n4t1s/cloudflare-supermemory",
+    projectName: "cloudflare_supermemory",
+    displayProjectName: "kagayoi_memory", // 既存Kagayoi名で保存済みのproject provenanceを維持する。
+  }],
   ["github.com/1llum1n4t1s/kagayoi-memory", {
     identity: "github.com/1llum1n4t1s/cloudflare-supermemory",
     projectName: "cloudflare_supermemory",
   }],
 ]);
 export const DEFAULT_MEMORY_CONTAINER = "memories";
-export const CONFIG_FILE_NAME = "kagayoi-memory.json";
+export const CONFIG_FILE_NAME = "remnifold.json";
+export const LEGACY_CONFIG_FILE_NAMES = ["kagayoi-memory.json", "supermemory.json"];
 export const LEGACY_CONFIG_FILE_NAME = "supermemory.json";
 
 function fail(message) {
@@ -83,13 +91,10 @@ function parseArguments(argv) {
   if (options.statePath) {
     options.statePath = resolve(options.statePath);
   } else {
-    const currentStatePath = join(homedir(), ".kagayoi-memory", `history-import-v${IMPORT_VERSION}.json`);
-    const legacyStatePath = join(homedir(), ".codex-supermemory", `history-import-v${IMPORT_VERSION}.json`);
-    if (options.apply && !existsSync(currentStatePath) && existsSync(legacyStatePath)) {
-      mkdirSync(dirname(currentStatePath), { recursive: true });
-      renameSync(legacyStatePath, currentStatePath);
-    }
-    options.statePath = existsSync(currentStatePath) || !existsSync(legacyStatePath) ? currentStatePath : legacyStatePath;
+    options.statePath = join(homedir(), ".remnifold", `history-import-v${IMPORT_VERSION}.json`);
+    // 旧ファイルは読取専用の互換入口とし、新規保存はRemnifoldの状態へ集約する。
+    options.legacyStatePaths = [".kagayoi-memory", ".codex-supermemory"]
+      .map((name) => join(homedir(), name, `history-import-v${IMPORT_VERSION}.json`));
   }
   return options;
 }
@@ -141,21 +146,20 @@ function getProjectContext(cwd = process.cwd()) {
   const identity = legacy?.identity || remote || `path:${root}`;
   const provenanceProjectName = legacy?.projectName || projectName;
   return {
-    projectName,
+    projectName: legacy?.displayProjectName || projectName,
     containerTag: `repo_${provenanceProjectName}__${sha256(identity).slice(0, 16)}`,
   };
 }
 
 function loadConfig(codexHome) {
-  const environmentBaseUrl = [process.env.KAGAYOI_MEMORY_API_URL, process.env.SUPERMEMORY_API_URL]
+  const environmentBaseUrl = [process.env.REMNIFOLD_API_URL, process.env.KAGAYOI_MEMORY_API_URL, process.env.SUPERMEMORY_API_URL]
     .find((value) => typeof value === "string" && value.trim())?.trim() || "";
-  const environmentApiKey = [process.env.KAGAYOI_MEMORY_API_KEY, process.env.SUPERMEMORY_CODEX_API_KEY, process.env.CLOUDFLARE_MEMORY_API_KEY]
+  const environmentApiKey = [process.env.REMNIFOLD_API_KEY, process.env.KAGAYOI_MEMORY_API_KEY, process.env.SUPERMEMORY_CODEX_API_KEY, process.env.CLOUDFLARE_MEMORY_API_KEY]
     .find((value) => typeof value === "string" && value.trim())?.trim() || "";
   const currentConfigPath = join(codexHome, CONFIG_FILE_NAME);
-  const legacyConfigPath = join(codexHome, LEGACY_CONFIG_FILE_NAME);
-  const configPath = existsSync(currentConfigPath) ? currentConfigPath : legacyConfigPath;
+  const configPath = [currentConfigPath, ...LEGACY_CONFIG_FILE_NAMES.map((name) => join(codexHome, name))].find(existsSync);
   let config = {};
-  if (existsSync(configPath)) {
+  if (configPath) {
     try {
       config = JSON.parse(readFileSync(configPath, "utf8"));
       if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("invalid configuration");
@@ -169,7 +173,7 @@ function loadConfig(codexHome) {
   const baseUrl = environmentBaseUrl || (typeof config.baseUrl === "string" ? config.baseUrl.trim() : "");
   const apiKey = environmentApiKey || (typeof config.apiKey === "string" ? config.apiKey.trim() : "");
   if (!baseUrl || !apiKey) {
-    fail("Kagayoi Memory configuration requires baseUrl and apiKey (file values may be overridden by KAGAYOI_MEMORY_API_URL and KAGAYOI_MEMORY_API_KEY). Values are never printed.");
+    fail("Remnifold configuration requires baseUrl and apiKey (file values may be overridden by REMNIFOLD_API_URL and REMNIFOLD_API_KEY). Values are never printed.");
   }
 
   const normalizedBaseUrl = normalizeEndpoint(baseUrl);
@@ -181,14 +185,17 @@ function normalizeEndpoint(baseUrl) {
   try {
     parsed = new URL(baseUrl);
   } catch {
-    fail("Kagayoi Memory endpoint is invalid.");
+    fail("Remnifold endpoint is invalid.");
   }
   const hostname = parsed.hostname.toLowerCase();
-  const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+  // setupのIPAddress.IsLoopbackと揃え、URL正規化後のIPだけを判定する。
+  const ip = hostname.replace(/^\[|\]$/g, "");
+  const local = hostname === "localhost" || (isIP(ip) === 4 && ip.startsWith("127.")) ||
+    ip === "::1" || ip === "::ffff:7f00:1";
   const officialSupermemory = hostname === "supermemory.ai" || hostname.endsWith(".supermemory.ai");
   const acceptedProtocol = parsed.protocol === "https:" || (local && parsed.protocol === "http:");
   if (!acceptedProtocol || parsed.username || parsed.password || parsed.search || parsed.hash || officialSupermemory) {
-    fail("Refusing an unsupported Kagayoi Memory endpoint.");
+    fail("Refusing an unsupported Remnifold endpoint.");
   }
   return parsed.toString().replace(/\/+$/, "");
 }
@@ -205,7 +212,7 @@ async function api(config, path, { method = "GET", body } = {}) {
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   });
-  if (!response.ok) fail(`Kagayoi Memory API request failed (HTTP ${response.status}).`);
+  if (!response.ok) fail(`Remnifold API request failed (HTTP ${response.status}).`);
   return response.status === 204 ? null : response.json();
 }
 
@@ -268,7 +275,7 @@ function sanitizeText(value, knownSecrets, counter) {
   let text = value
     .replace(/<private>[\s\S]*?<\/private>/gi, REDACTED)
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
-    .replace(/<(?:kagayoi-memory|supermemory)-context>[\s\S]*?<\/(?:kagayoi-memory|supermemory)-context>/gi, "")
+    .replace(/<(?:remnifold|kagayoi-memory|supermemory)-context>[\s\S]*?<\/(?:remnifold|kagayoi-memory|supermemory)-context>/gi, "")
     .replace(/\r\n/g, "\n")
     .trim();
 
@@ -402,7 +409,7 @@ function cleanUserRequest(value) {
   if (typeof value !== "string") return "";
   let text = value.replace(/\r\n/g, "\n").trim();
   if (/^# AGENTS\.md instructions(?: for [^\n]*)?\s*\n/i.test(text)) return "";
-  for (const tag of ["recommended_plugins", "environment_context", "codex_internal_context", "kagayoi-memory-context", "kagayoi-memory-recall", "kagayoi-memory-index", "supermemory-context", "supermemory-recall", "supermemory-index", "system-reminder"]) {
+  for (const tag of ["recommended_plugins", "environment_context", "codex_internal_context", "remnifold-context", "remnifold-recall", "remnifold-index", "kagayoi-memory-context", "kagayoi-memory-recall", "kagayoi-memory-index", "supermemory-context", "supermemory-recall", "supermemory-index", "system-reminder"]) {
     text = text.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, "gi"), "");
   }
   const annotationBlocks = [];
@@ -457,12 +464,15 @@ async function readTaskTitles(codexHome) {
 function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars = DEFAULT_MAX_DOCUMENT_CHARS, containerTag) {
   const titleText = sanitizeText(title || transcript.turns[0]?.user.split("\n")[0] || "Codex task", [], { count: 0 });
   const legacyTitle = titleText.slice(0, 200);
-  const safeTitle = truncateUtf16(titleText, 200);
+  const safeTitle = truncateUtf16(projectRequestText(titleText).trim() || "Codex task", 200);
   const hasProjectProvenance = typeof project.containerTag === "string" && Boolean(project.containerTag.trim());
   const reuseExistingCapture = containerTag === undefined && hasProjectProvenance;
   containerTag ||= DEFAULT_MEMORY_CONTAINER;
   return transcript.turns.flatMap((turn, index) => {
     const body = `### User request\n${turn.user}\n\n### Final assistant response\n${turn.assistant}`;
+    const requestStart = "### User request\n".length;
+    const projectionEdits = requestProjectionEdits(turn.user, { keepInvocation: true })
+      .map((edit) => ({ ...edit, start: edit.start + requestStart, end: edit.end + requestStart }));
     // 本文ハッシュをIDに含め、再送は同じID、別内容は別IDにする。
     const identity = `${candidate.meta.id}:${index + 1}:${sha256(body)}`;
     const legacyHeader = `# ${legacyTitle}\n\nSession: ${candidate.meta.id}\nTurn: ${index + 1}\n\n`;
@@ -475,7 +485,7 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
       // 出力境界だけ最大1 code unit戻し、補助文字を次のpartへ全体で移す。
       const legacyPart = body.slice(offset, offset + size);
       const end = truncateUtf16(body, Math.min(offset + size, body.length)).length;
-      parts.push({ content: body.slice(start, end), hash: sha256(legacyPart).slice(0, 16) });
+      parts.push({ content: projectTextSlice(body, start, end, projectionEdits), hash: sha256(legacyPart).slice(0, 16) });
       start = end;
     }
     return parts.map((part, partIndex) => ({
@@ -488,17 +498,19 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
         ...(project.projectName ? { project: project.projectName } : {}),
         ...(hasProjectProvenance ? { sm_project_id: project.containerTag } : {}),
         sm_scope: hasProjectProvenance ? "project" : "shared", sm_source: "codex",
+        // 既存文書のprovenanceと重複判定を保つため、永続化済み識別子を維持する。
         sm_client: "codex-kagayoi-memory", sessionId: candidate.meta.id,
         rootSessionId: candidate.meta.rootSessionId, sessionKind: candidate.meta.isSubagent ? "subagent" : "root",
         turn: index + 1, part: partIndex + 1, parts: parts.length,
         captureVersion: 2, captureKey: `${identity}:${partIndex + 1}:${part.hash}`,
-        memoryIndex: buildMemoryIndex({
+        memoryIndex: { ...buildMemoryIndex({
           title: safeTitle,
           request: turn.user,
           response: turn.assistant,
           sourceUpdatedAt: turn.sourceTimestamp,
           sourceKind: "conversation",
-        }),
+        }), ...(!part.content.replace(/^### (?:User request|Final assistant response)\s*$/gm, "").trim()
+          ? { recallable: false, sections: [] } : {}) },
         // このturnを開始した最初の利用者イベントの記録日時。保存処理の実行日時ではない。
         ...(turn.sourceTimestamp ? { sourceTimestamp: turn.sourceTimestamp } : {}),
       },
@@ -625,9 +637,14 @@ async function main() {
     }
   }
   let created = 0;
-  let updated = 0;
   let unchanged = 0;
   const state = options.apply ? loadState(options.statePath) : null;
+  if (state) {
+    for (const legacyPath of options.legacyStatePaths || []) {
+      const legacyState = loadState(legacyPath);
+      state.documents = { ...legacyState.documents, ...state.documents };
+    }
+  }
   if (options.apply) {
     for (const document of planned) {
       const key = `${document.metadata.sm_project_id || document.containerTag}:${document.metadata.captureKey}`;
@@ -662,7 +679,7 @@ async function main() {
     existingDocuments: existingCount,
     existingHistoricalDocuments: existingHistory.size,
     created,
-    updated,
+    updated: 0,
     unchanged,
     stateFile: options.apply ? options.statePath : "not created in plan mode",
     nextStep: options.apply ? "Run the same command again to verify idempotency." : "Re-run with --apply to upload the sanitized task records.",

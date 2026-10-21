@@ -15,7 +15,7 @@ if (event === "SessionStart" || event === "UserPromptSubmit") {
   if (Object.keys(result).length) process.stdout.write(JSON.stringify(result));
 } else if (event === "PreToolUse") {
   const readOnly = new Set(["search_memory", "listTopics", "listSpaces", "listMemories", "listDocuments", "getDocument", "whoAmI"]);
-  const name = /^mcp__kagayoi_memory__(.+)$/.exec(payload.tool_name || "")?.[1];
+  const name = /^mcp__remnifold__(.+)$/.exec(payload.tool_name || "")?.[1];
   if (readOnly.has(name)) process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -30,7 +30,7 @@ if (event === "SessionStart" || event === "UserPromptSubmit") {
     const { capture } = await import("../client/capture.mjs");
     const result = await capture(payload);
     if (result.saved || result.pending) process.stdout.write(JSON.stringify({
-      systemMessage: `Kagayoi Memory: saved ${result.saved} documents; pending ${result.pending}.`,
+      systemMessage: `Remnifold: saved ${result.saved} documents; pending ${result.pending}.`,
     }));
   } catch (error) {
     process.stderr.write(captureFailureMessage(error));
