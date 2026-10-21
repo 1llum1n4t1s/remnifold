@@ -12,7 +12,7 @@ This repository packages the Remnifold self-hosted Cloudflare server and its Cod
 
 ## Local plugin update after a vava release
 
-`vava.config.json.localPlugin` is this repository's post-publication integration for the personal Codex plugin. It is separate from vava's Git-only `consumerUpdates.targets`: the personal marketplace source is not a Git repository.
+`vava.config.json.localPlugin` configures the personal release installation described in [DESIGN.md](DESIGN.md#release-installation). Run its updater on Windows with authenticated GitHub CLI access and the native Codex CLI available. Its external work root must be under `D:/Codex/remnifold`, outside the repository and selected Codex home, with no linked ancestors.
 
 - During vava preflight, read `localPlugin` and run its `verify` commands for the current version before deciding new versus resume. Verification compares the installed files with the release commit and does not depend on CI artifact retention. An already published version whose local installation is pending must resume that version; do not bump or publish again to repair the installation.
 - After the exact release commit's configured CI workflow succeeds and publishes its plugin artifact, run `ready`, then `update`, then every `verify` command from the repository root, substituting the fixed `NEW_VERSION`. This is a required release checkpoint, including resumed releases; do not require another installation request. Dry-run reports these commands without running the update.
@@ -21,7 +21,7 @@ This repository packages the Remnifold self-hosted Cloudflare server and its Cod
 - Installation verification does not prove that an already running chat has reloaded its MCP server or hooks. Report any required new chat/restart or hook trust separately, based on the actual CLI result and runtime checks.
 - The updater returns its external `workRoot`/`stagingPath`; clean this invocation's downloaded/extracted temporary files under the applicable cleanup rules after validation, retaining only evidence needed for a failed checkpoint. If obsolete managed files require Prunlet cleanup, keep the checkpoint blocked until that cleanup and re-verification finish.
 
-To exercise the update/retry/failure paths without changing the real installation, use `node scripts/local-plugin-update-e2e.mjs --archive <published-remnifold.tar.gz> --work-root <absolute-external-work-directory>`. The E2E launches the actual updater against isolated CLI fixtures; it does not publish or change remote memory.
+For updater changes, run `node scripts/local-plugin-update-e2e.mjs --archive <absolute-path-to-published-remnifold.tar.gz> --work-root <absolute-external-work-directory>` on Windows using the same work-root constraints. The E2E launches the actual updater against isolated GitHub/Codex CLI fixtures; it does not change the real installation or remote memory. Inspect `local-plugin-update-validation.json` in that work directory for successful installation, idempotent retry, recovery after CLI failure, verification without retained CI artifacts, and rejection before installation changes on invalid publication inputs or local edits. This check is separate from the normal CI checks below.
 
 ## Dependency maintenance
 
