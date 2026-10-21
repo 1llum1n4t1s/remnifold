@@ -10,6 +10,19 @@ This repository packages the Remnifold self-hosted Cloudflare server and its Cod
 - Run client tests, server tests, plugin validation, and `git diff --check` for affected changes.
 - Do not deploy, migrate a remote database, publish a package, create a remote repository, push, run `scripts/setup-topics.mjs --apply` or `pnpm -C server test:live`, or invoke remote consolidation without an explicit request.
 
+## Local plugin update after a vava release
+
+`vava.config.json.localPlugin` is this repository's post-publication integration for the personal Codex plugin. It is separate from vava's Git-only `consumerUpdates.targets`: the personal marketplace source is not a Git repository.
+
+- During vava preflight, read `localPlugin` and run its `verify` commands for the current version before deciding new versus resume. Verification compares the installed files with the release commit and does not depend on CI artifact retention. An already published version whose local installation is pending must resume that version; do not bump or publish again to repair the installation.
+- After the exact release commit's configured CI workflow succeeds and publishes its plugin artifact, run `ready`, then `update`, then every `verify` command from the repository root, substituting the fixed `NEW_VERSION`. This is a required release checkpoint, including resumed releases; do not require another installation request. Dry-run reports these commands without running the update.
+- Use the downloaded published artifact, validate its files against that release commit, and install through the official Codex plugin CLI. Preserve the connection, capture receipts, and hook/MCP registration. Never edit Codex's plugin cache directly, add a duplicate registration, or commit/push the non-Git marketplace source.
+- Record the local result as `complete` or `already-current` only after the official installed version and both marketplace/cache contents match. A failed update or verification remains `pending`/`blocked` and must be reported even when publication succeeded. Re-run this checkpoint idempotently on resume.
+- Installation verification does not prove that an already running chat has reloaded its MCP server or hooks. Report any required new chat/restart or hook trust separately, based on the actual CLI result and runtime checks.
+- The updater returns its external `workRoot`/`stagingPath`; clean this invocation's downloaded/extracted temporary files under the applicable cleanup rules after validation, retaining only evidence needed for a failed checkpoint. If obsolete managed files require Prunlet cleanup, keep the checkpoint blocked until that cleanup and re-verification finish.
+
+To exercise the update/retry/failure paths without changing the real installation, use `node scripts/local-plugin-update-e2e.mjs --archive <published-remnifold.tar.gz> --work-root <absolute-external-work-directory>`. The E2E launches the actual updater against isolated CLI fixtures; it does not publish or change remote memory.
+
 ## Dependency maintenance
 
 - Update `server/package.json` and `server/pnpm-lock.yaml` together, then verify the frozen-lockfile install and server checks below.
