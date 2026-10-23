@@ -119,9 +119,14 @@ export async function buildPackage({ root = REPOSITORY_ROOT, output = DEFAULT_OU
   await mkdir(path.resolve(resolvedRoot, "dist"), { recursive: true });
   await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(staging, { allowedRoot: path.resolve(resolvedRoot, "dist"), recursive: true, force: true });
   try {
+    const createdDirectories = new Set();
     for (const relativePath of files) {
       const destination = path.join(staging, relativePath);
-      await mkdir(path.dirname(destination), { recursive: true });
+      const directory = path.dirname(destination);
+      if (!createdDirectories.has(directory)) {
+        await mkdir(directory, { recursive: true });
+        createdDirectories.add(directory);
+      }
       await copyFile(path.join(resolvedRoot, relativePath), destination);
     }
     await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(resolvedOutput, { allowedRoot: path.resolve(resolvedRoot, "dist"), recursive: true, force: true });

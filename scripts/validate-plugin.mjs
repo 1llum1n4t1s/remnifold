@@ -128,29 +128,43 @@ function validateHooksManifest(hooksManifest, errors) {
   }
 }
 
-async function validateRelativeImports(root, files, errors) {
-  const moduleFiles = files.filter((file) => /\.(?:js|mjs)$/u.test(file));
-  for (const relativePath of moduleFiles) {
-    const source = await readFile(path.join(root, relativePath), "utf8");
-    const imports = source.matchAll(/(?:\bfrom\s*|\bimport\s*\()\s*["'](\.{1,2}\/[^"']+)["']/gu);
-    for (const match of imports) {
-      const target = path.resolve(root, path.dirname(relativePath), match[1]);
-      const escaped = path.relative(root, target).startsWith("..");
-      if (escaped) {
-        errors.push(`${relativePath}: import escapes the plugin (${match[1]})`);
-        continue;
-      }
-      await access(target).catch(() => errors.push(`${relativePath}: import target is missing (${match[1]})`));
+async function validateRelativeImports(root, relativePath, source, errors) {
+  const imports = source.matchAll(/(?:\bfrom\s*|\bimport\s*\()\s*["'](\.{1,2}\/[^"']+)["']/gu);
+  for (const match of imports) {
+    const target = path.resolve(root, path.dirname(relativePath), match[1]);
+    const escaped = path.relative(root, target).startsWith("..");
+    if (escaped) {
+      errors.push(`${relativePath}: import escapes the plugin (${match[1]})`);
+      continue;
     }
+    await access(target).catch(() => errors.push(`${relativePath}: import target is missing (${match[1]})`));
   }
 }
 
-async function validateText(root, files, errors) {
+function validateText(relativePath, source, errors) {
+  if (/\b(?:TODO|FIXME)\b/iu.test(source)) errors.push(`${relativePath}: unresolved TODO/FIXME marker`);
+  if (source.includes("\0")) errors.push(`${relativePath}: contains a NUL byte`);
+}
+
+async function validateSources(root, files, errors) {
+  const moduleTextErrors = new Map();
+  for (const relativePath of files.filter((file) => /\.(?:js|mjs)$/u.test(file))) {
+    const source = await readFile(path.join(root, relativePath), "utf8");
+    await validateRelativeImports(root, relativePath, source, errors);
+    const textErrors = [];
+    validateText(relativePath, source, textErrors);
+    moduleTextErrors.set(relativePath, textErrors);
+  }
+
+  // import の指摘を先にし、テキストの指摘は元のファイル順に戻す。
   for (const relativePath of files) {
     if (!TEXT_EXTENSIONS.has(path.extname(relativePath))) continue;
+    if (moduleTextErrors.has(relativePath)) {
+      errors.push(...moduleTextErrors.get(relativePath));
+      continue;
+    }
     const source = await readFile(path.join(root, relativePath), "utf8");
-    if (/\b(?:TODO|FIXME)\b/iu.test(source)) errors.push(`${relativePath}: unresolved TODO/FIXME marker`);
-    if (source.includes("\0")) errors.push(`${relativePath}: contains a NUL byte`);
+    validateText(relativePath, source, errors);
   }
 }
 
@@ -201,8 +215,7 @@ export async function validatePlugin(root = REPOSITORY_ROOT) {
   }
 
   if (files.length) {
-    await validateRelativeImports(resolvedRoot, files, errors);
-    await validateText(resolvedRoot, files, errors);
+    await validateSources(resolvedRoot, files, errors);
   }
 
   if (errors.length) {
