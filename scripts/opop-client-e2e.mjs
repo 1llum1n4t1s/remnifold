@@ -35,6 +35,7 @@ const server = createServer(async (request, response) => {
   response.setHeader("Content-Type", "application/json");
   if (request.url === "/v4/search") response.end(JSON.stringify({ searchScope: "all-containers", searchedContainers: ["fixture-space"], spaceDiscoveryComplete: true,
     results: mode === "all-failed" ? [bad] : mode === "success" ? [good] : [good, bad] }));
+  else if (request.url === "/v3/documents/list" && JSON.parse(text).recentTasks === true) response.end(JSON.stringify({ recentTasks: true, documents: [] }));
   else { response.writeHead(503); response.end(JSON.stringify({ error: marker })); }
 });
 

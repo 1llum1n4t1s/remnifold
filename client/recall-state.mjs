@@ -59,8 +59,8 @@ export function recallState(payload, codexHome, event) {
       } finally { closeSync(file); }
     }
     return {
-      has(item, formatted) { return state.documents[digest(`${item.containerTag}:${item.id}`)] === digest(`${formatted}\n${item.updatedAt || ""}\n${item.sourceUpdatedAt || ""}`); },
-      mark(item, formatted) { state.documents[digest(`${item.containerTag}:${item.id}`)] = digest(`${formatted}\n${item.updatedAt || ""}\n${item.sourceUpdatedAt || ""}`); },
+      has(item, formatted, channel = "") { return state.documents[digest(`${item.containerTag}:${item.id}${channel ? `:${channel}` : ""}`)] === digest(`${formatted}\n${item.updatedAt || ""}\n${item.sourceUpdatedAt || ""}`); },
+      mark(item, formatted, channel = "") { state.documents[digest(`${item.containerTag}:${item.id}${channel ? `:${channel}` : ""}`)] = digest(`${formatted}\n${item.updatedAt || ""}\n${item.sourceUpdatedAt || ""}`); },
       save() {
         let temporary;
         try {

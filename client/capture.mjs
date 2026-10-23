@@ -88,7 +88,7 @@ export async function capture(payload, { codexHome = process.env.CODEX_HOME || j
   if (!cwd) throw markCaptureFailure(new Error("Missing project path."), "transcript");
   const project = await captureStage("transcript", () => getProjectContext(cwd));
   const transcript = await captureStage("transcript", () => parseTaskTranscript(candidate.filePath, [config.apiKey]));
-  const titles = await captureStage("transcript", () => readTaskTitles(codexHome));
+  const titles = await captureStage("transcript", () => readTaskTitles(codexHome, new Set([candidate.meta.id])));
   const title = sanitizeText(titles.get(candidate.meta.id) || "", [config.apiKey], { count: 0 });
   const documents = buildTurnDocuments(candidate, transcript, project, title);
   // 応答を確認した文書だけ記録する。中断後の再送も同じcustomIdなので上書き損失は起きない。

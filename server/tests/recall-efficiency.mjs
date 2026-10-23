@@ -3,6 +3,8 @@
 // stale vector混入、原文固有語欠落/semantic自動注入、legacy出典破壊、checkpoint過剰抑制、
 // 互換fallback誤判定、空prompt通信、パス内のプロジェクト欠落、識別子の見出し不一致、
 // バージョン番号の過剰除外。実APIと実clientを全migration済みSQLiteへ接続する。
+// 直近作業: 意味一致への依存、現在session/非capture/optout/checkpoint混入、task集約前の上限、
+// 再import日時の誤用、timezone/無効日付、multipart/revision重複、legacy欠落、不正入力受理。
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -15,7 +17,9 @@ import { runHook } from "../../client/memory-hooks.mjs";
 import { callTool } from "../../client/mcp-server.mjs";
 import { buildMemoryIndex } from "../../client/memory-index.mjs";
 
-const artifactPath = resolve(import.meta.dirname, "../../dist/recall-efficiency-validation.json");
+const artifactPath = process.env.REMNIFOLD_VALIDATION_DIR
+  ? resolve(process.env.REMNIFOLD_VALIDATION_DIR, "recall-efficiency-validation.json")
+  : resolve(import.meta.dirname, "../../dist/recall-efficiency-validation.json");
 const migrations = readdirSync(resolve(import.meta.dirname, "../migrations")).filter((name) => name.endsWith(".sql")).sort();
 const embedding = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
 const opposite = embedding.map((value) => -value);
@@ -146,6 +150,16 @@ const cases = [];
 const scenario = (name, run) => cases.push({ name, run });
 const ids = (result) => result.results.map((row) => row.id);
 const index = (title, request = title) => ({ memoryIndex: buildMemoryIndex({ title, request, sourceUpdatedAt: sourceDate }) });
+function assertRecallTraffic(f, searches, recent) {
+  const related = f.metrics.requests.filter((row) => row.path === "/v4/search");
+  const recentRequests = f.metrics.requests.filter((row) => row.path === "/v3/documents/list" && row.body?.recentTasks === true);
+  assert.equal(related.length, searches);
+  assert.equal(recentRequests.length, recent);
+  assert.equal(f.metrics.requests.length, searches + recent, "unexpected discovery or document hydration request");
+  for (const row of recentRequests) assert.equal(row.body.projection, "index");
+  assert.equal(f.metrics.embeddings, searches, "recent listing must not add embeddings");
+  assert.equal(f.metrics.vectorQueries.length, searches, "recent listing must not add vector queries");
+}
 
 scenario("automatic project-path recall excludes machine prefixes and generic request noise", async (f) => {
   const wanted = await f.seed("other-folder", "# Remnifold\n索引の読込", index("Remnifold", "索引の読込"));
@@ -156,7 +170,7 @@ scenario("automatic project-path recall excludes machine prefixes and generic re
   f.reset(); const hook = await f.hook(String.raw`"C:\Users\IMT\dev\remnifold" メモリー機能側で修正で最適化が出来そうな部分が発見できていたら修正してください`);
   const text = hook.hookSpecificOutput?.additionalContext || "";
   assert.ok(text.includes(wanted)); assert.ok(noise.every((id) => !text.includes(id)));
-  assert.equal(f.metrics.requests.length, 1);
+  assertRecallTraffic(f, 1, 1);
   assert.doesNotMatch(f.metrics.requests[0].body.q, /Users|IMT|\bdev\b/u);
   return { selected: 1, excluded: noise.length, requests: f.metrics.requests.length, crossFolderMatch: true };
 });
@@ -197,14 +211,14 @@ scenario("legacy hydration uses the same identifier matching for the selected he
   assert.equal(row.provenance.projectId, "legacy-source"); assert.equal(row.sourceUpdatedAt, sourceDate);
   assert.ok(f.metrics.requests.some((request) => request.path === `/v3/documents/${wanted}`));
 });
-scenario("generic repair wording skips automatic requests but remains manually searchable", async (f) => {
+scenario("generic repair wording requests only recent tasks and remains manually searchable", async (f) => {
   const wanted = await f.seed("manual-history", "# 最適化の記録\n修正内容", index("最適化の記録"));
   f.reset(); assert.deepEqual(await f.hook("修正して最適化してください"), {});
-  assert.equal(f.metrics.requests.length, 0); assert.equal(f.metrics.embeddings, 0);
+  assertRecallTraffic(f, 0, 1);
   f.reset(); assert.ok(ids(await f.search("最適化")).includes(wanted));
 });
 
-scenario("59 legacy spaces: search, hook and MCP each use one API/embed/vector and zero document GET", async (f) => {
+scenario("59 legacy spaces: related search uses one API/embed/vector and hook adds one recent listing", async (f) => {
   const wanted = await f.seed("space-58", "# AbortSignal timeout\n\nAbortSignal timeout implementation evidence", { sm_project_id: "legacy-project", sourceTimestamp: sourceDate });
   for (let i = 0; i < 58; i++) await f.seed(`space-${i}`, `# Gardening ${i}\n\nUnrelated flowers`);
   const runs = [];
@@ -214,8 +228,7 @@ scenario("59 legacy spaces: search, hook and MCP each use one API/embed/vector a
     runs.push({ route, elapsedMs: performance.now() - start, requests: f.metrics.requests.length, embeddings: f.metrics.embeddings, vectorQueries: f.metrics.vectorQueries.length, responseBytes: f.metrics.responseBytes });
     const body = route === "runHook" ? JSON.stringify(result) : JSON.stringify(route === "MCP callTool" ? result.structuredContent : result);
     assert.ok(body.includes(wanted), `${route} missed legacy matching record`);
-    assert.equal(f.metrics.requests.length, 1, `${route} multiplied API calls`);
-    assert.equal(f.metrics.embeddings, 1); assert.equal(f.metrics.vectorQueries.length, 1);
+    assertRecallTraffic(f, 1, route === "runHook" ? 1 : 0);
     assert.equal(f.metrics.vectorQueries[0].namespace, undefined);
   }
   return { runs };
@@ -263,7 +276,7 @@ scenario("body-only query returns bounded original excerpt, but unrelated semant
   assert.equal(row.metadata.memoryIndex.title, "Request transport");
   f.reset(); const hook = await f.hook("AbortSignal.timeout"); const text = hook.hookSpecificOutput?.additionalContext || "";
   assert.ok(text.includes(wanted)); assert.match(text, /原文|original (?:quote|excerpt)/iu); assert.match(text, /AbortSignal\.timeout/u); assert.ok(!text.includes(unrelated));
-  assert.equal(f.metrics.requests.length, 1); assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM facts").get().n, 0);
+  assertRecallTraffic(f, 1, 1); assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM facts").get().n, 0);
   f.reset(); assert.ok(ids(await f.search("AbortSignal.timeout")).includes(unrelated));
 });
 scenario("recallable false stays manually discoverable and never automatically injected", async (f) => {
@@ -303,6 +316,87 @@ scenario("legacy list projection builds compact index and preserves authoritativ
   assert.equal(original.document.index.provenance, undefined);
   const recalled = await f.search("旧文書", { automatic: true });
   assert.equal(recalled.results.find((row) => row.id === id).provenance.projectId, "legacy-list-source");
+});
+scenario("recent completed tasks cross projects without matches and paginate after task grouping", async (f) => {
+  const capture = (sessionId, date, extra = {}) => ({ type: "conversation", sessionId, captureVersion: 2,
+    turn: 1, part: 1, parts: 1, sm_project_id: "other-project", sourceTimestamp: date,
+    memoryIndex: buildMemoryIndex({ title: "別作業の完了", request: "果樹の配置を変更", sourceUpdatedAt: date }), ...extra });
+  const firstDate = "2026-10-22T10:00:00Z";
+  const first = await f.seed("unrelated-space", "# 果樹\n配置を完了しました", capture("task-one", firstDate, { turn: 3 }));
+  for (let i = 0; i < 55; i++) {
+    const id = await f.seed(i % 2 ? "shared-space" : "unrelated-space", `# 分割 ${i}\n完了しました`, capture("task-one", firstDate, { turn: i % 2 ? 2 : 3, part: i + 2, parts: 56 }));
+    f.db.prepare("UPDATE memories SET updated_at = '2099-01-01T00:00:00Z' WHERE id = ?").run(id);
+  }
+  const second = await f.seed("other-space", "# 料理\n手順の整理を完了", capture("task-two", "2026-10-22T09:00:00Z"));
+  const legacy = await f.seed("legacy-space", "# 旧記録\n作業を完了しました", {
+    type: "conversation", sessionId: "legacy-task", completedAt: "2026-10-21T12:00:00Z",
+  });
+  const old = await f.seed("reimport-space", "# 再取込\n過去の作業", capture("old-task", "2020-01-01T00:00:00Z"));
+  f.db.prepare("UPDATE memories SET updated_at = '2099-01-01T00:00:00Z' WHERE id = ?").run(old);
+  const excluded = [];
+  excluded.push(await f.seed("current", "# 現在\n完了", capture("current-task", "2098-01-01T00:00:00Z")));
+  excluded.push(await f.seed("optout", "# 除外\n完了", capture("optout", firstDate, { memoryIndex: { ...index("除外").memoryIndex, recallable: false } })));
+  excluded.push(await f.seed("checkpoint", "# 統合\n完了", capture("checkpoint", firstDate, { sm_consolidation: true })));
+  excluded.push(await f.seed("manual", "# 手動\n完了", { ...capture("manual", firstDate), type: "note" }));
+  excluded.push(await f.seed("no-session", "# 無所属\n完了", { ...capture("", firstDate) }));
+  const forgotten = await f.seed("forgotten", "# 忘却\n完了", capture("forgotten", firstDate));
+  await f.raw("/v4/memories", { containerTag: "forgotten", documentId: forgotten }, "DELETE"); excluded.push(forgotten);
+  const body = { projection: "index", recentTasks: true, excludeSessionId: "current-task", limit: 2, page: 1 };
+  f.reset();
+  const result = await f.raw("/v3/documents/list", body);
+  assert.equal(result.status, 200); assert.equal(result.body.recentTasks, true);
+  assert.deepEqual(result.body.documents.map((row) => row.id), [first, second]);
+  assert.equal(result.body.pagination.totalItems, 4); assert.equal(result.body.pagination.hasMore, true);
+  assert.equal(result.body.documents[0].metadata.sessionId, "task-one");
+  assert.equal(result.body.documents[0].metadata.turn, 3); assert.equal(result.body.documents[0].metadata.part, 1);
+  assert.equal(result.body.documents[0].provenance.projectId, "other-project");
+  const page2 = await f.raw("/v3/documents/list", { ...body, page: 2 });
+  assert.deepEqual(page2.body.documents.map((row) => row.id), [legacy, old]);
+  assert.equal(page2.body.pagination.hasMore, false);
+  assert.ok(![...result.body.documents, ...page2.body.documents].some((row) => excluded.includes(row.id)));
+  assert.equal(f.metrics.embeddings, 0); assert.equal(f.metrics.vectorQueries.length, 0);
+  const ordinary = await f.raw("/v3/documents/list", { projection: "index", containerTag: "manual" });
+  assert.equal(ordinary.body.documents.length, 1); assert.equal(ordinary.body.recentTasks, undefined);
+});
+scenario("recent task chronology validates dates, respects timezones and selects revision representatives", async (f) => {
+  const seed = async (tag, sessionId, metadata, createdAt = "2020-01-01T00:00:00Z") => {
+    const id = await f.seed(tag, `# ${tag}\n作業を完了しました`, { type: "conversation", sessionId, ...metadata });
+    f.db.prepare("UPDATE memories SET created_at = ?, updated_at = ? WHERE id = ?").run(createdAt, "2099-01-01T00:00:00Z", id);
+    return id;
+  };
+  const earlyZone = await seed("zone-a", "same-session", { sourceTimestamp: "2026-10-23T01:00:00+09:00" });
+  const lateZone = await seed("zone-b", "same-session", { sourceTimestamp: "2026-10-22T18:00:00Z" });
+  const fallback = await seed("invalid-date", "invalid", { memoryIndex: { sourceUpdatedAt: "not-a-date" }, sourceTimestamp: "2026-02-30T00:00:00Z", sourceUpdatedAt: "2026-10-22T17:00:00Z" });
+  const invalidFallback = await seed("invalid-all", "invalid-all", { sourceTimestamp: "not-a-date", completedAt: 9999999 });
+  const dateOnly = await seed("date-only", "date-only", { memoryIndex: { sourceUpdatedAt: "2099-01-01" }, sourceTimestamp: "2099-01-01" }, "2019-01-01T00:00:00Z");
+  const olderRevision = await seed("revisions", "revision-task", { sm_project_id: "revision-project", sourceTimestamp: "2026-10-22T19:00:00Z", turn: 4, part: 1 });
+  const latestRevision = await seed("revisions", "revision-task", { sm_project_id: "revision-project", sourceTimestamp: "2026-10-22T19:00:00Z", turn: 4, part: 1 }, "2020-01-02T00:00:00Z");
+  f.db.prepare("UPDATE memories SET updated_at = '2020-01-03T00:00:00Z' WHERE id = ?").run(latestRevision);
+  // 旧版だけを後から更新しても、後に作成された新版を代表にする。
+  const patched = await f.raw(`/v3/documents/${olderRevision}`, { content: "# 旧版の再更新\n元の完了記録を再送しました" }, "PATCH");
+  assert.equal(patched.status, 200); await f.drain();
+  const revisionDates = f.db.prepare("SELECT created_at, updated_at FROM memories WHERE id IN (?, ?) ORDER BY created_at ASC").all(olderRevision, latestRevision);
+  assert.ok(revisionDates[0].created_at < revisionDates[1].created_at);
+  assert.ok(revisionDates[0].updated_at > revisionDates[1].updated_at);
+  const latestTurn = await seed("turns", "turn-task", { sourceTimestamp: "2026-10-22T20:00:00Z", turn: 9, part: 1 });
+  await seed("turns", "turn-task", { sourceTimestamp: "2026-10-22T20:00:00Z", turn: 8, part: 1 });
+  const priority = await seed("index-date", "index-task", { memoryIndex: { sourceUpdatedAt: "2026-10-22T21:00:00Z" }, sourceTimestamp: "2020-01-01T00:00:00Z" });
+  const result = await f.raw("/v3/documents/list", { projection: "index", recentTasks: true, limit: 50 });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.documents.map((row) => row.id), [priority, latestTurn, latestRevision, lateZone, fallback, earlyZone, invalidFallback, dateOnly]);
+  assert.equal(result.body.pagination.totalItems, 8);
+});
+scenario("recent task list rejects invalid mode and session inputs", async (f) => {
+  for (const body of [
+    { recentTasks: "true", projection: "index" }, { recentTasks: true },
+    { recentTasks: true, projection: "full" }, { recentTasks: true, projection: "capture" },
+    { recentTasks: true, projection: "index", containerTag: "scoped" },
+    { recentTasks: true, projection: "index", topic: "scoped" },
+    ...[null, 1, "", "  ", "a".repeat(161)].map((excludeSessionId) => ({ recentTasks: true, projection: "index", excludeSessionId })),
+    { projection: "index", excludeSessionId: "current" }, { recentTasks: false, projection: "index", excludeSessionId: "current" },
+  ]) assert.equal((await f.raw("/v3/documents/list", body)).status, 400, JSON.stringify(body));
+  const result = await f.raw("/v3/documents/list", { recentTasks: false, projection: "index" });
+  assert.equal(result.status, 200); assert.equal(result.body.recentTasks, undefined);
 });
 scenario("substantial brief continuation capture is redacted, retry-stable and recalled through its timeout section", async (f) => {
   const secret = "fixture-configured-sensitive-value";
@@ -452,9 +546,11 @@ scenario("MCP manual body-only search displays the original query excerpt", asyn
   assert.match(text, /原文の該当箇所/u); assert.match(text, /AbortSignal\.timeout/u); assert.equal(f.metrics.requests.length, 1);
 });
 scenario("empty prompts and SessionStart send no API or AI traffic", async (f) => {
-  f.reset(); assert.deepEqual(await f.hook(""), {}); assert.deepEqual(await f.hook("この その あの"), {});
+  f.reset(); assert.deepEqual(await f.hook(""), {});
   assert.deepEqual(await runHook("SessionStart", {}, { request: f.request, settings, context }), {});
   assert.equal((await f.search(" ")).results.length, 0); assert.equal(f.metrics.requests.length, 0); assert.equal(f.metrics.embeddings, 0);
+  f.reset(); assert.deepEqual(await f.hook("この その あの"), {});
+  assertRecallTraffic(f, 0, 1);
 });
 
 const report = { command: "node --experimental-transform-types server/tests/recall-efficiency.mjs", node: process.version, platform: process.platform, arch: process.arch, migrations,

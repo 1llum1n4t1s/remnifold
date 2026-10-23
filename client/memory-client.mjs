@@ -29,6 +29,7 @@ export function readSettings(codexHome = process.env.CODEX_HOME || join(homedir(
     codexHome,
     recallMode: config.recallMode || "direct",
     maxMemories: Math.max(1, Math.min(5, Number(config.maxMemories) || 3)),
+    maxRecentTasks: Number.isInteger(config.maxRecentTasks) ? Math.max(0, Math.min(3, config.maxRecentTasks)) : 2,
     minimumSimilarity: Math.max(0.65, Math.min(0.95, Number(config.similarityThreshold) || 0.70)),
     projectContainerTag: config.projectContainerTag,
     userContainerTag: config.userContainerTag,
@@ -327,6 +328,19 @@ export function formatSearchResult(result) {
   const failure = result.failedContainers.length || result.failedDocuments?.length ? `\nIncomplete search: ${result.failedContainers.length} spaces and ${result.failedDocuments?.length || 0} document indexes were unavailable.` : "";
   const discovery = result.spaceDiscoveryComplete === false ? "\nIncomplete space discovery: the API returned its 100-space limit, so additional spaces may exist." : "";
   return `${text}${failure}${discovery}\nWhen an entry appears applicable, read the original with getDocument(documentId), validate it against the current implementation, and reuse the parts that still fit.`;
+}
+
+export async function recentTaskIndex({ sessionId, limit = 2, request = api } = {}) {
+  const response = await request("/v3/documents/list", { body: {
+    projection: "index", recentTasks: true, page: 1, limit,
+    ...(typeof sessionId === "string" && sessionId.trim() ? { excludeSessionId: sessionId.trim() } : {}),
+  } });
+  // 旧サーバーが未知のオプションを無視して返した通常一覧は、直近の作業と見なさない。
+  if (response?.recentTasks !== true) return [];
+  if (!Array.isArray(response.documents)) throw new Error("Invalid recent task response");
+  return response.documents.map((document) => documentIndex(document))
+    .filter((index) => index.id && index.containerTag && index.recallable && !index.consolidation &&
+      (!sessionId || index.sessionId !== sessionId)).slice(0, limit);
 }
 
 export async function listIndex({ containerTag, topic, page = 1, limit = 10, request = api } = {}) {

@@ -53,6 +53,8 @@ const server = createServer(async (request, response) => {
     if (request.url === "/v4/search") {
       metrics.searches++; lastQuery = JSON.parse(body).q;
       result = { searchScope: "all-containers", searchedContainers: ["fixture-space"], spaceDiscoveryComplete: true, results: searchRows };
+    } else if (request.url === "/v3/documents/list" && JSON.parse(body).recentTasks === true) {
+      result = { recentTasks: true, documents: [] };
     } else if (request.method === "POST" && request.url === "/v3/documents") {
       const document = JSON.parse(body); captured.push(document); metrics.captures++;
       result = { id: `capture-${captured.length}` };

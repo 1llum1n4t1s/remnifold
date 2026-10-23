@@ -115,33 +115,38 @@ function matchingSection(content, terms) {
 
 export function documentIndex(document, fallbackContainer, terms = []) {
   const metadata = document.metadata && typeof document.metadata === "object" ? document.metadata : {};
-  const originalContent = String(document.content || document.memory || document.summary || "");
-  const content = matchingSection(originalContent, terms);
-  const sourceDates = [...new Set([...originalContent.matchAll(/^updated_at:\s*(\S+)\s*$/gm)].map((match) => match[1]).filter(validDate))];
-  const originalDate = sourceDates.length === 1 ? sourceDates[0] : undefined;
-  const request = content.match(/### User request\s*\n([\s\S]*?)(?=\n### Final assistant response|$)/)?.[1];
-  const response = content.match(/### Final assistant response\s*\n([\s\S]*)/)?.[1];
-  const headings = [...content.matchAll(/^#{1,4}\s+(.+)$/gm)].map((match) => match[1]);
-  const heading = headings.find((h) => !/^Codex saved memory import:/i.test(h)) || headings[0];
-  const importedTitle = heading?.replace(/^Codex saved memory import:\s*/i, "");
   const saved = metadata.memoryIndex?.version === INDEX_VERSION ? metadata.memoryIndex : null;
-  const index = saved ? buildMemoryIndex({
-    title: saved.title,
-    request: degradedIndexRequest(saved.description) ? indexRequestText(request).trim() || saved.title : saved.description,
-    response: "",
-    sourceUpdatedAt: saved.sourceUpdatedAt,
-    sourceKind: saved.sourceKind,
-  }) : buildMemoryIndex({
-    title: metadata.title || (document.title && !/^Memory [a-f0-9]+$/i.test(document.title) ? document.title : importedTitle),
-    request: request || content.match(/^description:\s*(.+)$/m)?.[1] || firstText(content),
-    response,
-    sourceUpdatedAt: metadata.sourceTimestamp || metadata.sourceUpdatedAt || metadata.completedAt || originalDate,
-    sourceKind: metadata.type === "conversation" ? "conversation" : "historical-document",
-  });
+  let index;
+  if (saved) {
+    let description = saved.description;
+    if (degradedIndexRequest(description)) {
+      const content = matchingSection(String(document.content || document.memory || document.summary || ""), terms);
+      const request = content.match(/### User request\s*\n([\s\S]*?)(?=\n### Final assistant response|$)/)?.[1];
+      description = indexRequestText(request).trim() || saved.title;
+    }
+    index = buildMemoryIndex({ title: saved.title, request: description, response: "",
+      sourceUpdatedAt: saved.sourceUpdatedAt, sourceKind: saved.sourceKind });
+  } else {
+    const originalContent = String(document.content || document.memory || document.summary || "");
+    const content = matchingSection(originalContent, terms);
+    const sourceDates = [...new Set([...originalContent.matchAll(/^updated_at:\s*(\S+)\s*$/gm)].map((match) => match[1]).filter(validDate))];
+    const originalDate = sourceDates.length === 1 ? sourceDates[0] : undefined;
+    const request = content.match(/### User request\s*\n([\s\S]*?)(?=\n### Final assistant response|$)/)?.[1];
+    const response = content.match(/### Final assistant response\s*\n([\s\S]*)/)?.[1];
+    const headings = [...content.matchAll(/^#{1,4}\s+(.+)$/gm)].map((match) => match[1]);
+    const heading = headings.find((h) => !/^Codex saved memory import:/i.test(h)) || headings[0];
+    const importedTitle = heading?.replace(/^Codex saved memory import:\s*/i, "");
+    index = buildMemoryIndex({
+      title: metadata.title || (document.title && !/^Memory [a-f0-9]+$/i.test(document.title) ? document.title : importedTitle),
+      request: request || content.match(/^description:\s*(.+)$/m)?.[1] || firstText(content), response,
+      sourceUpdatedAt: metadata.sourceTimestamp || metadata.sourceUpdatedAt || metadata.completedAt || originalDate,
+      sourceKind: metadata.type === "conversation" ? "conversation" : "historical-document",
+    });
+    if (!request && !metadata.title && !heading) index.recallable = false;
+  }
   if (saved && Array.isArray(saved.sections)) index.sections = saved.sections.filter((s) => typeof s === "string").slice(0, 4).map((s) => shortText(s, 60));
   if (saved?.recallable === false) index.recallable = false;
   else if (saved?.recallable === true && !index.description) index.recallable = true;
-  if (!saved && !request && !metadata.title && !heading) index.recallable = false;
   const containerTag = document.containerTag || document.containerTags?.[0] || fallbackContainer;
   const topicValues = Array.isArray(document.topics)
     ? document.topics
@@ -215,4 +220,11 @@ export function formatIndexItem(item) {
     ? ` | provenance=${promptText(item.provenance.project || item.provenance.projectId || item.provenance.containerTag, 160)}${item.provenance.project && item.provenance.projectId ? ` (${promptText(item.provenance.projectId, 160)})` : ""}`
     : "";
   return `- ◪ ${promptText(item.title, 100)}${when}${sections}\n  id=${promptText(item.id, 80)}${topics} | container=${promptText(item.containerTag || "unknown", 160)}${provenance} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${promptText(timestamp, 40)}${parts}${kind}${excerpt}`;
+}
+
+export function formatRecentTask(item) {
+  const project = item.provenance?.project || item.provenance?.projectId || item.containerTag;
+  const timestamp = item.sourceUpdatedAt || item.createdAt || item.updatedAt || "日時不明";
+  const description = item.description && item.description !== item.title ? ` — ${promptText(item.description, 100)}` : "";
+  return `- ◷ ${promptText(item.title, 80)}${description}\n  id=${promptText(item.id, 64)} | project=${promptText(project, 64)} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${promptText(timestamp, 40)}`;
 }

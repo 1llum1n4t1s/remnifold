@@ -541,7 +541,19 @@ async function filterIndexLexicalRows(
 function excerpt(content: string, query: string, maxLength: number): string {
   if (content.length <= maxLength) return content;
   const firstTerm = (query.match(/[\p{L}\p{N}_-]{3,}/u) ?? [""])[0]?.toLocaleLowerCase() ?? "";
-  const matchAt = firstTerm ? content.toLocaleLowerCase().indexOf(firstTerm) : -1;
+  const lower = firstTerm ? content.toLocaleLowerCase() : "";
+  let matchAt = firstTerm ? lower.indexOf(firstTerm) : -1;
+  if (matchAt >= 0 && lower.length !== content.length) {
+    // locale依存の結合文字の除去も保ち、変換済みprefix長から原文位置を探す。
+    let low = 0;
+    let high = content.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (content.slice(0, middle).toLocaleLowerCase().length <= matchAt) low = middle;
+      else high = middle - 1;
+    }
+    matchAt = low;
+  }
   let start = Math.max(0, (matchAt >= 0 ? matchAt : 0) - Math.floor(maxLength / 3));
   if (start > 0 && /[\uD800-\uDBFF]/u.test(content[start - 1]!) && /[\uDC00-\uDFFF]/u.test(content[start]!)) start += 1;
   const prefix = start > 0 ? "…" : "";
@@ -2187,13 +2199,31 @@ function mergeRankedMemories(
 // 回答本文の該当箇所を検索入口として返す。要約や新しい事実は生成しない。
 function querySearchExcerpt(content: string, terms: string[]): string {
   const lower = content.toLowerCase();
+  // 小文字化でUTF-16長が変わるときだけ、検索位置を原文へ対応付ける。
+  let sourceOffsets: Uint32Array | undefined;
+  if (lower.length !== content.length) {
+    sourceOffsets = new Uint32Array(lower.length);
+    let sourceOffset = 0;
+    let lowerOffset = 0;
+    for (const point of content) {
+      const length = point.toLowerCase().length;
+      for (let unit = 0; unit < length; unit += 1) {
+        sourceOffsets[lowerOffset++] = sourceOffset + Math.min(unit, point.length - 1);
+      }
+      sourceOffset += point.length;
+    }
+  }
   let best = "";
   let bestScore = 0;
+  const scoredStarts = new Set<number>();
   for (const term of terms) {
-    const at = lower.indexOf(term);
-    if (at < 0) continue;
+    const lowerAt = lower.indexOf(term);
+    if (lowerAt < 0) continue;
+    const at = sourceOffsets?.[lowerAt] ?? lowerAt;
     let start = Math.max(0, at - 60);
     if (start > 0 && /[\uD800-\uDBFF]/u.test(content[start - 1]!) && /[\uDC00-\uDFFF]/u.test(content[start]!)) start += 1;
+    if (scoredStarts.has(start)) continue;
+    scoredStarts.add(start);
     const text = truncateUtf16(content.slice(start), 236);
     const lowerText = text.toLowerCase();
     const score = terms.reduce((sum, value) => sum + (lowerText.includes(value) ? Math.min(12, value.length) : 0), 0);
@@ -2240,8 +2270,7 @@ async function indexSearchRows(rows: RankedMemoryRow[], query: string, env: Env,
   return projected;
 }
 
-function queryCoverage(row: RankedMemoryRow, topics: string[], terms: string[], withExcerpt = true): number {
-  const metadata = parseMetadata(row.metadata_json);
+function queryCoverage(row: RankedMemoryRow, topics: string[], terms: string[], withExcerpt = true, metadata = parseMetadata(row.metadata_json)): number {
   const index = memoryIndexV1(metadata) ?? {};
   const text = [index.title, index.description, ...(Array.isArray(index.sections) ? index.sections : []), ...topics,
     ...(withExcerpt && row.searchExcerpt ? [row.searchExcerpt] : [])].join(" ").toLowerCase();
@@ -2253,12 +2282,15 @@ function sortByQueryCoverage(
   compareIndexCoverage = false, preferCheckpoints = false,
 ): RankedMemoryRow[] {
   // 各段階の最新rowから一度だけ算出し、同じIDを持つ別rowも個別に扱う。
-  const ranked = rows.map((row) => ({
-    row,
-    coverage: queryCoverage(row, topics.get(row.id) ?? [], terms),
-    indexCoverage: compareIndexCoverage ? queryCoverage(row, topics.get(row.id) ?? [], terms, false) : 0,
-    checkpoint: preferCheckpoints ? Number(parseMetadata(row.metadata_json).sm_consolidation === true) : 0,
-  }));
+  const ranked = rows.map((row) => {
+    const metadata = parseMetadata(row.metadata_json);
+    return {
+      row,
+      coverage: queryCoverage(row, topics.get(row.id) ?? [], terms, true, metadata),
+      indexCoverage: compareIndexCoverage ? queryCoverage(row, topics.get(row.id) ?? [], terms, false, metadata) : 0,
+      checkpoint: preferCheckpoints ? Number(metadata.sm_consolidation === true) : 0,
+    };
+  });
   ranked.sort((left, right) => right.coverage - left.coverage ||
     right.indexCoverage - left.indexCoverage || right.checkpoint - left.checkpoint);
   return ranked.map(({ row }) => row);
@@ -3065,6 +3097,17 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
     throw new HttpError(400, "enrichmentEligible must be a boolean");
   }
   const projection = (body.projection ?? "full") as DocumentProjection;
+  if (body.recentTasks !== undefined && typeof body.recentTasks !== "boolean") {
+    throw new HttpError(400, "recentTasks must be a boolean");
+  }
+  const recentTasks = body.recentTasks === true;
+  if (recentTasks && (projection !== "index" || containerTag || requestedTopic)) {
+    throw new HttpError(400, "recentTasks requires index projection without containerTag or topic");
+  }
+  if (body.excludeSessionId !== undefined && (!recentTasks || typeof body.excludeSessionId !== "string" ||
+      !body.excludeSessionId.trim() || body.excludeSessionId.length > 160)) {
+    throw new HttpError(400, "excludeSessionId requires recentTasks and a nonempty string of at most 160 characters");
+  }
   const page = positiveInteger(body.page, 1, 100_000);
   const limit = positiveInteger(body.limit, 10, MAX_LIMIT);
   const offset = (page - 1) * limit;
@@ -3073,6 +3116,19 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
     conditions.push("json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0");
   }
   const parameters: (string | number)[] = [];
+  if (recentTasks) {
+    conditions.push(
+      "json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0",
+      "json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1",
+      "json_extract(m.metadata_json, '$.type') = 'conversation'",
+      "json_type(m.metadata_json, '$.sessionId') = 'text'",
+      "length(trim(json_extract(m.metadata_json, '$.sessionId'))) > 0",
+    );
+    if (typeof body.excludeSessionId === "string") {
+      conditions.push("json_extract(m.metadata_json, '$.sessionId') <> ?");
+      parameters.push(body.excludeSessionId);
+    }
+  }
   if (containerTag) {
     conditions.push("m.container_tag = ?");
     parameters.push(containerTag);
@@ -3101,17 +3157,46 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   const where = conditions.join(" AND ");
   const columns = projection === "index"
     ? `m.id, m.container_tag, m.metadata_json, m.status, m.created_at, m.updated_at,
-       substr(m.content, 1, 300) AS content_preview`
+       ${recentTasks ? "m.content_preview" : "substr(m.content, 1, 300) AS content_preview"}`
     : projection === "ids"
       ? "m.id"
       : projection === "capture"
         ? "m.id, m.metadata_json"
         : DOCUMENT_DISPLAY_COLUMNS;
+  // 元の作業日時で比較し、再importによるupdated_atの更新を最近の作業と誤認しない。
+  // SQLiteの日時変換はtimezoneを正規化する。日付の繰上がりと非文字列も除外する。
+  const sourceDate = (path: string) => {
+    const value = `json_extract(m.metadata_json, '${path}')`;
+    return `CASE WHEN json_type(m.metadata_json, '${path}') = 'text'
+      AND ${value} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*'
+      AND strftime('%Y-%m-%d', substr(${value}, 1, 10), '+0 days') = substr(${value}, 1, 10)
+      THEN julianday(${value}) END`;
+  };
+  const recentPrefix = recentTasks ? `WITH candidates AS (
+    SELECT m.id, m.container_tag, m.metadata_json, m.status, m.created_at, m.updated_at,
+      substr(m.content, 1, 300) AS content_preview,
+      COALESCE(${["$.memoryIndex.sourceUpdatedAt", "$.sourceTimestamp", "$.sourceUpdatedAt", "$.completedAt"].map(sourceDate).join(", ")},
+      julianday(m.created_at)) AS source_date,
+      COALESCE(CASE WHEN json_type(m.metadata_json, '$.sm_project_id') = 'text'
+        THEN NULLIF(trim(json_extract(m.metadata_json, '$.sm_project_id')), '') END, m.container_tag) AS task_project,
+      json_extract(m.metadata_json, '$.sessionId') AS task_session
+    FROM memories AS m WHERE ${where}
+  ), ranked AS (
+    SELECT candidates.*, ROW_NUMBER() OVER (
+      PARTITION BY task_project, task_session
+      ORDER BY source_date DESC,
+        CASE WHEN json_type(metadata_json, '$.turn') = 'integer' THEN json_extract(metadata_json, '$.turn') ELSE 0 END DESC,
+        CASE WHEN json_type(metadata_json, '$.part') = 'integer' THEN json_extract(metadata_json, '$.part') ELSE 1 END ASC,
+        created_at DESC, updated_at DESC, id DESC
+    ) AS task_rank FROM candidates
+  ), recent AS (SELECT * FROM ranked WHERE task_rank = 1) ` : "";
+  const table = recentTasks ? "recent" : "memories";
+  const selection = recentTasks ? "1 = 1" : where;
   const [countResult, rowsResult] = await env.DB.batch([
-    env.DB.prepare(`SELECT COUNT(*) AS total FROM memories AS m WHERE ${where}`).bind(...parameters),
+    env.DB.prepare(`${recentPrefix}SELECT COUNT(*) AS total FROM ${table} AS m WHERE ${selection}`).bind(...parameters),
     env.DB.prepare(
-      `SELECT ${columns} FROM memories AS m WHERE ${where}
-       ORDER BY m.updated_at DESC LIMIT ? OFFSET ?`,
+      `${recentPrefix}SELECT ${columns} FROM ${table} AS m WHERE ${selection}
+       ORDER BY ${recentTasks ? "m.source_date DESC, m.id DESC" : "m.updated_at DESC"} LIMIT ? OFFSET ?`,
     ).bind(...parameters, limit, offset),
   ]);
   if (!countResult || !rowsResult) {
@@ -3167,6 +3252,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   }
   return json({
     documents,
+    ...(recentTasks ? { recentTasks: true } : {}),
     ...(projection === "full" ? {
       memoryEntries: documents.map((document) => ({
         id: document.id,
@@ -3185,6 +3271,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
       limit,
       totalItems: total,
       totalPages: Math.ceil(total / limit),
+      ...(recentTasks ? { hasMore: page * limit < total } : {}),
     },
   });
 }

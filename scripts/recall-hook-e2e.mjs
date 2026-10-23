@@ -21,6 +21,7 @@ const temporary = await mkdtemp(join(tmpdir(), "remnifold-recall-e2e-"));
 const artifact = join(root, "dist", runtimeRoot === root ? "recall-hook-validation.json" : "recall-hook-installed-validation.json");
 const checks = [];
 // 失敗条件: 重複注入、更新/compact見逃し、出力超過、Git/API過剰呼出し、子の停止漏れ、fixtureの認証漏れ。
+// 直近作業の失敗条件: 話題への依存、旧サーバーの誤採用、現在セッションの除外漏れ、既読channelの干渉、片側障害による正常側の欠落。
 const children = new Set();
 const configuredKey = "local-fixture-key";
 let revision = "2026-09-30T00:00:00.000Z";
@@ -28,6 +29,11 @@ let failure = false;
 let huge = false;
 let empty = false;
 let fixtureRows = null;
+let recentRows = [];
+let recentFailure = false;
+let recentMarker = true;
+const recentRequests = [];
+const documentFetches = [];
 let lastSearchQuery = "";
 let report;
 let requests = 0;
@@ -43,8 +49,17 @@ const server = createServer(async (request, response) => {
   }
   let body = "";
   for await (const chunk of request) body += chunk;
-  if (body && request.url === "/v4/search") { lastSearchQuery = JSON.parse(body).q; }
+  const input = body ? JSON.parse(body) : {};
+  if (request.url === "/v4/search") { lastSearchQuery = input.q; }
   requests += 1;
+  if (request.url === "/v3/documents/list" && input.recentTasks === true) {
+    recentRequests.push(input);
+    response.writeHead(recentFailure ? 503 : 200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(recentFailure ? { error: "private-recent-error-do-not-expose" }
+      : { documents: recentRows.slice(0, input.limit), ...(recentMarker ? { recentTasks: true } : {}) }));
+    return;
+  }
+  if (/^\/v3\/documents\//u.test(request.url)) documentFetches.push(request.url);
   response.writeHead(failure ? 503 : 200, { "Content-Type": "application/json" });
   response.end(JSON.stringify(failure ? { error: "fixture unavailable" } : {
     user: { id: "fixture-user" }, searchScope: "all-containers", searchedContainers: ["fixture-space"], spaceDiscoveryComplete: true,
@@ -56,10 +71,10 @@ const environment = { ...process.env, CODEX_HOME: temporary,
 const transcript = join(temporary, "rollout.jsonl");
 const payload = { prompt: "Chrome extension implementation", cwd: root, session_id: "fixture-session", transcript_path: transcript };
 const count = (output) => output.hookSpecificOutput?.additionalContext?.length || 0;
-async function hook(input = payload, event = "UserPromptSubmit") {
+async function hook(input = payload, event = "UserPromptSubmit", extraEnvironment = {}) {
   const args = [join(runtimeRoot, "scripts", "hook-launcher.mjs"), event];
   return await new Promise((done, reject) => {
-    const child = spawn(process.execPath, args, { cwd: root, env: environment, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, args, { cwd: root, env: { ...environment, ...extraEnvironment }, stdio: ["pipe", "pipe", "pipe"] });
     children.add(child);
     let output = "", errors = "";
     let timedOut = false;
@@ -132,7 +147,7 @@ try {
       assert.match(output, /id=legacy-with-source/u);
       assert.match(output, /id=legacy-index-only/u);
       assert.doesNotMatch(output, /id=legacy-opt-out|questionItemId|request_user_input_async|ambient UI state/u);
-      assert.equal(requests - before, 1);
+      assert.equal(requests - before, 2);
       return { requests: requests - before, detailsFetched: 0 };
     } finally { fixtureRows = null; }
   });
@@ -147,9 +162,10 @@ try {
       await writeFile(trace, "");
       const requestsBefore = requests;
       await hook(payload, "SessionStart");
+      assert.equal(requests, requestsBefore);
       await hook({ ...payload, prompt: "修正して最適化してください" });
       const after = (await readFile(trace, "utf8")).match(/built-in: git/gu)?.length || 0;
-      assert.equal(after, 0); assert.equal(requests, requestsBefore);
+      assert.equal(after, 0); assert.equal(requests, requestsBefore + 1);
       return { gitProcesses: after, apiRequests: requests - requestsBefore };
     } finally { delete environment.GIT_TRACE; }
   });
@@ -250,9 +266,14 @@ try {
     await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(stateFile, { allowedRoot: temporary });
   });
   await check("unwritable state path fail open", async () => {
-    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(stateDirectory, { allowedRoot: temporary, recursive: true }); await writeFile(stateDirectory, "fixture file blocks directory");
-    assert.ok(count(await hook())); assert.ok(count(await hook()));
-    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(stateDirectory, { allowedRoot: temporary });
+    // 他ケースの復元記録が参照する親ディレクトリを通常ファイルに置き換えない。
+    const blockedHome = join(temporary, "unwritable-home");
+    await mkdir(join(blockedHome, "remnifold"), { recursive: true });
+    await writeFile(join(blockedHome, "remnifold", "recall-state"), "fixture file blocks directory");
+    const blockedEnvironment = { CODEX_HOME: blockedHome };
+    assert.ok(count(await hook(payload, "UserPromptSubmit", blockedEnvironment)));
+    assert.ok(count(await hook(payload, "UserPromptSubmit", blockedEnvironment)));
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(blockedHome, { allowedRoot: temporary, recursive: true });
   });
   await check("API failure remains visible and does not mark seen", async () => {
     failure = true; assert.ok((await hook()).systemMessage); failure = false;
@@ -262,6 +283,146 @@ try {
     const input = { ...payload, session_id: "empty-session" };
     empty = true; assert.deepEqual(await hook(input), {}); empty = false;
     assert.ok(count(await hook(input))); assert.equal(count(await hook(input)), 0);
+  });
+  const recentDocument = (id, overrides = {}) => ({
+    id, containerTag: "other-project-space", createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-10-22T21:00:00.000Z",
+    metadata: { project: "OrionCrossProject", type: "conversation", sessionId: `completed-${id}`,
+      memoryIndex: { version: 1, title: "Invoice export completed", description: "CSV export now preserves Japanese names",
+        sourceUpdatedAt: "2026-10-20T12:34:56.000Z", sections: [], recallable: true } },
+    ...overrides,
+  });
+  const recentHeading = /直近の作業（話題との一致は未判定）/u;
+  const context = (output) => output.hookSpecificOutput?.additionalContext || "";
+  await check("recent work crosses project and topic without fetching documents", async () => {
+    recentRows = [recentDocument("recent-cross-project")];
+    const beforeRequests = recentRequests.length, beforeFetches = documentFetches.length;
+    try {
+      const input = { ...payload, session_id: "recent-cross-project-session" };
+      const text = context(await hook(input));
+      assert.match(text, recentHeading);
+      assert.match(text, /id=recent-cross-project/u);
+      assert.match(text, /OrionCrossProject/u);
+      assert.match(text, /Invoice export completed/u);
+      assert.match(text, /2026-10-20/u);
+      assert.match(text, /id=doc-0/u);
+      const request = recentRequests[beforeRequests];
+      assert.equal(recentRequests.length - beforeRequests, 1);
+      assert.deepEqual(request, { projection: "index", recentTasks: true, limit: 2, page: 1, excludeSessionId: input.session_id });
+      assert.match(text, /\n  id=doc-0[^\n]*container=fixture-space/u,
+        "An older topic match must retain its topic index rather than becoming a recent task");
+      assert.equal(documentFetches.length, beforeFetches);
+      assert.ok(text.length <= 3000);
+      return { recentRequests: 1, detailsFetched: 0, characters: text.length, sourceDate: "2026-10-20" };
+    } finally { recentRows = []; }
+  });
+  await check("topic-less prompts receive recent work while empty and slash requests remain silent", async () => {
+    recentRows = [recentDocument("recent-topicless")];
+    try {
+      for (const prompt of ["続けて", "ありがとう"]) {
+        const text = context(await hook({ ...payload, prompt, session_id: `recent-topicless-${prompt}` }));
+        assert.match(text, recentHeading); assert.match(text, /id=recent-topicless/u);
+        assert.doesNotMatch(text, /id=doc-0/u);
+      }
+      const before = requests;
+      for (const prompt of ["", "   ", "/help"]) assert.deepEqual(await hook({ ...payload, prompt }), {});
+      assert.equal(requests, before);
+    } finally { recentRows = []; }
+  });
+  await check("recent revisions deduplicate independently and compact restores them", async () => {
+    const input = { ...payload, prompt: "ありがとう", session_id: "recent-revisions" };
+    recentRows = [recentDocument("recent-revision")];
+    try {
+      assert.match(context(await hook(input)), /id=recent-revision/u);
+      assert.equal(count(await hook(input)), 0);
+      const original = recentRows[0];
+      recentRows = [{ ...original, updatedAt: "2026-10-23T12:00:00.000Z", metadata: { ...original.metadata,
+        memoryIndex: { ...original.metadata.memoryIndex, sourceUpdatedAt: "2026-10-21T12:34:56.000Z", description: "Invoice export and retry completed" } } }];
+      assert.match(context(await hook(input)), /id=recent-revision/u);
+      assert.equal(count(await hook(input)), 0);
+      recentRows = [recentDocument("recent-arrival"), ...recentRows];
+      const arrival = context(await hook(input));
+      assert.match(arrival, /id=recent-arrival/u);
+      assert.doesNotMatch(arrival, /id=recent-revision/u);
+      assert.equal(count(await hook(input)), 0);
+      assert.deepEqual(await hook({ ...input, source: "compact" }, "SessionStart"), {});
+      const compacted = context(await hook(input));
+      assert.match(compacted, /id=recent-revision/u); assert.match(compacted, /id=recent-arrival/u);
+      assert.equal(count(await hook(input)), 0);
+    } finally { recentRows = []; }
+  });
+  await check("recent visibility does not suppress a later topic index and same-turn overlap appears once", async () => {
+    const original = rows()[0];
+    const shared = recentDocument("recent-topic-shared", { topics: ["Chrome"], metadata: { ...original.metadata,
+      type: "conversation", sessionId: "completed-shared", memoryIndex: { ...original.metadata.memoryIndex, sourceUpdatedAt: revision } } });
+    fixtureRows = [shared]; recentRows = [shared]; empty = true;
+    try {
+      const input = { ...payload, session_id: "recent-topic-independent" };
+      assert.match(context(await hook(input)), recentHeading);
+      empty = false;
+      const topic = context(await hook(input));
+      assert.match(topic, /id=recent-topic-shared/u);
+      assert.doesNotMatch(topic, recentHeading);
+      assert.equal(count(await hook(input)), 0);
+      const overlap = context(await hook({ ...input, session_id: "recent-topic-overlap" }));
+      assert.equal((overlap.match(/id=recent-topic-shared/gu) || []).length, 1);
+    } finally { recentRows = []; fixtureRows = null; empty = false; }
+  });
+  await check("legacy recent response marker is required and does not mark unseen documents", async () => {
+    const input = { ...payload, prompt: "ありがとう", session_id: "recent-legacy-marker" };
+    recentRows = [recentDocument("recent-legacy")]; recentMarker = false;
+    try {
+      assert.equal(count(await hook(input)), 0);
+      recentMarker = true;
+      assert.match(context(await hook(input)), /id=recent-legacy/u);
+    } finally { recentRows = []; recentMarker = true; }
+  });
+  await check("topic and recent failures preserve the healthy channel and hide exception text", async () => {
+    recentRows = [recentDocument("recent-partial")];
+    try {
+      failure = true;
+      const topicFailed = await hook({ ...payload, session_id: "recent-topic-failed" });
+      assert.match(context(topicFailed), /id=recent-partial/u);
+      assert.ok(topicFailed.systemMessage);
+      failure = false; recentFailure = true;
+      const recentFailed = await hook({ ...payload, session_id: "recent-request-failed" });
+      assert.match(context(recentFailed), /id=doc-0/u);
+      assert.ok(recentFailed.systemMessage);
+      assert.doesNotMatch(JSON.stringify([topicFailed, recentFailed]), /private-recent-error-do-not-expose|fixture unavailable/u);
+      recentFailure = false;
+      assert.match(context(await hook({ ...payload, session_id: "recent-request-failed" })), /id=recent-partial/u);
+    } finally { recentRows = []; failure = false; recentFailure = false; }
+  });
+  await check("recent settings disable requests and clamp the independent count", async () => {
+    const configPath = join(temporary, "remnifold.json");
+    recentRows = Array.from({ length: 4 }, (_, index) => recentDocument(`recent-limit-${index}`));
+    try {
+      await writeFile(configPath, JSON.stringify({ maxRecentTasks: 0 }));
+      const before = recentRequests.length;
+      const disabled = context(await hook({ ...payload, session_id: "recent-disabled" }));
+      assert.match(disabled, /id=doc-0/u); assert.doesNotMatch(disabled, recentHeading);
+      assert.equal(recentRequests.length, before);
+      await writeFile(configPath, JSON.stringify({ maxMemories: 1, maxRecentTasks: 2 }));
+      const separate = context(await hook({ ...payload, session_id: "recent-separate-limit" }));
+      assert.match(separate, /id=doc-0/u);
+      assert.equal((separate.match(/id=recent-limit-/gu) || []).length, 2);
+      await writeFile(configPath, JSON.stringify({ maxRecentTasks: 99 }));
+      const capped = context(await hook({ ...payload, prompt: "ありがとう", session_id: "recent-capped" }));
+      assert.equal(recentRequests.at(-1).limit, 3);
+      assert.equal((capped.match(/id=recent-limit-/gu) || []).length, 3);
+    } finally { recentRows = []; await writeFile(configPath, "{}"); }
+  });
+  await check("recent slots survive large topic indexes within the combined context budget", async () => {
+    huge = true;
+    const original = recentDocument("recent-budget-0");
+    recentRows = [original, recentDocument("recent-budget-1", { metadata: { ...original.metadata,
+      memoryIndex: { ...original.metadata.memoryIndex, title: "Japanese output " + "😀&".repeat(500), description: "CSV " + "😀&".repeat(1000) } } })];
+    try {
+      const text = context(await hook({ ...payload, session_id: "recent-combined-budget" }));
+      assert.match(text, recentHeading);
+      assert.match(text, /id=recent-budget-0/u); assert.match(text, /id=recent-budget-1/u);
+      assert.ok(text.length <= 3000);
+      return { characters: text.length, maximumCharacters: 3000, recentItems: 2 };
+    } finally { recentRows = []; huge = false; }
   });
   await check("concurrent hooks leave valid state", async () => {
     const input = { ...payload, session_id: "concurrent-session" };

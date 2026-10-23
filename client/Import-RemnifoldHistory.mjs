@@ -444,7 +444,7 @@ function cleanUserRequest(value) {
   return [...annotationBlocks, annotationBlocks.length && text ? `### Current user request\n${text}` : text].filter(Boolean).join("\n\n").trim();
 }
 
-async function readTaskTitles(codexHome) {
+async function readTaskTitles(codexHome, requiredIds) {
   const result = new Map();
   const path = join(codexHome, "session_index.jsonl");
   if (!existsSync(path)) return result;
@@ -454,7 +454,7 @@ async function readTaskTitles(codexHome) {
     for await (const line of lines) {
       try {
         const row = JSON.parse(line);
-        if (typeof row.id === "string" && typeof row.thread_name === "string") result.set(row.id, row.thread_name);
+        if (typeof row.id === "string" && typeof row.thread_name === "string" && (!requiredIds || requiredIds.has(row.id))) result.set(row.id, row.thread_name);
       } catch { /* 末尾の書きかけ行は次回読む。 */ }
     }
   } finally { lines.close(); input.destroy(); }
@@ -488,6 +488,13 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
       parts.push({ content: projectTextSlice(body, start, end, projectionEdits), hash: sha256(legacyPart).slice(0, 16) });
       start = end;
     }
+    const memoryIndex = buildMemoryIndex({
+      title: safeTitle,
+      request: turn.user,
+      response: turn.assistant,
+      sourceUpdatedAt: turn.sourceTimestamp,
+      sourceKind: "conversation",
+    });
     return parts.map((part, partIndex) => ({
       customId: `codex-turn-v2:${identity}:${partIndex + 1}:${part.hash}`,
       content: `# ${safeTitle}\n\n${part.content}`,
@@ -503,13 +510,7 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
         rootSessionId: candidate.meta.rootSessionId, sessionKind: candidate.meta.isSubagent ? "subagent" : "root",
         turn: index + 1, part: partIndex + 1, parts: parts.length,
         captureVersion: 2, captureKey: `${identity}:${partIndex + 1}:${part.hash}`,
-        memoryIndex: { ...buildMemoryIndex({
-          title: safeTitle,
-          request: turn.user,
-          response: turn.assistant,
-          sourceUpdatedAt: turn.sourceTimestamp,
-          sourceKind: "conversation",
-        }), ...(!part.content.replace(/^### (?:User request|Final assistant response)\s*$/gm, "").trim()
+        memoryIndex: { ...memoryIndex, sections: [...memoryIndex.sections], ...(!part.content.replace(/^### (?:User request|Final assistant response)\s*$/gm, "").trim()
           ? { recallable: false, sections: [] } : {}) },
         // このturnを開始した最初の利用者イベントの記録日時。保存処理の実行日時ではない。
         ...(turn.sourceTimestamp ? { sourceTimestamp: turn.sourceTimestamp } : {}),
@@ -562,8 +563,9 @@ async function chooseCandidates(files, rootOnly) {
   };
 }
 
-async function listDocuments(config, containerTag) {
-  const documents = [];
+async function listCaptureHistory(config, containerTag) {
+  const captureKeys = new Set();
+  let count = 0;
   let page = 1;
   while (true) {
     const result = await api(config, "/v3/documents/list", {
@@ -571,13 +573,16 @@ async function listDocuments(config, containerTag) {
       body: { ...(containerTag ? { containerTag } : {}), page, limit: DEFAULT_LIST_LIMIT, projection: "capture" },
     });
     const batch = Array.isArray(result?.documents) ? result.documents : [];
-    documents.push(...batch);
+    count += batch.length;
+    for (const document of batch) {
+      if (document.metadata?.captureVersion === 2 && document.metadata?.captureKey) captureKeys.add(document.metadata.captureKey);
+    }
     const totalPages = Number(result?.pagination?.totalPages);
     if ((Number.isFinite(totalPages) && page >= totalPages) || batch.length < DEFAULT_LIST_LIMIT) break;
     page += 1;
     if (page > 10_000) fail("Too many document-list pages.");
   }
-  return documents;
+  return { count, captureKeys };
 }
 
 function loadState(statePath) {
@@ -612,7 +617,7 @@ async function main() {
   const idleCandidates = discovery.candidates.filter((candidate) =>
     (!options.sessionId || candidate.meta.id === options.sessionId) && (options.includeRecent || !candidate.recent));
   const selectedCandidates = options.limit > 0 ? idleCandidates.slice(0, options.limit) : idleCandidates;
-  const titles = await readTaskTitles(options.codexHome);
+  const titles = await readTaskTitles(options.codexHome, new Set(selectedCandidates.map((candidate) => candidate.meta.id)));
   const planned = [];
   let turnCount = 0;
   let redactions = 0;
@@ -628,14 +633,8 @@ async function main() {
       sanitizeText(titles.get(candidate.meta.id) || "", [config.apiKey], { count: 0 }), options.maxDocumentChars,
       options.containerTag || undefined));
   }
-  const existingHistory = new Set();
-  const existing = planned.length ? await listDocuments(config) : [];
-  const existingCount = existing.length;
-  for (const document of existing) {
-    if (document.metadata?.captureVersion === 2 && document.metadata?.captureKey) {
-      existingHistory.add(document.metadata.captureKey);
-    }
-  }
+  const { count: existingCount, captureKeys: existingHistory } = planned.length
+    ? await listCaptureHistory(config) : { count: 0, captureKeys: new Set() };
   let created = 0;
   let unchanged = 0;
   const state = options.apply ? loadState(options.statePath) : null;

@@ -6,7 +6,8 @@ import { createDeadlineRequest, recallQuery, runHook } from "./memory-hooks.mjs"
 import { callTool } from "./mcp-server.mjs";
 import { buildTurnDocuments, cleanUserRequest } from "./Import-RemnifoldHistory.mjs";
 
-const settings = { recallMode: "direct", maxMemories: 5, minimumSimilarity: 0.7 };
+// このfixtureは話題検索を検証する。直近作業の既定動作は実hook E2Eで検証する。
+const settings = { recallMode: "direct", maxMemories: 5, maxRecentTasks: 0, minimumSimilarity: 0.7 };
 const context = { containerTag: "project", projectName: "project", projectTags: ["project", "legacy-project"], sharedTags: ["shared"], readTags: ["project", "legacy-project", "shared"] };
 const date = "2026-09-11T01:02:03.000Z";
 const spaceList = (tags) => ({ spaces: tags.map((containerTag) => ({ containerTag, memoryCount: 1 })) });

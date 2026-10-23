@@ -394,7 +394,7 @@ try {
   }).then((response) => response.json());
   const recallCalls = [];
   const localApi = (path, options = {}) => {
-    recallCalls.push(path);
+    recallCalls.push({ path, body: options.body });
     return api(path, { ...options, config: { baseUrl, apiKey: token } });
   };
   const hook = await runHook("UserPromptSubmit", { prompt: "HttpRecallNeedle" }, {
@@ -402,12 +402,14 @@ try {
   });
   assert.match(hook.hookSpecificOutput.additionalContext, new RegExp(responseRecord.id));
   assert.match(hook.hookSpecificOutput.additionalContext, /原文の該当箇所.*HttpRecallNeedle/u);
-  assert.deepEqual(recallCalls, ["/v4/search"]);
+  assert.deepEqual(recallCalls.map((call) => call.path), ["/v4/search", "/v3/documents/list"]);
+  assert.deepEqual(recallCalls[1].body, { projection: "index", recentTasks: true, page: 1, limit: 2 });
+  const recallHttpRequests = recallCalls.length;
   const original = await readDocument(responseRecord.id, localApi);
   assert.match(original.text, /AbortSignal\.timeout/u);
   const artifact = resolve(root, "../dist/recall-http-validation.json");
   mkdirSync(resolve(artifact, ".."), { recursive: true });
-  writeFileSync(artifact, `${JSON.stringify({ node: process.version, runtime: "Wrangler local/workerd + local D1 + authenticated HTTP + real hook/API/getDocument", passed: true, recallHttpRequests: 1, fullSourcePreserved: true }, null, 2)}\n`);
+  writeFileSync(artifact, `${JSON.stringify({ node: process.version, runtime: "Wrangler local/workerd + local D1 + authenticated HTTP + real hook/API/getDocument", passed: true, recallHttpRequests, fullSourcePreserved: true }, null, 2)}\n`);
 
   const forgotten = await request("/v4/memories", {
     method: "DELETE",
@@ -451,7 +453,7 @@ try {
   assert.ok(capacityBody.results.every((record) => !record.content && !record.memory && record.metadata.memoryIndex.version === 1));
   assert.ok(Buffer.byteLength(capacityText) < 100_000);
   writeFileSync(artifact, `${JSON.stringify({ node: process.version, runtime: "Wrangler local/workerd + local D1 + authenticated HTTP + real hook/API/getDocument", passed: true,
-    recallHttpRequests: 1, fullSourcePreserved: true, capacity: { records: 50, sourceCharactersEach: longSource.length, legacyRecords: 25,
+    recallHttpRequests, fullSourcePreserved: true, capacity: { records: 50, sourceCharactersEach: longSource.length, legacyRecords: 25,
       responseBytes: Buffer.byteLength(capacityText), elapsedMs: performance.now() - capacityStarted, cloudflareProductionLatencyMeasured: false } }, null, 2)}\n`);
 
   console.log("Remnifold smoke tests passed: auth, save/upsert, search, topics, list, graph, MCP, forget");
