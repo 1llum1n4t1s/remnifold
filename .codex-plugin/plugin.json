@@ -1,7 +1,7 @@
 {
   "name": "remnifold",
-  "version": "1.0.10",
-  "description": "Self-hosted, topic-based memory for Codex on Cloudflare",
+  "version": "1.0.11",
+  "description": "Self-hosted, topic-based memory for AI clients on Cloudflare",
   "author": {
     "name": "Kagayoi",
     "url": "https://github.com/1llum1n4t1s"
@@ -10,7 +10,7 @@
   "interface": {
     "displayName": "Remnifold",
     "shortDescription": "Recall relevant work across projects from your own Cloudflare server.",
-    "longDescription": "Save completed Codex work to a self-hosted Cloudflare Worker, recall concise indexes by topic across project folders, and open source records only when details are needed.",
+    "longDescription": "Read and write memories through a remote MCP server on your own Cloudflare account. Keep Codex capture and recall hooks, search concise indexes across projects, and open source records when details are needed.",
     "developerName": "Kagayoi",
     "category": "Developer Tools",
     "capabilities": [
