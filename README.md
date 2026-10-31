@@ -10,7 +10,7 @@ Remote MCP clients connect to the deployed server without installing Node.js or 
 
 ## Connect a remote MCP client
 
-After the server has been updated and verified below, use `https://your-worker.example.workers.dev/mcp` as the Streamable HTTP MCP endpoint. A compatible client can authenticate with OAuth 2.1 discovery, public dynamic client registration, and PKCE S256. On the server's authorization page, enter the existing memory API key and approve the named client. OAuth tokens are valid for MCP only; existing REST clients continue to use the API key. Clients supporting a configured Bearer credential can also use the memory API key directly. Keep keys and tokens private.
+After the server has been updated and verified below, use `https://your-worker.example.workers.dev/mcp` as the Streamable HTTP MCP endpoint. A compatible client can authenticate with OAuth 2.1 discovery, public dynamic client registration, and PKCE S256. On the server's authorization page, enter the existing memory API key and approve the named client. If the completion page does not return to the client automatically, follow its link to continue. OAuth tokens are valid for MCP only; existing REST clients continue to use the API key. Clients supporting a configured Bearer credential can also use the memory API key directly. Keep keys and tokens private.
 
 [Grok Bot's Connect apps](https://docs.x.ai/grok-bot/overview) and [Grok connectors](https://docs.x.ai/grok/connectors) provide app and custom MCP connection paths. Choose OAuth when the client supports it; availability of manual Bearer-key entry in Grok Bot has not been verified.
 
