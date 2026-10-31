@@ -36,8 +36,14 @@ function json(value: unknown, status = 200): Response { return new Response(JSON
 function error(code: string, status = 400): Response { return json({ error: code }, status); }
 function resource(url: URL): string { return `${url.origin}/mcp`; }
 function escapeHtml(value: string): string { return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!); }
-function html(body: string, status = 200, cookie?: string): Response {
-  const h = new Headers({ ...headers(), "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" });
+function html(body: string, status = 200, cookie?: string, redirect?: URL): Response {
+  // フォーム POST の Origin を維持し、外部へのリファラー送信は抑止する。
+  // Chromium はフォームの 303 遷移にも form-action を適用するため、検証済みの戻り先だけを加える。
+  const formOrigins = redirect ? ["'self'", redirect.origin] : ["'self'"];
+  // Grok の登録済み Cursor コールバックは www から正規ホストへ 308 転送される。
+  if (redirect?.origin === "https://www.cursor.com" && redirect.pathname === "/agents/mcp/oauth/callback") formOrigins.push("https://cursor.com");
+  const formTargets = formOrigins.join(" ");
+  const h = new Headers({ ...headers(), "referrer-policy": "same-origin", "content-type": "text/html; charset=utf-8", "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action ${formTargets}; base-uri 'none'; frame-ancestors 'none'` });
   if (cookie) h.set("set-cookie", cookie);
   return new Response(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remnifold authorization</title><style>body{font:16px system-ui;max-width:38rem;margin:3rem auto;padding:0 1rem;line-height:1.5}label,input{display:block}input{box-sizing:border-box;width:100%;padding:.65rem;margin:.5rem 0 1rem}button{padding:.6rem 1rem;margin-right:.5rem}</style><main>${body}</main></html>`, { status, headers: h });
 }
@@ -62,6 +68,7 @@ function validRedirect(input: string): boolean {
     const u = new URL(input);
     if (u.username || u.password || u.hash || u.href !== input) return false;
     const host = u.hostname.toLowerCase();
+    if (!/^(?:[a-z0-9.-]+|\[[a-f0-9:]+\])$/.test(host)) return false;
     const loopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
     if (u.protocol === "http:") return loopback;
     if (u.protocol !== "https:") return false;
@@ -125,7 +132,7 @@ async function authorizeGet(request: Request, env: Env): Promise<Response> {
   const payload = base64(encoder.encode(JSON.stringify({ client: c.id, redirect, challenge, state: p.get("state"), nonce, exp: now() + CODE_SECONDS, resource: resource(url) })));
   const session = `${payload}.${await signature(env.MEMORY_API_KEY, payload)}`;
   const content = `<h1>Authorize Remnifold access</h1><p><strong>${escapeHtml(c.name)}</strong> requests read and write access to your memories.</p><p>Return address: ${escapeHtml(new URL(redirect).host)}</p><form method="post" action="/oauth/authorize"><input type="hidden" name="session" value="${session}"><label for="key">Memory API key</label><input id="key" name="key" type="password" autocomplete="off" required><button name="decision" value="allow">Allow</button><button name="decision" value="deny" formnovalidate>Deny</button></form>`;
-  return html(content, 200, `mcp_oauth_csrf=${nonce}; Path=/oauth/authorize; Max-Age=${CODE_SECONDS}; HttpOnly; Secure; SameSite=Lax`);
+  return html(content, 200, `mcp_oauth_csrf=${nonce}; Path=/oauth/authorize; Max-Age=${CODE_SECONDS}; HttpOnly; Secure; SameSite=Lax`, new URL(redirect));
 }
 async function authorizePost(request: Request, env: Env): Promise<Response> {
   const origin = new URL(request.url).origin;

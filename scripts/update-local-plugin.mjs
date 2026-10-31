@@ -115,7 +115,7 @@ export async function run(argv = process.argv.slice(2)) {
   const version = args["--version"];
   if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u.test(version || "")) fail("INVALID_VERSION");
   if (["--check-published", "--apply", "--verify-only"].filter((flag) => args[flag]).length !== 1) fail("INVALID_ARGUMENTS");
-  const config = JSON.parse(await readFile(args["--config"] ? expand(args["--config"]) : path.join(REPOSITORY_ROOT, "vava.config.json"), "utf8"));
+  const config = args["--config"] ? JSON.parse(await readFile(expand(args["--config"]), "utf8")) : { localPlugin: { id: "remnifold@personal", repository: "1llum1n4t1s/remnifold", workflow: "CI", artifact: "remnifold", sourcePath: "~/plugins/remnifold" } };
   const settings = config.localPlugin;
   if (!settings || !/^[\w.-]+\/[\w.-]+$/u.test(settings.repository) || settings.id !== "remnifold@personal" || settings.artifact !== "remnifold" || settings.workflow !== "CI") fail("INVALID_CONFIG");
   const source = expand(settings.sourcePath);

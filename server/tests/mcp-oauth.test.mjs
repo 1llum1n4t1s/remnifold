@@ -36,6 +36,8 @@ async function authorization(f, client, options = {}) {
   const params = new URLSearchParams({ client_id: client.client_id, redirect_uri: client.redirect_uris[0], response_type: "code", code_challenge_method: "S256", code_challenge: challenge, resource: "https://memory.example/mcp", state: "test-state" });
   const response = await f.request(`/oauth/authorize?${params}`);
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("referrer-policy"), "same-origin", "Browser form POST must retain its Origin without leaking the authorization URL cross-origin");
+  assert.equal(response.headers.get("content-security-policy"), `default-src 'none'; style-src 'unsafe-inline'; form-action ${options.formTargets ?? `'self' ${new URL(client.redirect_uris[0]).origin}`}; base-uri 'none'; frame-ancestors 'none'`);
   const html = await response.text();
   assert.match(html, /&lt;client&gt;/); assert.doesNotMatch(html, /owner-secret/);
   const session = /name="session" value="([^"]+)"/.exec(html)[1];
@@ -174,12 +176,31 @@ test("browser OAuth endpoints expose CORS without weakening consent origin check
   const forged = await authorization(f, client, { origin: "https://evil.example" });
   assert.equal(forged.consent.status, 400);
   assert.equal(forged.consent.headers.get("access-control-allow-origin"), null);
+  assert.equal((await authorization(f, client, { origin: "null" })).consent.status, 400);
   f.db.close();
+});
+
+test("Grok callback permits its canonical-host redirect without changing the registered redirect URI", async () => {
+  const f = fixture();
+  try {
+    const client = await register(f, ["https://www.cursor.com/agents/mcp/oauth/callback"]);
+    const { consent, verifier } = await authorization(f, client, { formTargets: "'self' https://www.cursor.com https://cursor.com" });
+    assert.equal(consent.status, 303);
+    const target = new URL(consent.headers.get("location"));
+    assert.equal(target.origin + target.pathname, client.redirect_uris[0]);
+    assert.equal((await exchange(f, client, target.searchParams.get("code"), verifier)).status, 200);
+    for (const redirect of ["https://www.cursor.com/other-callback", "https://www.cursor.com.example/agents/mcp/oauth/callback"]) {
+      const other = await register(f, [redirect]);
+      assert.equal((await authorization(f, other)).consent.status, 303);
+    }
+    const insecure = await f.request("/oauth/register", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: ["http://www.cursor.com/agents/mcp/oauth/callback"] }) });
+    assert.equal(insecure.status, 400);
+  } finally { f.db.close(); }
 });
 
 test("registration and consent reject untrusted redirects, invalid origins, and invalid credentials", async () => {
   const f = fixture();
-  for (const redirect of ["http://example.com/cb", "https://192.168.1.2/cb", "https://client.example/cb#x", "https://x:pw@client.example/cb", "http://127.0.0.2/cb", "https://*.example/cb"]) {
+  for (const redirect of ["http://example.com/cb", "https://192.168.1.2/cb", "https://client.example/cb#x", "https://x:pw@client.example/cb", "http://127.0.0.2/cb", "https://*.example/cb", "https://client.example;upgrade-insecure-requests/cb"]) {
     const response = await f.request("/oauth/register", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: [redirect] }) });
     assert.equal(response.status, 400, redirect);
   }
