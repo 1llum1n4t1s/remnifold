@@ -28,7 +28,7 @@ pwsh -NoProfile -File scripts/setup-client.ps1 -BaseUrl https://your-worker.exam
 
 Enter the API key at the secure prompt if it is not already supplied. The script verifies an authenticated session before writing `remnifold.json` in the selected Codex home: `-CodexHome`, then `CODEX_HOME`, then the default `~/.codex`. Run Codex with the same home so it reads that connection. To update an existing connection, use `-Force`; unrelated settings are preserved. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` can supply process-level overrides.
 
-For the personal installation configured by this repository, the vava release process includes a local plugin update. Other installations use the manual update steps above. Release-maintainer instructions are in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#local-plugin-update-after-a-vava-release).
+On Windows, the existing `remnifold@personal` installation can also be updated on explicit request with the repository's [standalone local updater](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update). Publishing a release does not update that installation automatically.
 
 After installing or updating the plugin, review any hook trust requested by Codex for its four hooks, then start a new task to load the updated plugin. Run the plugin's `whoAmI` MCP tool to verify connectivity and space discovery. Installing a plugin alone does not trust its hooks.
 
