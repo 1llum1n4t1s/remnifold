@@ -5,17 +5,14 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import worker from "../src/index.ts";
 import { handleMcpRequest } from "../src/mcp.ts";
+import { adapter } from "./d1-adapter.mjs";
 
 function fixture(withOAuth = true) {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
   const migrations = resolve(import.meta.dirname, "../migrations");
   for (const name of readdirSync(migrations).filter((name) => name.endsWith(".sql") && (withOAuth || !name.startsWith("0008_"))).sort()) db.exec(readFileSync(resolve(migrations, name), "utf8"));
-  const prepare = (sql) => {
-    const operation = (values = []) => ({ bind: (...next) => operation(next), first: async () => db.prepare(sql).get(...values), all: async () => ({ results: db.prepare(sql).all(...values) }), run: async () => ({ meta: { changes: Number(db.prepare(sql).run(...values).changes) } }), execute: () => /^\s*(?:SELECT|WITH|PRAGMA)\b/iu.test(sql) ? { results: db.prepare(sql).all(...values), meta: { changes: 0 } } : { results: [], meta: { changes: Number(db.prepare(sql).run(...values).changes) } } });
-    return operation();
-  };
-  const DB = { prepare, batch: async (operations) => { db.exec("BEGIN"); try { const results = operations.map((op) => op.execute()); db.exec("COMMIT"); return results; } catch (error) { db.exec("ROLLBACK"); throw error; } } };
+  const DB = adapter(db);
   const pending = [];
   const ctx = { waitUntil: (promise) => pending.push(Promise.resolve(promise)) };
   const env = { DB, MEMORY_API_KEY: "test-configured-secret", AI_ENRICHMENT_MODE: "off", MEMORY_VECTORS: { deleteByIds: async () => ({}) } };

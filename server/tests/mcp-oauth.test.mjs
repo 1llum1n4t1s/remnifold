@@ -33,11 +33,11 @@ async function register(f, redirects = ["https://client.example/callback"]) {
 async function authorization(f, client, options = {}) {
   const verifier = "v".repeat(43);
   const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))).toString("base64url");
-  const params = new URLSearchParams({ client_id: client.client_id, redirect_uri: client.redirect_uris[0], response_type: "code", code_challenge_method: "S256", code_challenge: challenge, resource: "https://memory.example/mcp", state: "test-state" });
+  const params = new URLSearchParams({ client_id: client.client_id, redirect_uri: client.redirect_uris[0], response_type: "code", code_challenge_method: "S256", code_challenge: challenge, resource: "https://memory.example/mcp", state: options.state ?? "test-state" });
   const response = await f.request(`/oauth/authorize?${params}`);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("referrer-policy"), "same-origin", "Browser form POST must retain its Origin without leaking the authorization URL cross-origin");
-  assert.equal(response.headers.get("content-security-policy"), `default-src 'none'; style-src 'unsafe-inline'; form-action ${options.formTargets ?? `'self' ${new URL(client.redirect_uris[0]).origin}`}; base-uri 'none'; frame-ancestors 'none'`);
+  assert.equal(response.headers.get("content-security-policy"), "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
   const html = await response.text();
   assert.match(html, /&lt;client&gt;/); assert.doesNotMatch(html, /owner-secret/);
   const session = /name="session" value="([^"]+)"/.exec(html)[1];
@@ -45,9 +45,57 @@ async function authorization(f, client, options = {}) {
   const consent = await f.post("/oauth/authorize", { session, key: options.key ?? "owner-secret", decision: options.decision ?? "allow" }, { origin: options.origin ?? "https://memory.example", cookie });
   return { consent, verifier, cookie, session };
 }
+async function completionTarget(response) {
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("location"), null);
+  assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.match(response.headers.get("set-cookie"), /mcp_oauth_csrf=;.*Max-Age=0/);
+  assert.equal(response.headers.get("content-security-policy"), "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  const body = await response.clone().text();
+  const decode = value => value.replace(/&(amp|quot|#39|lt|gt);/g, (_, entity) => ({ amp: "&", quot: '"', "#39": "'", lt: "<", gt: ">" })[entity]);
+  const meta = /<meta http-equiv="refresh" content="0; url=([^"]+)">/.exec(body);
+  const anchor = /<a href="([^"]+)" rel="noreferrer">/.exec(body);
+  assert.ok(meta && anchor);
+  assert.ok(body.indexOf(meta[0]) < body.indexOf("</head>"));
+  assert.equal(decode(meta[1]), decode(anchor[1]));
+  assert.doesNotMatch(body, /<(?:script|img|iframe|form)\b|\bonerror=|owner-secret/i);
+  return new URL(decode(meta[1]));
+}
 function exchange(f, client, code, verifier, extra = {}) {
   return f.post("/oauth/token", { grant_type: "authorization_code", client_id: client.client_id, redirect_uri: client.redirect_uris[0], code, code_verifier: verifier, ...extra });
 }
+
+test("OAuth query and form validation retain decoded duplicate and field length boundaries", async () => {
+  const f = fixture();
+  try {
+    const client = await register(f);
+    const query = new URLSearchParams({ client_id: client.client_id, redirect_uri: client.redirect_uris[0], response_type: "code", code_challenge_method: "S256", code_challenge: "c".repeat(43) });
+    const fields = new URLSearchParams({ client_id: client.client_id });
+    const many = new URLSearchParams(Array.from({ length: 500 }, (_, i) => [`extra${i}`, ""])).toString();
+    const cases = [
+      ["extra=&other=", true],
+      [many, true],
+      [`${"k".repeat(100)}=${"v".repeat(4096)}`, true],
+      [`${"k".repeat(101)}=v`, false],
+      [`extra=${"v".repeat(4097)}`, false],
+      ["extra=first&extra=second", false],
+      ["extra=first&%65xtra=second", false],
+      ["a+b=first&a%20b=second", false],
+      ["%E8%A8%98%E6%86%B6=first&記憶=second", false],
+      ["=first&=second", false],
+    ];
+    for (const [extra, valid] of cases) {
+      const get = await f.request(`/oauth/authorize?${query}&${extra}`);
+      assert.equal(get.status, valid ? 200 : 400, `query: ${extra.slice(0, 60)}`);
+      if (!valid) assert.deepEqual(await get.json(), { error: "invalid_request" });
+      const post = await f.request("/oauth/revoke", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: `${fields}&${extra}` });
+      assert.equal(post.status, valid ? 200 : 400, `form: ${extra.slice(0, 60)}`);
+      if (!valid) assert.deepEqual(await post.json(), { error: "invalid_request" });
+    }
+    assert.equal(f.db.prepare("SELECT count(*) AS n FROM mcp_oauth_codes").get().n, 0);
+  } finally { f.db.close(); }
+});
 
 test("database failures emit fixed diagnostics without exposing credentials", async () => {
   const f = fixture(), client = await register(f);
@@ -72,8 +120,7 @@ test("discovery, consent, PKCE, rotation, replay, revocation, and owner key rota
   assert.equal((await (await f.request("/.well-known/oauth-protected-resource/mcp")).json()).resource, "https://memory.example/mcp");
   assert.match(oauthChallenge(new Request("https://memory.example/mcp")).headers.get("www-authenticate"), /oauth-protected-resource\/mcp/);
   const { consent, verifier } = await authorization(f, client);
-  assert.equal(consent.status, 303);
-  const location = new URL(consent.headers.get("location"));
+  const location = await completionTarget(consent);
   assert.equal(location.searchParams.get("state"), "test-state");
   const code = location.searchParams.get("code");
   assert.equal((await exchange(f, client, code, "w".repeat(43))).status, 400);
@@ -102,7 +149,7 @@ test("discovery, consent, PKCE, rotation, replay, revocation, and owner key rota
   assert.equal((await refresh(issued.refresh_token)).status, 400);
   assert.equal(await auth(rotated.access_token), false);
   const second = await authorization(f, client);
-  const code2 = new URL(second.consent.headers.get("location")).searchParams.get("code");
+  const code2 = (await completionTarget(second.consent)).searchParams.get("code");
   const token2 = await (await exchange(f, client, code2, second.verifier)).json();
   f.env.MEMORY_API_KEY = "rotated-key";
   assert.equal(await auth(token2.access_token), false);
@@ -114,7 +161,7 @@ test("discovery, consent, PKCE, rotation, replay, revocation, and owner key rota
 test("concurrent exchanges are one-time, revocation is client-bound, and missing migration fails closed", async () => {
   const f = fixture(), client = await register(f), other = await register(f);
   const { consent, verifier } = await authorization(f, client);
-  const code = new URL(consent.headers.get("location")).searchParams.get("code");
+  const code = (await completionTarget(consent)).searchParams.get("code");
   const responses = await Promise.all([exchange(f, client, code, verifier), exchange(f, client, code, verifier)]);
   assert.deepEqual(responses.map(r => r.status).sort(), [200, 400]);
   const tokens = await responses.find(r => r.status === 200).json();
@@ -131,7 +178,7 @@ test("concurrent exchanges are one-time, revocation is client-bound, and missing
 test("concurrent refresh reuse revokes the whole token family", async () => {
   const f = fixture(), client = await register(f);
   const { consent, verifier } = await authorization(f, client);
-  const code = new URL(consent.headers.get("location")).searchParams.get("code");
+  const code = (await completionTarget(consent)).searchParams.get("code");
   const tokens = await (await exchange(f, client, code, verifier)).json();
   const refresh = () => f.post("/oauth/token", { grant_type: "refresh_token", client_id: client.client_id, refresh_token: tokens.refresh_token });
   const results = await Promise.all([refresh(), refresh()]);
@@ -148,7 +195,7 @@ test("registration rate is atomic and pending exhaustion recovers while approved
   assert.equal(burst.filter(r => r.status === 201).length, 10);
   assert.equal(burst.filter(r => r.status === 429).length, 10);
   const client = await register(f);
-  assert.equal((await authorization(f, client)).consent.status, 303);
+  await completionTarget((await authorization(f, client)).consent);
   f.db.prepare("UPDATE mcp_oauth_clients SET created_at = 1 WHERE id = ?").run(client.client_id);
   // Fill only the unapproved registration pool, simulating distributed senders.
   f.db.exec(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < 990)
@@ -158,7 +205,7 @@ test("registration rate is atomic and pending exhaustion recovers while approved
   f.db.exec("UPDATE mcp_oauth_clients SET created_at = 1 WHERE authorized_at IS NULL");
   assert.equal((await registerFrom("192.0.2.2")).status, 201);
   assert.ok(f.db.prepare("SELECT authorized_at FROM mcp_oauth_clients WHERE id = ?").get(client.client_id).authorized_at);
-  assert.equal((await authorization(f, client)).consent.status, 303);
+  await completionTarget((await authorization(f, client)).consent);
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM mcp_oauth_registration_limits WHERE bucket = ?").get("192.0.2.1").n, 0);
   f.db.close();
 });
@@ -180,18 +227,19 @@ test("browser OAuth endpoints expose CORS without weakening consent origin check
   f.db.close();
 });
 
-test("Grok callback permits its canonical-host redirect without changing the registered redirect URI", async () => {
+test("completion documents preserve validated callback URLs and hostile-looking state without external form targets", async () => {
   const f = fixture();
   try {
-    const client = await register(f, ["https://www.cursor.com/agents/mcp/oauth/callback"]);
-    const { consent, verifier } = await authorization(f, client, { formTargets: "'self' https://www.cursor.com https://cursor.com" });
-    assert.equal(consent.status, 303);
-    const target = new URL(consent.headers.get("location"));
-    assert.equal(target.origin + target.pathname, client.redirect_uris[0]);
-    assert.equal((await exchange(f, client, target.searchParams.get("code"), verifier)).status, 200);
-    for (const redirect of ["https://www.cursor.com/other-callback", "https://www.cursor.com.example/agents/mcp/oauth/callback"]) {
-      const other = await register(f, [redirect]);
-      assert.equal((await authorization(f, other)).consent.status, 303);
+    const state = `quotes '" & ; url=https://other.example/ <img src=x onerror=alert(1)>`;
+    for (const redirect of ["https://www.cursor.com/agents/mcp/oauth/callback", "https://chatgpt.com/connector/oauth/test", "https://client.example/call'back?fixed=a%26b&quoted=%22value%22"]) {
+      const client = await register(f, [redirect]);
+      const { consent, verifier } = await authorization(f, client, { state });
+      const target = await completionTarget(consent);
+      const expected = new URL(redirect);
+      expected.searchParams.set("state", state);
+      expected.searchParams.set("code", target.searchParams.get("code"));
+      assert.equal(target.href, expected.href);
+      assert.equal((await exchange(f, client, target.searchParams.get("code"), verifier)).status, 200);
     }
     const insecure = await f.request("/oauth/register", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: ["http://www.cursor.com/agents/mcp/oauth/callback"] }) });
     assert.equal(insecure.status, 400);
@@ -209,7 +257,7 @@ test("registration and consent reject untrusted redirects, invalid origins, and 
   assert.equal((await authorization(f, client, { origin: "https://evil.example" })).consent.status, 400);
   assert.equal((await authorization(f, client, { key: "wrong" })).consent.status, 403);
   const denied = await authorization(f, client, { decision: "deny" });
-  assert.equal(new URL(denied.consent.headers.get("location")).searchParams.get("error"), "access_denied");
+  assert.equal((await completionTarget(denied.consent)).searchParams.get("error"), "access_denied");
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM mcp_oauth_codes").get().n, 0);
   f.db.close();
 });

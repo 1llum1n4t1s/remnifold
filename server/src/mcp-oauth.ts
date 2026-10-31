@@ -36,16 +36,11 @@ function json(value: unknown, status = 200): Response { return new Response(JSON
 function error(code: string, status = 400): Response { return json({ error: code }, status); }
 function resource(url: URL): string { return `${url.origin}/mcp`; }
 function escapeHtml(value: string): string { return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!); }
-function html(body: string, status = 200, cookie?: string, redirect?: URL): Response {
+function html(body: string, status = 200, cookie?: string, headContent = ""): Response {
   // フォーム POST の Origin を維持し、外部へのリファラー送信は抑止する。
-  // Chromium はフォームの 303 遷移にも form-action を適用するため、検証済みの戻り先だけを加える。
-  const formOrigins = redirect ? ["'self'", redirect.origin] : ["'self'"];
-  // Grok の登録済み Cursor コールバックは www から正規ホストへ 308 転送される。
-  if (redirect?.origin === "https://www.cursor.com" && redirect.pathname === "/agents/mcp/oauth/callback") formOrigins.push("https://cursor.com");
-  const formTargets = formOrigins.join(" ");
-  const h = new Headers({ ...headers(), "referrer-policy": "same-origin", "content-type": "text/html; charset=utf-8", "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action ${formTargets}; base-uri 'none'; frame-ancestors 'none'` });
+  const h = new Headers({ ...headers(), "referrer-policy": "same-origin", "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" });
   if (cookie) h.set("set-cookie", cookie);
-  return new Response(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remnifold authorization</title><style>body{font:16px system-ui;max-width:38rem;margin:3rem auto;padding:0 1rem;line-height:1.5}label,input{display:block}input{box-sizing:border-box;width:100%;padding:.65rem;margin:.5rem 0 1rem}button{padding:.6rem 1rem;margin-right:.5rem}</style><main>${body}</main></html>`, { status, headers: h });
+  return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remnifold authorization</title>${headContent}<style>body{font:16px system-ui;max-width:38rem;margin:3rem auto;padding:0 1rem;line-height:1.5}label,input{display:block}input{box-sizing:border-box;width:100%;padding:.65rem;margin:.5rem 0 1rem}button{padding:.6rem 1rem;margin-right:.5rem}</style></head><body><main>${body}</main></body></html>`, { status, headers: h });
 }
 async function body(request: Request): Promise<string | null> {
   if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY || !request.body) return null;
@@ -55,12 +50,19 @@ async function body(request: Request): Promise<string | null> {
   const bytes = new Uint8Array(size); let at = 0; for (const chunk of chunks) { bytes.set(chunk, at); at += chunk.length; }
   return new TextDecoder().decode(bytes);
 }
+function validParams(params: URLSearchParams): boolean {
+  const keys = new Set<string>();
+  for (const [key, value] of params) {
+    if (key.length > 100 || value.length > 4096 || keys.has(key)) return false;
+    keys.add(key);
+  }
+  return true;
+}
 async function form(request: Request): Promise<URLSearchParams | null> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/x-www-form-urlencoded")) return null;
   const data = await body(request); if (data === null) return null;
   const params = new URLSearchParams(data);
-  for (const [key, value] of params) if (key.length > 100 || value.length > 4096 || params.getAll(key).length !== 1) return null;
-  return params;
+  return validParams(params) ? params : null;
 }
 function validRedirect(input: string): boolean {
   if (input.length > 2048 || !input || input.includes("*")) return false;
@@ -125,14 +127,14 @@ async function register(request: Request, env: Env): Promise<Response> {
 }
 async function authorizeGet(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url), p = url.searchParams;
-  for (const [k, v] of p) if (k.length > 100 || v.length > 4096 || p.getAll(k).length !== 1) return error("invalid_request");
+  if (!validParams(p)) return error("invalid_request");
   const c = await client(env, p.get("client_id") ?? ""), redirect = p.get("redirect_uri") ?? "", challenge = p.get("code_challenge") ?? "";
   if (!c || !redirectAllowed(c, redirect) || p.get("response_type") !== "code" || p.get("code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge) || (p.has("resource") && p.get("resource") !== resource(url)) || (p.has("scope") && p.get("scope") !== "memory")) return error("invalid_request");
   const nonce = random();
   const payload = base64(encoder.encode(JSON.stringify({ client: c.id, redirect, challenge, state: p.get("state"), nonce, exp: now() + CODE_SECONDS, resource: resource(url) })));
   const session = `${payload}.${await signature(env.MEMORY_API_KEY, payload)}`;
   const content = `<h1>Authorize Remnifold access</h1><p><strong>${escapeHtml(c.name)}</strong> requests read and write access to your memories.</p><p>Return address: ${escapeHtml(new URL(redirect).host)}</p><form method="post" action="/oauth/authorize"><input type="hidden" name="session" value="${session}"><label for="key">Memory API key</label><input id="key" name="key" type="password" autocomplete="off" required><button name="decision" value="allow">Allow</button><button name="decision" value="deny" formnovalidate>Deny</button></form>`;
-  return html(content, 200, `mcp_oauth_csrf=${nonce}; Path=/oauth/authorize; Max-Age=${CODE_SECONDS}; HttpOnly; Secure; SameSite=Lax`, new URL(redirect));
+  return html(content, 200, `mcp_oauth_csrf=${nonce}; Path=/oauth/authorize; Max-Age=${CODE_SECONDS}; HttpOnly; Secure; SameSite=Lax`);
 }
 async function authorizePost(request: Request, env: Env): Promise<Response> {
   const origin = new URL(request.url).origin;
@@ -157,7 +159,11 @@ async function authorizePost(request: Request, env: Env): Promise<Response> {
     if (!results[0]?.meta.changes || !results[1]?.meta.changes) return error("invalid_request");
     result.searchParams.set("code", code);
   } else return html("<h1>Authorization failed</h1><p>Unable to authorize this request. Start again from your application.</p>", 403);
-  return new Response(null, { status: 303, headers: { ...headers(), location: result.href, "set-cookie": "mcp_oauth_csrf=; Path=/oauth/authorize; Max-Age=0; HttpOnly; Secure; SameSite=Lax" } });
+  // POST の遷移列を同一オリジンの文書で終え、アプリ側の追加転送を form-action から切り離す。
+  const target = escapeHtml(result.href);
+  const response = html(`<h1>Authorization finished</h1><p>Returning to your application.</p><p><a href="${target}" rel="noreferrer">Continue to your application</a></p>`, 200, "mcp_oauth_csrf=; Path=/oauth/authorize; Max-Age=0; HttpOnly; Secure; SameSite=Lax", `<meta http-equiv="refresh" content="0; url=${target}">`);
+  response.headers.set("referrer-policy", "no-referrer");
+  return response;
 }
 async function issue(env: Env, grant: Grant | Code, family: string, marker: string, source: "code" | "refresh", sourceHash: string): Promise<Response> {
   const access = random(), refresh = random(), timestamp = now();
