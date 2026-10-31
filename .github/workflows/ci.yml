@@ -48,6 +48,9 @@ jobs:
       - name: Create plugin archive
         run: tar -czf dist/remnifold.tar.gz -C dist remnifold
 
+      - name: Verify final plugin archive before publication
+        run: node scripts/verify-plugin-archive.mjs dist/remnifold.tar.gz
+
       - name: Upload plugin archive
         uses: actions/upload-artifact@v7
         with:
