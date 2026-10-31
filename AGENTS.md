@@ -32,7 +32,7 @@ For updater changes, run `node scripts/local-plugin-update-e2e.mjs --archive <ab
 
 ## Validation
 
-Run these checks from the repository root for affected changes (Node.js 24.18.0 or later in the 24 series, pnpm 11.4.0):
+Run these checks from the repository root for affected changes (Node.js 24.18.0 or later in the 24 series, pnpm 12.16.1):
 
 ```powershell
 node --test client/*.test.mjs scripts/*.test.mjs

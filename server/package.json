@@ -9,12 +9,12 @@
     "deploy": "wrangler deploy --minify",
     "migrate:local": "wrangler d1 migrations apply DB --local",
     "migrate:remote": "wrangler d1 migrations apply DB --remote",
-    "test": "node --experimental-transform-types --test tests/auth.test.mjs tests/topics.test.mjs tests/races.test.mjs && node --experimental-transform-types tests/log-regressions.mjs && node --experimental-transform-types tests/recall-efficiency.mjs && node --experimental-transform-types tests/review-fixes-e2e.mjs && node --experimental-transform-types tests/opop-performance.mjs && node --experimental-transform-types tests/opop-projection-e2e.mjs && node --experimental-transform-types tests/structure-performance-e2e.mjs && node tests/smoke.mjs",
+    "test": "node --experimental-transform-types --test tests/auth.test.mjs tests/topics.test.mjs tests/races.test.mjs tests/remote-mcp.test.mjs tests/mcp-oauth.test.mjs && node --experimental-transform-types tests/log-regressions.mjs && node --experimental-transform-types tests/recall-efficiency.mjs && node --experimental-transform-types tests/review-fixes-e2e.mjs && node --experimental-transform-types tests/opop-performance.mjs && node --experimental-transform-types tests/opop-projection-e2e.mjs && node --experimental-transform-types tests/structure-performance-e2e.mjs && node tests/smoke.mjs",
     "test:live": "node tests/live-smoke.mjs"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20261019.1",
+    "@cloudflare/workers-types": "5.20261031.1",
     "typescript": "^7.0.2",
-    "wrangler": "4.151.3"
+    "wrangler": "4.156.0"
   }
 }
