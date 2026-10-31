@@ -10,6 +10,15 @@ import { parseArgs, runSetup } from "./setup-server.mjs";
 
 const API_KEY = "test-only-api-key-that-must-not-appear";
 
+function verifiedResponse(url, init) {
+  if (!url.endsWith("/mcp")) return { ok: true, status: 200 };
+  const message = JSON.parse(init.body);
+  const result = message.method === "initialize"
+    ? { protocolVersion: "2025-06-18" }
+    : { tools: ["search_memory", "getDocument", "add_memory"].map((name) => ({ name })) };
+  return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: message.id, result }) };
+}
+
 async function fixture(existingConfig) {
   const root = await mkdtemp(path.join(os.tmpdir(), "remnifold-setup-"));
   const serverDir = path.join(root, "server");
@@ -137,7 +146,7 @@ test("apply creates missing resources, writes config, migrates, deploys, and ver
     output: (line) => lines.push(line),
     fetchImpl: async (url, init) => {
       requests.push({ url, authorization: init.headers?.Authorization });
-      return { ok: true, status: 200 };
+      return verifiedResponse(url, init);
     },
     sleep: async () => {},
     nodeVersion: "24.0.0",
@@ -154,7 +163,11 @@ test("apply creates missing resources, writes config, migrates, deploys, and ver
   assert.deepEqual(requests, [
     { url: "https://remnifold.example.workers.dev/health", authorization: undefined },
     { url: "https://remnifold.example.workers.dev/v3/session", authorization: `Bearer ${API_KEY}` },
+    { url: "https://remnifold.example.workers.dev/mcp", authorization: `Bearer ${API_KEY}` },
+    { url: "https://remnifold.example.workers.dev/mcp", authorization: `Bearer ${API_KEY}` },
   ]);
+  assert.ok(cloudflare.calls.findIndex(({ args }) => args[0] === "d1" && args[1] === "migrations") < cloudflare.calls.findIndex(({ args }) => args[0] === "deploy"));
+  assert.match(lines.join("\n"), /Remote MCP migration: verified/);
   assert.doesNotMatch(lines.join("\n"), new RegExp(API_KEY));
 });
 
@@ -177,11 +190,11 @@ test("existing resources and secret are reused while custom config fields are pr
     secretPresent: true,
   });
   const requests = [];
-  await runSetup(["--apply"], {
+  await runSetup(["--apply", "--worker-name", "remnifold"], {
     ...files,
     env: {},
     runner: cloudflare.runner,
-    output: () => {},
+    output: (line) => requests.push({ line }),
     fetchImpl: async (url, init) => {
       requests.push({ url, headers: init.headers });
       return { ok: true, status: 200 };
@@ -198,8 +211,26 @@ test("existing resources and secret are reused while custom config fields are pr
   assert.equal(config.vectorize.length, 2);
   assert.equal(config.d1_databases.length, 2);
   assert.equal(cloudflare.calls.some(({ args }) => args[0] === "secret" && args[1] === "put"), false);
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].url.endsWith("/health"), true);
+  assert.equal(requests.filter(({ url }) => url).length, 1);
+  assert.ok(requests.some(({ url }) => url?.endsWith("/health")));
+  assert.ok(requests.some(({ line }) => line?.includes("MCP verification skipped")));
+});
+
+test("existing custom configuration selects the same Worker and storage, and rejects a mismatched D1 ID", async (t) => {
+  const id = "22222222-2222-2222-2222-222222222222";
+  const config = JSON.stringify({ name: "custom-memory", d1_databases: [{ binding: "DB", database_name: "custom-memory", database_id: id }], vectorize: [{ binding: "MEMORY_VECTORS", index_name: "custom-memory" }] });
+  const files = await fixture(config);
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
+  const cloudflare = mockCloudflare({ resourceName: "custom-memory", workerName: "custom-memory", d1: id, vector: { dimensions: 1024, metric: "cosine" }, secretVerifiable: true, secretPresent: true });
+  await runSetup(["--apply"], { ...files, env: {}, runner: cloudflare.runner, output: () => {}, fetchImpl: async () => ({ ok: true, status: 200 }), nodeVersion: "24.0.0" });
+  const updated = JSON.parse(await readFile(path.join(files.serverDir, "wrangler.jsonc"), "utf8"));
+  assert.equal(updated.name, "custom-memory");
+  assert.equal(updated.d1_databases[0].database_id, id);
+  assert.equal(updated.vectorize[0].index_name, "custom-memory");
+  assert.equal(cloudflare.calls.some(({ args }) => args.includes("create")), false);
+  const wrongAccount = mockCloudflare({ resourceName: "custom-memory", d1: "33333333-3333-3333-3333-333333333333", vector: { dimensions: 1024, metric: "cosine" } });
+  await assert.rejects(runSetup(["--apply"], { ...files, env: {}, runner: wrongAccount.runner, output: () => {}, nodeVersion: "24.0.0" }), /Configured D1 database was not found with its existing ID/);
+  assert.equal(wrongAccount.calls.some(({ args }) => args.includes("create") || args[0] === "deploy"), false);
 });
 
 test("1.x resource names are reused instead of creating an empty replacement store", async (t) => {
@@ -313,11 +344,34 @@ test("rerun-safe discovery accepts the 1.x key alias and recovers when create re
     env: { CLOUDFLARE_MEMORY_API_KEY: API_KEY },
     runner: cloudflare.runner,
     output: (line) => lines.push(line),
-    fetchImpl: async () => ({ ok: true, status: 200 }),
+    fetchImpl: async (url, init) => verifiedResponse(url, init),
     sleep: async () => {},
     nodeVersion: "24.0.0",
   });
   assert.match(lines.join("\n"), /conflict or interruption/);
+  assert.doesNotMatch(lines.join("\n"), new RegExp(API_KEY));
+});
+
+test("MCP tool discovery failure does not report a completed migration or expose credentials", async (t) => {
+  const files = await fixture();
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
+  const cloudflare = mockCloudflare();
+  const lines = [];
+  await assert.rejects(runSetup(["--apply"], {
+    ...files,
+    env: { REMNIFOLD_API_KEY: API_KEY },
+    runner: cloudflare.runner,
+    output: (line) => lines.push(line),
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/mcp") && JSON.parse(init.body).method === "tools/list") {
+        return { ok: true, json: async () => ({ jsonrpc: "2.0", id: 2, result: { tools: [] } }) };
+      }
+      return verifiedResponse(url, init);
+    },
+    sleep: async () => {},
+    nodeVersion: "24.0.0",
+  }), /Remote MCP tool discovery verification failed/);
+  assert.doesNotMatch(lines.join("\n"), /Remote MCP migration: verified/);
   assert.doesNotMatch(lines.join("\n"), new RegExp(API_KEY));
 });
 

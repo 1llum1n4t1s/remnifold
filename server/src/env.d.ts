@@ -4,4 +4,5 @@ interface Env {
   AI: Ai;
   AI_ENRICHMENT_MODE: "on" | "off";
   MEMORY_API_KEY: string;
+  MCP_ALLOWED_ORIGINS?: string;
 }

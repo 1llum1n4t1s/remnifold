@@ -456,7 +456,34 @@ try {
     recallHttpRequests, fullSourcePreserved: true, capacity: { records: 50, sourceCharactersEach: longSource.length, legacyRecords: 25,
       responseBytes: Buffer.byteLength(capacityText), elapsedMs: performance.now() - capacityStarted, cloudflareProductionLatencyMeasured: false } }, null, 2)}\n`);
 
-  console.log("Remnifold smoke tests passed: auth, save/upsert, search, topics, list, graph, MCP, forget");
+  // リモートMCPも実workerdと認証付きHTTPを通し、旧記憶と同じD1へ接続する。
+  let rpcId = 0;
+  const rpc = async (method, params = {}) => {
+    const id = ++rpcId;
+    const response = await request("/mcp", { method: "POST", headers: { Accept: "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18" }, body: JSON.stringify({ jsonrpc: "2.0", id, method, params }) });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.id, id);
+    assert.equal(result.error, undefined);
+    assert.equal(result.result.isError, undefined, JSON.stringify(result));
+    return result.result;
+  };
+  const initialized = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "remote-http-smoke", version: "1" } });
+  assert.equal(initialized.protocolVersion, "2025-06-18");
+  assert.match(initialized.instructions, /search memory/);
+  assert.ok((await rpc("tools/list")).tools.some(tool => tool.name === "add_memory"));
+  const remoteCall = async (name, args) => (await rpc("tools/call", { name, arguments: args })).structuredContent;
+  assert.equal((await remoteCall("getDocument", { documentId: responseRecord.id })).id, responseRecord.id);
+  const remoteArgs = { content: `RemoteHttpNeedle ${token} password="remote-secret"`, containerTag: "remote-mcp-smoke", projectId: "remote-project", idempotencyKey: "http-save" };
+  const remoteSaved = await remoteCall("add_memory", remoteArgs);
+  assert.equal((await remoteCall("add_memory", remoteArgs)).id, remoteSaved.id);
+  assert.equal((await remoteCall("getDocument", { documentId: remoteSaved.id })).content, 'RemoteHttpNeedle [REDACTED] password="[REDACTED]"');
+  const remoteSearch = await remoteCall("search_memory", { query: "RemoteHttpNeedle", containerTag: "remote-mcp-smoke" });
+  assert.equal(remoteSearch.results[0].id, remoteSaved.id);
+  assert.equal(remoteSearch.results[0].content, undefined);
+  await remoteCall("add_memory", { action: "forget", documentId: remoteSaved.id, containerTag: "remote-mcp-smoke" });
+  assert.equal((await fetch(`${baseUrl}/mcp`)).status, 401);
+  console.log("Remnifold smoke tests passed: auth, save/upsert, search, topics, list, graph, MCP, remote MCP HTTP, forget");
 } finally {
   await stopChild(worker);
   rmSync(state, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

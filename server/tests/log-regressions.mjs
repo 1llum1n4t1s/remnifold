@@ -5,33 +5,13 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import worker from "../src/index.ts";
+import { adapter } from "./d1-adapter.mjs";
 
 const artifactPath = resolve(import.meta.dirname, "../../dist/server-log-validation.json");
 const migrations = readdirSync(resolve(import.meta.dirname, "../migrations")).filter((name) => name.endsWith(".sql")).sort();
 const checkpoint = { title: "Checkpoint", overview: "Verified restart state.", verified: ["Sources stored."], unverified: [], unresolved: [], nextActions: [] };
 const output = (value, finish_reason = "stop") => ({ choices: [{ finish_reason, message: { content: typeof value === "string" ? value : JSON.stringify(value) } }] });
 const embedding = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
-
-function adapter(database) {
-  const hooks = {};
-  function prepare(sql) {
-    const bind = (values = []) => ({ sql, values, bind: (...next) => bind(next),
-      first: async () => { await hooks.first?.(sql, values); return database.prepare(sql).get(...values); },
-      all: async () => { await hooks.all?.(sql, values); return { results: database.prepare(sql).all(...values) }; },
-      run: async () => { await hooks.run?.(sql, values); return { meta: { changes: Number(database.prepare(sql).run(...values).changes) } }; },
-      execute: () => { hooks.execute?.(sql, values); return /^\s*(SELECT|WITH|PRAGMA)\b/iu.test(sql)
-        ? { results: database.prepare(sql).all(...values), meta: { changes: 0 } }
-        : { results: [], meta: { changes: Number(database.prepare(sql).run(...values).changes) } }; },
-    });
-    return bind();
-  }
-  return { hooks, prepare, batch: async (operations) => {
-    await hooks.batch?.(operations);
-    database.exec("BEGIN");
-    try { const results = operations.map((operation) => operation.execute()); database.exec("COMMIT"); return results; }
-    catch (error) { database.exec("ROLLBACK"); throw error; }
-  } };
-}
 
 function fixture() {
   const db = new DatabaseSync(":memory:");
@@ -269,10 +249,26 @@ scenario("late revision replacement rejects stale failure status update", async 
   assert.ok(logs.some((entry) => entry.event === "memory_enrichment_failed" && entry.revision !== "replacement-revision"));
 });
 scenario("failed AI enrichment records errors in completion log", async (f, logs) => {
-  const [id] = await f.seed(); f.env.AI.run = async () => { throw new Error(`injected-ai-failure ${f.env.MEMORY_API_KEY}`); };
+  const [id] = await f.seed(); f.env.AI.run = async () => { throw new Error(`injected-ai-failure ${f.env.MEMORY_API_KEY} ${"x".repeat(2100)}`); };
   assert.equal((await f.api("/v4/enrich", { id })).status, 202); await f.drain();
   const log = logs.find((entry) => entry.event === "memory_enriched" && entry.memoryId === id); assert.equal(log?.ok, false); assert.ok(Array.isArray(log.errors)); assert.ok(log.errors.some((error) => error.includes("injected-ai-failure")));
   assert.ok(!JSON.stringify(logs).includes(f.env.MEMORY_API_KEY));
+  const stored = f.db.prepare("SELECT enrichment_error FROM memories WHERE id = ?").get(id).enrichment_error;
+  assert.match(stored, /injected-ai-failure/u); assert.match(stored, /\[redacted\]/u); assert.ok(stored.length <= 2_000);
+  assert.ok(!stored.includes(f.env.MEMORY_API_KEY));
+  const readErrors = async () => {
+    const document = await f.api(`/v3/documents/${id}`, undefined, "GET");
+    const list = await f.api("/v3/documents/list", { projection: "full" });
+    assert.equal(document.status, 200); assert.equal(list.status, 200);
+    return [document.body.enrichment.error, list.body.documents.find((item) => item.id === id).enrichment.error];
+  };
+  assert.deepEqual(await readErrors(), [stored, stored]);
+  const legacy = `legacy diagnostic ${f.env.MEMORY_API_KEY} ${"y".repeat(2100)}`;
+  f.db.prepare("UPDATE memories SET enrichment_error = ? WHERE id = ?").run(legacy, id);
+  for (const value of await readErrors()) {
+    assert.match(value, /legacy diagnostic \[redacted\]/u); assert.ok(value.length <= 2_000); assert.ok(!value.includes(f.env.MEMORY_API_KEY));
+  }
+  assert.equal(f.db.prepare("SELECT enrichment_error FROM memories WHERE id = ?").get(id).enrichment_error, legacy);
 });
 scenario("derived data persistence failures report failed stages and errors", async (f, logs) => {
   const [id] = await f.seed();

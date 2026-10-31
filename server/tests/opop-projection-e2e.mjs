@@ -9,7 +9,7 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
+import { resolveWorkerImports } from "./worker-imports.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
 const source = readFileSync(resolve(root, "server/src/index.ts"), "utf8").replace(/\r\n/gu, "\n");
@@ -52,7 +52,7 @@ function comparisonSource() {
 }
 
 async function loadWorker(text) {
-  const imported = replaceOnce(text, '"../../client/memory-index.mjs"', JSON.stringify(pathToFileURL(resolve(root, "client/memory-index.mjs")).href));
+  const imported = resolveWorkerImports(text, root);
   // DB/公開JSON全体を比較するため、時計と新規IDだけを両Workerで同じ値にする。
   const deterministic = `let sequence = 0;
 const Date = class extends globalThis.Date { constructor(...args) { super(...(args.length ? args : [${JSON.stringify(timestamp)}])); } static now() { return globalThis.Date.parse(${JSON.stringify(timestamp)}); } };

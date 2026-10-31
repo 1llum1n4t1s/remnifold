@@ -352,11 +352,11 @@ function deployUrl(output) {
 }
 
 async function verifyEndpoint(context, baseUrl) {
-  const request = async (route, headers = {}) => {
+  const request = async (route, init = {}) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
     try {
-      return await context.fetchImpl(`${baseUrl}${route}`, { headers, signal: controller.signal });
+      return await context.fetchImpl(`${baseUrl}${route}`, { ...init, signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
@@ -369,8 +369,48 @@ async function verifyEndpoint(context, baseUrl) {
   }
   if (!health.ok) throw new SetupError(`Deployment health check returned HTTP ${health.status}.`);
   if (context.apiKey) {
-    const session = await request("/v3/session", { Authorization: `Bearer ${context.apiKey}` });
+    let session;
+    try {
+      session = await request("/v3/session", { headers: { Authorization: `Bearer ${context.apiKey}` } });
+    } catch {
+      throw new SetupError("Authenticated session verification failed.");
+    }
     if (!session.ok) throw new SetupError(`Authenticated session check returned HTTP ${session.status}.`);
+    const rpc = async (id, method, params, protocolVersion) => {
+      let response;
+      let body;
+      try {
+        response = await request("/mcp", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${context.apiKey}`,
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            ...(protocolVersion ? { "MCP-Protocol-Version": protocolVersion } : {}),
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+        });
+        if (!response.ok) throw new Error();
+        body = await response.json();
+      } catch {
+        throw new SetupError(`Remote MCP ${method} verification failed.`);
+      }
+      if (body?.jsonrpc !== "2.0" || body.id !== id || body.error || !body.result || typeof body.result !== "object") {
+        throw new SetupError(`Remote MCP ${method} verification failed.`);
+      }
+      return body.result;
+    };
+    const initialized = await rpc(1, "initialize", {
+      protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "remnifold-setup", version: "1" },
+    });
+    if (!["2025-03-26", "2025-06-18", "2025-11-25"].includes(initialized.protocolVersion)) {
+      throw new SetupError("Remote MCP initialize verification failed.");
+    }
+    const listed = await rpc(2, "tools/list", {}, initialized.protocolVersion);
+    const names = Array.isArray(listed.tools) ? listed.tools.map((tool) => tool?.name) : [];
+    if (!["search_memory", "getDocument", "add_memory"].every((name) => names.includes(name))) {
+      throw new SetupError("Remote MCP tool discovery verification failed.");
+    }
   }
 }
 
@@ -405,6 +445,33 @@ export async function runSetup(args, dependencies = {}) {
     }
   }
 
+  // An existing configuration identifies the installation to upgrade, even when
+  // its resources have custom names or similarly named stores also exist.
+  let existingConfig;
+  const existingConfigPath = path.join(serverDir, "wrangler.jsonc");
+  try {
+    existingConfig = parseJsonc(await readFile(existingConfigPath, "utf8"), existingConfigPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const existingDb = existingConfig?.d1_databases?.find((binding) => binding?.binding === "DB");
+  const existingVector = existingConfig?.vectorize?.find((binding) => binding?.binding === "MEMORY_VECTORS");
+  const databaseNameExplicit = options.databaseNameExplicit;
+  const vectorIndexNameExplicit = options.vectorIndexNameExplicit;
+  for (const [explicit, field, value] of [
+    [options.workerNameExplicit, "workerName", existingConfig?.name],
+    [options.databaseNameExplicit, "databaseName", existingDb?.database_name],
+    [options.vectorIndexNameExplicit, "vectorIndexName", existingVector?.index_name],
+  ]) {
+    if (!explicit && value !== undefined) {
+      if (typeof value !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(value)) {
+        throw new SetupError(`Existing Wrangler configuration has an invalid ${field}.`);
+      }
+      options[field] = value;
+      options[`${field}Explicit`] = true;
+    }
+  }
+
   const environment = dependencies.env ?? process.env;
   const apiKey = [
     environment[options.apiKeyEnv],
@@ -429,6 +496,13 @@ export async function runSetup(args, dependencies = {}) {
   const vectors = await listVectors(context);
   let d1 = findD1(databases, options.databaseName);
   let vector = findVector(vectors, options.vectorIndexName);
+  if (existingDb && !databaseNameExplicit &&
+      (!d1 || (existingDb.database_id && d1.id !== existingDb.database_id))) {
+    throw new SetupError("Configured D1 database was not found with its existing ID; check the Cloudflare account and configuration before updating.");
+  }
+  if (existingVector && !vectorIndexNameExplicit && !vector) {
+    throw new SetupError("Configured Vectorize index was not found; check the Cloudflare account and configuration before updating.");
+  }
   // 1.x利用者のD1とVectorizeは名称変更後も再利用し、保存済み記憶を分断しない。
   if (!d1 && !options.databaseNameExplicit && options.databaseName === DEFAULT_NAME) {
     for (const name of LEGACY_RESOURCE_NAMES) {
@@ -534,9 +608,11 @@ export async function runSetup(args, dependencies = {}) {
   const endpoint = options.baseUrl ?? deployUrl(`${deployed.stdout}\n${deployed.stderr}`);
   if (endpoint) {
     await verifyEndpoint(context, endpoint);
-    output(`Endpoint verification: healthy at ${endpoint}${apiKey ? " (authenticated session verified)" : ""}`);
+    output(`Endpoint verification: healthy at ${endpoint}`);
+    if (apiKey) output(`Remote MCP migration: verified authenticated session, initialization, and memory tools at ${endpoint}/mcp`);
+    else output(`Remote MCP endpoint: ${endpoint}/mcp; authenticated session and MCP verification skipped because the API key was not supplied locally.`);
   } else {
-    output("Endpoint verification: skipped because Wrangler did not report a workers.dev URL; rerun with --base-url to verify a custom domain.");
+    output("Endpoint and authenticated MCP verification: skipped because Wrangler did not report a workers.dev URL; rerun with --base-url to verify a custom domain.");
   }
   return { mode: "apply", endpoint, configPath: generated.configPath };
 }

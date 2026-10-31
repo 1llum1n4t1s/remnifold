@@ -165,6 +165,12 @@ function lexicalEligible(row) {
   return typeof row.lexicalSimilarity === "number" && Number.isFinite(row.lexicalSimilarity);
 }
 
+function compareDates(a, b) {
+  const left = a ? Date.parse(a) : -Infinity;
+  const right = b ? Date.parse(b) : -Infinity;
+  return left > right ? 1 : left < right ? -1 : 0;
+}
+
 function latestCaptureRevisions(candidates) {
   const latest = new Map();
   const revisionKeys = new Map();
@@ -174,15 +180,16 @@ function latestCaptureRevisions(candidates) {
     const key = JSON.stringify([index.provenance?.projectId || index.containerTag, index.sessionId, index.turn, index.part]);
     revisionKeys.set(candidate, key);
     const previous = latest.get(key);
-    const revision = (item) => [item.index.sourceUpdatedAt || "", item.index.createdAt || "", item.index.updatedAt || ""].join("\n");
-    if (!previous || revision(candidate) > revision(previous)) latest.set(key, candidate);
+    const newer = previous && (compareDates(index.sourceUpdatedAt, previous.index.sourceUpdatedAt) ||
+      compareDates(index.createdAt, previous.index.createdAt) || compareDates(index.updatedAt, previous.index.updatedAt));
+    if (!previous || newer > 0) latest.set(key, candidate);
   }
   return candidates.filter((candidate) => !revisionKeys.has(candidate) || latest.get(revisionKeys.get(candidate)) === candidate);
 }
 
 function compareProjectCandidates(a, b) {
   return Number(b.projectOnly) - Number(a.projectOnly) || (a.projectOnly && b.projectOnly
-    ? String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || "")) : 0);
+    ? compareDates(b.index.sourceUpdatedAt || b.index.updatedAt, a.index.sourceUpdatedAt || a.index.updatedAt) : 0);
 }
 
 function rankForHydration(candidates, terms, settings, limit, automatic) {
@@ -207,8 +214,8 @@ function selectSearchDocuments(hydrated, terms, settings, limit, automatic) {
     const consolidationDifference = automatic ? Number(b.index.consolidation) - Number(a.index.consolidation) : 0;
     return b.relevance - a.relevance || compareProjectCandidates(a, b) || b.indexRelevance - a.indexRelevance || consolidationDifference ||
       Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
-      String(b.index.consolidationCreatedAt || "").localeCompare(String(a.index.consolidationCreatedAt || "")) ||
-      String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || ""));
+      compareDates(b.index.consolidationCreatedAt, a.index.consolidationCreatedAt) ||
+      compareDates(b.index.sourceUpdatedAt || b.index.updatedAt, a.index.sourceUpdatedAt || a.index.updatedAt);
   });
   const selected = [];
   const seen = new Set();

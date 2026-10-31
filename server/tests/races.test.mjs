@@ -23,7 +23,7 @@ function d1Adapter(database) {
       },
       all: async () => {
         const results = database.prepare(sql).all(...values);
-        return { results: beforeAll ? await beforeAll(sql, results) : results };
+        return { results: beforeAll ? await beforeAll(sql, results, values) : results };
       },
       run: async () => {
         if (beforeRun) await beforeRun(sql, values);
@@ -1962,9 +1962,14 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
   try {
     const DB = d1Adapter(database);
     let selected = [];
-    DB.interceptAll((sql, rows) => {
-      if (sql.includes("THEN '' ELSE") && sql.includes("AS content")) {
-        selected.push({ sql, rows: rows.map((row) => ({ id: row.id, content: row.content })) });
+    const fixtureIds = new Set();
+    DB.interceptAll((_sql, rows, values) => {
+      const fixtureRows = rows.filter((row) => fixtureIds.has(row.id) && Object.hasOwn(row, "content"));
+      if (fixtureRows.length > 0) {
+        // 後段の全文取得は、選抜済み文書IDだけを束ねて渡す。候補取得はスコープ等も渡す。
+        const hydration = values.length === fixtureIds.size && new Set(values).size === fixtureIds.size &&
+          values.every((value) => fixtureIds.has(value));
+        selected.push({ hydration, rows: fixtureRows.map(({ id, content }) => ({ id, content })) });
       }
       return rows;
     });
@@ -2007,12 +2012,25 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
       metadata: { memoryIndex: { version: "future", title: "FtsNeedle Qz unknown" } },
     }), plainEnv, ctx).then((response) => response.json());
 
-    const assertProjection = (record) => {
-      assert.ok(record, "expected an indexOnly content projection query");
-      assert.equal(record.rows.find((row) => row.id === v1.id)?.content, "");
-      assert.equal(record.rows.find((row) => row.id === legacy.id)?.content, legacyContent);
-      assert.equal(record.rows.find((row) => row.id === booleanVersion.id)?.content, booleanVersionContent);
-      assert.equal(record.rows.find((row) => row.id === unknownVersion.id)?.content, unknownVersionContent);
+    const expectedContent = new Map([
+      [v1.id, ""],
+      [legacy.id, legacyContent],
+      [booleanVersion.id, booleanVersionContent],
+      [unknownVersion.id, unknownVersionContent],
+    ]);
+    for (const id of expectedContent.keys()) fixtureIds.add(id);
+    const assertProjection = (path) => {
+      const hydration = selected.filter((record) => record.hydration);
+      assert.equal(hydration.length, 1, `${path}: expected one selected-document hydration`);
+      assert.equal(hydration[0].rows.find((row) => row.id === v1.id)?.content, v1Content);
+      const candidates = selected.filter((record) => !record.hydration);
+      assert.ok(candidates.some(({ rows }) => expectedContent.size === new Set(rows.map(({ id }) => id)).size),
+        `${path}: expected all fixture rows in one D1 result`);
+      for (const { rows } of candidates) {
+        for (const { id, content } of rows) {
+          assert.equal(content, expectedContent.get(id), `${path}: unexpected content for ${id}`);
+        }
+      }
     };
 
     selected = [];
@@ -2022,7 +2040,7 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
       indexOnly: true,
       limit: 10,
     }), plainEnv, ctx);
-    assertProjection(selected.find(({ sql }) => sql.includes("ORDER BY updated_at DESC LIMIT ?")));
+    assertProjection("recent");
 
     selected = [];
     const lexicalProjection = await worker.fetch(request("/v4/search", {
@@ -2031,7 +2049,7 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
       indexOnly: true,
       limit: 10,
     }), plainEnv, ctx).then((response) => response.json());
-    assertProjection(selected.find(({ sql }) => sql.includes("FROM memories_fts")));
+    assertProjection("lexical");
     assert.match(lexicalProjection.results.find(({ id }) => id === booleanVersion.id)?.metadata.memoryIndex.description ?? "", /boolean version/);
     assert.match(lexicalProjection.results.find(({ id }) => id === unknownVersion.id)?.metadata.memoryIndex.description ?? "", /unknown version/);
 
@@ -2042,7 +2060,7 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
       indexOnly: true,
       limit: 10,
     }), plainEnv, ctx);
-    assertProjection(selected.find(({ sql }) => sql.includes("instr(lower(content)")));
+    assertProjection("short-word lexical");
 
     for (const id of [v1.id, legacy.id, booleanVersion.id, unknownVersion.id]) {
       database.prepare(
@@ -2061,7 +2079,8 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
       indexOnly: true,
       limit: 10,
     }), semanticEnv, ctx).then((response) => response.json());
-    assertProjection(selected.find(({ sql }) => sql.includes("vector_status <> 'indexed'")));
+    assertProjection("semantic fallback");
+    assert.equal(semantic.results.length, expectedContent.size);
     assert.ok(semantic.results.every((result) => result.semanticSimilarity === 1));
 
     const revisions = new Map(database.prepare(
@@ -2084,13 +2103,15 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
       },
     });
     selected = [];
-    await worker.fetch(request("/v4/search", {
+    const vector = await worker.fetch(request("/v4/search", {
       containerTag: "content-projection",
       q: "VectorNeedle",
       indexOnly: true,
       limit: 10,
-    }), vectorEnv, ctx);
-    assertProjection(selected.find(({ sql }) => sql.includes("id IN (") && sql.includes("embedding_json")));
+    }), vectorEnv, ctx).then((response) => response.json());
+    assertProjection("vector hydration");
+    assert.equal(vector.results.length, expectedContent.size);
+    assert.ok(vector.results.every((result) => result.semanticSimilarity === 0.9));
   } finally {
     database.close();
   }

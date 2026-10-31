@@ -254,7 +254,7 @@ syncBuiltinESMExports(); process.on("exit", () => fs.writeFileSync(${JSON.string
     return { runs };
   });
   await check("automatic latest revisions preserve separate turns and parts; manual retains history", async () => {
-    searchRows = [row("old"), row("latest", 1, 1, "2026-10-20T00:00:00Z"), row("other-turn", 2), row("other-part", 1, 2)];
+    searchRows = [row("old", 1, 1, "2026-10-31T09:00:00+09:00"), row("latest", 1, 1, "2026-10-31T01:00:00Z"), row("other-turn", 2), row("other-part", 1, 2)];
     const output = context(await hook("UserPromptSubmit", { prompt: "SnowRunner truck settings", cwd: root }));
     assert.ok(!output.includes("id=old ") && !output.includes("id=old\n"));
     for (const id of ["latest", "other-turn", "other-part"]) assert.ok(output.includes(`id=${id}`));
@@ -262,6 +262,7 @@ syncBuiltinESMExports(); process.on("exit", () => fs.writeFileSync(${JSON.string
     assert.ok(!manual.isError);
     const text = JSON.stringify(manual);
     for (const id of ["old", "latest", "other-turn", "other-part"]) assert.ok(text.includes(`\"${id}\"`));
+    assert.ok(text.includes("2026-10-31T09:00:00+09:00"));
     searchRows = [];
   });
   await check("legacy getDocument projects skills while preserving source identity and provenance", async () => {

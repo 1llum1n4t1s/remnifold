@@ -8,7 +8,7 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
+import { resolveWorkerImports } from "./worker-imports.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
 const args = process.argv.slice(2);
@@ -34,7 +34,7 @@ async function bounded(promise, description) {
 
 async function loadWorker(sourceRoot) {
   const source = readFileSync(resolve(sourceRoot, "server/src/index.ts"), "utf8").replace(/\r\n/gu, "\n");
-  let observed = source.replace('"../../client/memory-index.mjs"', JSON.stringify(pathToFileURL(resolve(sourceRoot, "client/memory-index.mjs")).href));
+  let observed = resolveWorkerImports(source, sourceRoot);
   // 実際の評価点だけを数える。探索候補・判定・結果は置き換えない。
   for (const name of ["excerpt", "indexQueryPatterns"]) {
     const declaration = new RegExp(`(function ${name}\\([^\\n]+\\{\\n)`, "u");

@@ -1,12 +1,22 @@
 # Remnifold
 
-A Codex plugin and self-hosted Cloudflare backend for recalling useful implementation history across project folders.
+A self-hosted Cloudflare memory server with remote MCP access and a Codex plugin for recalling useful implementation history across project folders.
 
 The plugin saves completed work in a shared collection and keeps its project folder as provenance. Browse records by content topics, or ask about a topic such as “Chrome extension”: recall searches across memory spaces in one server request, injects concise indexes, and lets Codex open an applicable source record through MCP before reusing the implementation.
 
 ## Requirements
 
-Use Node.js 24.18.0 or later in the 24 series, pnpm 11.4.0, a Codex installation with plugin and hook support, and PowerShell 7 for the Windows setup helper. The MCP server and capture hooks have no npm runtime dependencies. The backend needs your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled.
+Remote MCP clients connect to the deployed server without installing Node.js or Codex locally. Server setup and maintenance require Node.js 24.18.0 or later in the 24 series, pnpm 12.16.1, and your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled. The optional Codex integration requires Codex with plugin and hook support; its Windows setup helper uses PowerShell 7. Its MCP server and capture hooks have no npm runtime dependencies.
+
+## Connect a remote MCP client
+
+After the server has been updated and verified below, use `https://your-worker.example.workers.dev/mcp` as the Streamable HTTP MCP endpoint. A compatible client can authenticate with OAuth 2.1 discovery, public dynamic client registration, and PKCE S256. On the server's authorization page, enter the existing memory API key and approve the named client. OAuth tokens are valid for MCP only; existing REST clients continue to use the API key. Clients supporting a configured Bearer credential can also use the memory API key directly. Keep keys and tokens private.
+
+[Grok Bot's Connect apps](https://docs.x.ai/grok-bot/overview) and [Grok connectors](https://docs.x.ai/grok/connectors) provide app and custom MCP connection paths. Choose OAuth when the client supports it; availability of manual Bearer-key entry in Grok Bot has not been verified.
+
+For ChatGPT, follow the [private plugin setup](https://developers.openai.com/plugins/build/plugins): choose **+ Add custom MCP server**, enter the `/mcp` URL and authentication, then choose **Create as a plugin**. This private connection does not require submission to the public directory. [ChatGPT dots](https://learn.chatgpt.com/docs/dots/computers-and-apps) uses supported, installed and enabled plugins; confirm in your account that this plugin appears and works in dots. Direct entry of an arbitrary MCP URL in dots has not been verified.
+
+The server asks the AI to search for relevant context, open full records when needed, and save durable outcomes. Tool use is chosen by the client and model, so automatic searches or saves are not guaranteed. Ask the AI to search or save explicitly when needed. This remote integration does not replace the existing Codex stdio server or hooks; avoid registering a duplicate remote server under the same Codex integration.
 
 ## Connect an existing server
 
@@ -36,7 +46,9 @@ The default command performs read-only discovery and prints the proposed resourc
 node scripts/setup-server.mjs --apply --location apac
 ```
 
-The setup reuses resources by name, checks the Vectorize dimensions and metric, creates missing resources, writes the ignored `server/wrangler.jsonc`, installs the Worker secret, applies D1 migrations, deploys, and verifies the endpoint. Re-run the same command to update the installation. An existing secret is retained unless a replacement key is supplied. Without its local value, verification can check health but cannot authenticate the session. Use `--base-url` for a custom domain when Wrangler does not report a workers.dev URL. `--help` lists resource-name, profile, location, and endpoint options.
+The setup reuses resources by name, checks the Vectorize dimensions and metric, creates missing resources, writes the ignored `server/wrangler.jsonc`, installs the Worker secret, applies D1 migrations, deploys, and verifies the endpoint. For an existing installation, retain its Wrangler configuration and first run the read-only command to check that it selects the existing Worker, D1 database and Vectorize index. If its configuration is unavailable or it used custom names, provide the original names with `--worker-name`, `--database-name`, and `--vector-index-name`; verify the plan before applying. An existing configured D1 ID must match the selected account. Do not create a replacement server or copy memories for this upgrade.
+
+Apply the server update and migrations before connecting or updating clients. The additive OAuth migration keeps existing REST and Codex clients compatible. Supply the existing key locally as `REMNIFOLD_API_KEY` to verify the authenticated session and remote MCP initialization and discovery of `search_memory`, `getDocument`, and `add_memory`. Supplying a key also writes it to the Worker, so use the existing key rather than an accidental replacement. If no local key is supplied, the existing secret is retained and only health is checked; authenticated verification is explicitly skipped. Use `--base-url` for a custom domain when Wrangler does not report a workers.dev URL. If a step fails, correct the cause and rerun the same command; resource discovery and migrations are safe to resume. The command reports the `/mcp` endpoint after deployment, and reports verified migration only after the authenticated checks pass. `--help` lists all options.
 
 Keep the local Wrangler configuration for future updates. Never commit generated resource IDs, credentials, or `.wrangler/` state. Cloudflare usage is billed to the account that hosts the server.
 

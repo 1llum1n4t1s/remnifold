@@ -88,11 +88,28 @@ async function main() {
     indexed("recent-project", "依存更新", { project: "replacetranslator", sm_project_id: "repo_replacetranslator__1234567890abcdef", sourceUpdatedAt: "2026-10-21T00:00:00.000Z" },
       { semanticSimilarity: 0.71, topics: ["ESLint", "Puppeteer"], searchExcerpt: "依存更新 ESLint Puppeteer" }),
   ];
+  const projectOffsetRows = [
+    indexed("offset-old", "release", { project: "ReplaceTranslator", sourceUpdatedAt: "2026-10-31T09:00:00+09:00" }),
+    indexed("offset-new", "release", { project: "ReplaceTranslator", sourceUpdatedAt: "2026-10-31T01:00:00Z" }),
+    indexed("offset-tie", "release", { project: "ReplaceTranslator", sourceUpdatedAt: "2026-10-31T10:00:00+09:00" }),
+    indexed("offset-fallback", "release", { project: "ReplaceTranslator", memoryIndex: buildMemoryIndex({ title: "release", request: "release" }) }, { updatedAt: "2026-10-31T00:30:00Z" }),
+    indexed("offset-missing", "release", { project: "ReplaceTranslator", memoryIndex: buildMemoryIndex({ title: "release", request: "release" }) }, { updatedAt: undefined, createdAt: undefined }),
+  ];
+  const revisionOffsetRows = [
+    indexed("revision-offset-old", "alpha beta", { sessionId: "offset", turn: 1, part: 1, sourceUpdatedAt: "2026-10-31T09:00:00+09:00" }),
+    indexed("revision-offset-new", "alpha beta", { sessionId: "offset", turn: 1, part: 1, sourceUpdatedAt: "2026-10-31T01:00:00Z" }),
+    indexed("revision-tie-old", "alpha beta", { sessionId: "offset", turn: 2, part: 1, sourceUpdatedAt: "2026-10-31T10:00:00+09:00" }, { createdAt: "2026-10-01T00:00:00Z" }),
+    indexed("revision-tie-new", "alpha beta", { sessionId: "offset", turn: 2, part: 1, sourceUpdatedAt: "2026-10-31T01:00:00Z" }, { createdAt: "2026-10-02T00:00:00Z" }),
+    indexed("revision-missing", "alpha beta", { sessionId: "offset", turn: 3, part: 1, memoryIndex: buildMemoryIndex({ title: "alpha beta", request: "alpha beta" }) }, { createdAt: undefined, updatedAt: undefined }),
+    indexed("revision-fallback", "alpha beta", { sessionId: "offset", turn: 3, part: 1, memoryIndex: buildMemoryIndex({ title: "alpha beta", request: "alpha beta" }) }, { createdAt: "2026-10-01T00:00:00Z" }),
+  ];
   const scenarios = [
     { name: "manual-project-hydration-cap", rows: [
       ...Array.from({ length: 25 }, (_, i) => ({ ...projectRows[0], id: `old-project-${i}` })), projectRows[2],
     ], input: { query: "ReplaceTranslator", limit: 3 } },
     { name: "manual-project-recency", rows: projectRows, input: { query: "ReplaceTranslator", limit: 3 } },
+    { name: "manual-project-offset", rows: projectOffsetRows, input: { query: "ReplaceTranslator", limit: 10 } },
+    { name: "automatic-revision-offset", rows: revisionOffsetRows, input: { query: "alpha beta", automatic: true, limit: 10 } },
     { name: "manual-project-topic", rows: projectRows, input: { query: "ReplaceTranslator 依存更新 ESLint Puppeteer", limit: 3 } },
     { name: "automatic-project-isolation", rows: projectRows, input: { query: "ReplaceTranslator", automatic: true, limit: 3 } },
     { name: "automatic-ranking", rows: ranking, input: { query: "alpha beta", automatic: true, limit: 20 } },
@@ -175,6 +192,9 @@ async function main() {
     const find = (name) => current.find((scenario) => scenario.name === name);
     const ids = (name) => find(name).result.results.map((index) => index.id);
     assert.equal(ids("manual-project-recency")[0], "recent-project");
+    assert.deepEqual(ids("manual-project-offset"), ["offset-new", "offset-tie", "offset-fallback", "offset-old", "offset-missing"]);
+    assert.equal(find("manual-project-offset").result.results[1].sourceUpdatedAt, "2026-10-31T10:00:00+09:00");
+    assert.deepEqual(ids("automatic-revision-offset"), ["revision-offset-new", "revision-tie-new", "revision-fallback"]);
     assert.equal(ids("manual-project-hydration-cap")[0], "recent-project");
     assert.equal(ids("manual-project-topic")[0], "recent-project");
     assert.ok(!ids("automatic-project-isolation").includes("recent-project"));

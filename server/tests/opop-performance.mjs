@@ -9,7 +9,7 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
+import { resolveWorkerImports } from "./worker-imports.mjs";
 import { buildMemoryIndex } from "../../client/memory-index.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
@@ -54,7 +54,7 @@ function comparisonSource() {
 }
 
 async function loadWorker(text, optimized) {
-  let instrumented = replaceOnce(text, '"../../client/memory-index.mjs"', JSON.stringify(pathToFileURL(resolve(root, "client/memory-index.mjs")).href));
+  let instrumented = resolveWorkerImports(text, root);
   const coverageSignature = instrumented.match(/^function queryCoverage\([^\n]+\): number \{/mu)?.[0];
   assert.ok(coverageSignature, "queryCoverage signature changed");
   instrumented = replaceOnce(instrumented, coverageSignature, `${coverageSignature} __counts.coverage++;`);

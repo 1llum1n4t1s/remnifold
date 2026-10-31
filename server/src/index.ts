@@ -1,4 +1,7 @@
 import { documentIndex } from "../../client/memory-index.mjs";
+import packageMetadata from "../package.json" with { type: "json" };
+import { handleMcpRequest } from "./mcp.ts";
+import { authorizeMcp, oauthChallenge, routeOAuth } from "./mcp-oauth.ts";
 
 // JSON escapingを含む最大長のcontent、entityContext、metadataをまとめて収容する。
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -1883,7 +1886,7 @@ async function runMemoryEnrichment(memory: EnrichmentMemory, env: Env): Promise<
     "UPDATE memories SET enrichment_error = ? WHERE id = ? AND updated_at = ? AND topic_revision = ?",
   )
     .bind(
-      errors.length > 0 ? truncateUtf16(errors.join("; "), 2_000) : null,
+      errors.length > 0 ? diagnosticError(errors.join("; "), env) : null,
       memory.id,
       memory.updatedAt,
       memory.topicRevision,
@@ -3172,14 +3175,16 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
       AND strftime('%Y-%m-%d', substr(${value}, 1, 10), '+0 days') = substr(${value}, 1, 10)
       THEN julianday(${value}) END`;
   };
+  const taskProject = `COALESCE(CASE WHEN json_type(m.metadata_json, '$.sm_project_id') = 'text'
+        THEN NULLIF(trim(json_extract(m.metadata_json, '$.sm_project_id')), '') END, m.container_tag)`;
+  const taskSession = `json_extract(m.metadata_json, '$.sessionId')`;
   const recentPrefix = recentTasks ? `WITH candidates AS (
     SELECT m.id, m.container_tag, m.metadata_json, m.status, m.created_at, m.updated_at,
       substr(m.content, 1, 300) AS content_preview,
       COALESCE(${["$.memoryIndex.sourceUpdatedAt", "$.sourceTimestamp", "$.sourceUpdatedAt", "$.completedAt"].map(sourceDate).join(", ")},
       julianday(m.created_at)) AS source_date,
-      COALESCE(CASE WHEN json_type(m.metadata_json, '$.sm_project_id') = 'text'
-        THEN NULLIF(trim(json_extract(m.metadata_json, '$.sm_project_id')), '') END, m.container_tag) AS task_project,
-      json_extract(m.metadata_json, '$.sessionId') AS task_session
+      ${taskProject} AS task_project,
+      ${taskSession} AS task_session
     FROM memories AS m WHERE ${where}
   ), ranked AS (
     SELECT candidates.*, ROW_NUMBER() OVER (
@@ -3193,7 +3198,9 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   const table = recentTasks ? "recent" : "memories";
   const selection = recentTasks ? "1 = 1" : where;
   const [countResult, rowsResult] = await env.DB.batch([
-    env.DB.prepare(`${recentPrefix}SELECT COUNT(*) AS total FROM ${table} AS m WHERE ${selection}`).bind(...parameters),
+    env.DB.prepare(recentTasks
+      ? `SELECT COUNT(*) AS total FROM (SELECT 1 FROM memories AS m WHERE ${where} GROUP BY ${taskProject}, ${taskSession})`
+      : `SELECT COUNT(*) AS total FROM ${table} AS m WHERE ${selection}`).bind(...parameters),
     env.DB.prepare(
       `${recentPrefix}SELECT ${columns} FROM ${table} AS m WHERE ${selection}
        ORDER BY ${recentTasks ? "m.source_date DESC, m.id DESC" : "m.updated_at DESC"} LIMIT ? OFFSET ?`,
@@ -3243,7 +3250,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
           topicStatus: row.topic_status,
           topicModel: row.topic_model,
           topicsExtractedAt: row.topics_extracted_at,
-          error: row.enrichment_error,
+          error: row.enrichment_error === null ? null : diagnosticError(row.enrichment_error, env),
         },
         isForgotten: row.is_forgotten === 1,
         isLatest: true,
@@ -3297,7 +3304,7 @@ async function getDocument(id: string, env: Env): Promise<Response> {
       factsExtractedAt: row.facts_extracted_at,
       topicsExtractedAt: row.topics_extracted_at,
       vectorAttemptedAt: row.vector_attempted_at,
-      error: row.enrichment_error,
+      error: row.enrichment_error === null ? null : diagnosticError(row.enrichment_error, env),
     },
   });
 }
@@ -3590,6 +3597,36 @@ async function containerTagRoute(request: Request, tag: string, env: Env): Promi
 
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
+  const oauth = await routeOAuth(request, env);
+  if (oauth) return oauth;
+  if (url.pathname === "/mcp") {
+    const origin = request.headers.get("origin");
+    const allowed = [url.origin, ...(env.MCP_ALLOWED_ORIGINS ?? "").split(",").map(value => value.trim()).filter(Boolean)];
+    if (origin && !allowed.includes(origin)) return json({ error: { message: "Origin is not allowed" } }, 403);
+    let response: Response;
+    if (request.method === "OPTIONS") {
+      response = new Response(null, { status: 204 });
+    } else if (!(await isAuthorized(request, env)) && !(await authorizeMcp(request, env))) {
+      response = oauthChallenge(request);
+    } else {
+      response = await handleMcpRequest(request, {
+        api: inner => worker.fetch(inner, env, ctx),
+        version: packageMetadata.version,
+        apiKey: env.MEMORY_API_KEY,
+      });
+    }
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "no-store");
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Vary", "Origin");
+    if (origin) {
+      headers.set("Access-Control-Allow-Origin", origin);
+      headers.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID");
+      headers.set("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Protocol-Version, MCP-Session-Id");
+    }
+    return new Response(response.body, { status: response.status, headers });
+  }
   if (url.pathname === "/health" && request.method === "GET") {
     return json({
       ok: true,
@@ -3612,6 +3649,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       capabilities: {
         semanticSearch: enrichmentEnabled(env),
         factGraph: enrichmentEnabled(env),
+        remoteMcp: true,
       },
     });
   }
@@ -3657,7 +3695,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   throw new HttpError(404, "Not found");
 }
 
-export default {
+const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       return await route(request, env, ctx);
@@ -3684,3 +3722,5 @@ export default {
     }));
   },
 } satisfies ExportedHandler<Env>;
+
+export default worker;
