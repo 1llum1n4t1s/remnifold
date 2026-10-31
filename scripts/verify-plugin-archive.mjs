@@ -8,7 +8,7 @@ import { collectPackageFiles, REPOSITORY_ROOT } from "./package-plugin.mjs";
 
 // アップロードするアーカイブ自身を、同じcheckoutの配布対象と照合する。
 const archive = path.resolve(process.argv[2] ?? "dist/remnifold.tar.gz");
-const entries = execFileSync("tar", ["-tzf", archive], { encoding: "utf8" }).trim().split("\n");
+const entries = execFileSync("tar", ["-tzf", archive], { encoding: "utf8" }).trim().split(/\r?\n/u);
 const files = entries.filter(entry => !entry.endsWith("/"));
 const expected = (await collectPackageFiles()).map(file => `remnifold/${file}`).sort();
 assert.deepEqual([...files].sort(), expected, "Archive must contain exactly the release files");
