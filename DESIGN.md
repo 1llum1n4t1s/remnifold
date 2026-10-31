@@ -6,9 +6,10 @@ The repository has two deployable parts.
 Codex plugin                          User-owned Cloudflare account
   prompt/capture hooks  ───────────▶  Worker API
   MCP search/getDocument ◀─────────   D1 + Vectorize + Workers AI
+Remote MCP client      ◀──────────▶  Worker /mcp + OAuth endpoints
 ```
 
-`server/` owns authentication, persistence, lexical and semantic search, enrichment, and document retrieval. Each installation uses resources in the user's Cloudflare account. Client configuration selects that installation's endpoint and API key, plus recall settings.
+`server/` owns authentication, persistence, lexical and semantic search, enrichment, and document retrieval. Each installation uses resources in the user's Cloudflare account. Codex client configuration selects that installation's endpoint and API key, plus recall settings. Remote MCP clients connect directly to the Worker without the local plugin; their client and model control recall and saving rather than Codex hooks.
 
 ## Storage and provenance
 
@@ -88,6 +89,8 @@ Migrations run before deployment and client changes; the additive OAuth migratio
 
 The stateless Streamable HTTP endpoint is `/mcp`. It accepts the existing API key as a Bearer credential or MCP-scoped OAuth access tokens issued through protected-resource and authorization-server discovery, public dynamic client registration, authorization code with PKCE S256, refresh, and revocation. Owner consent requires the existing API key. OAuth tokens do not authorize the existing REST API. Remote tools search existing spaces and retrieve or save records using the same backend; they do not move or duplicate stored memories. Server instructions ask clients to search, open details when needed, and save durable results, but client and model behavior determines whether tools are called. The Codex stdio transport and hooks remain separate and unchanged.
 
+`server/src/mcp-oauth.ts` owns discovery and OAuth credentials persisted by migration `0008_remote_mcp_oauth.sql`. The Worker router checks credentials and browser origins before calling the transport adapter in `server/src/mcp.ts`. The adapter validates tool arguments and invokes the existing REST routes internally with the owner API key, retaining their storage and mutation rules. OAuth consent therefore grants access to the installation's memories, not an isolated per-client collection. Remote saves accept explicit `projectId` provenance; they do not infer local workspace folders. Remote consolidation also requires an explicit `projectId`, unlike the Codex stdio tool's workspace-root fallback.
+
 Remote saves use the same secret redaction implementation as Codex capture, additionally removing the current OAuth credential. A supplied idempotency key is scoped to the physical space, project, and redacted content so retries reuse a record without overwriting a different project's memory. OAuth access tokens expire after one hour; refresh tokens rotate and expire after 30 days. Reusing a refresh token revokes its token family, and changing the owner API key invalidates issued credentials. Registration is limited to ten requests per source IP and origin per hour. Unapproved registrations expire after 24 hours; approved client identities remain valid. Browser MCP requests require the server's own origin or an exact comma-separated origin in `MCP_ALLOWED_ORIGINS`; server-to-server clients normally send no Origin header. OAuth consent always requires the same origin.
 
 ## Plugin integration
@@ -99,6 +102,8 @@ The package uses Codex's `.codex-plugin/plugin.json` format because Codex 0.153.
 `scripts/package-plugin.mjs` stages allowlisted assets beside the output, removes the previous output, then renames the staging directory into place. Both directories must be children of the repository's `dist/` directory. Cleanup rejects symbolic links in the target, its ancestors, or its contents so replacing a package cannot traverse links into unrelated data. The replacement is not atomic across removal and rename; a failed build cleans its staging directory but does not restore a removed prior output.
 
 ### Release installation
+
+CI verifies the final plugin archive against the packaging checkout before publication: the exact allowlisted file set and every file's bytes must match, and the plugin and server manifest versions must match the root package version. This checks the uploaded archive itself in addition to validating the staged plugin directory. The command and required ordering are maintained in [AGENTS.md](AGENTS.md#validation).
 
 `vava.config.json.localPlugin` connects release publication to one configured personal installation, `remnifold@personal`. Its marketplace source is a non-Git directory, separate from vava's Git-based `consumerUpdates.targets`. This is a repository-side Windows release integration, not an updater shipped in the plugin or a server deployment mechanism. Other installations use the update steps in [README.md](README.md#connect-an-existing-server).
 
