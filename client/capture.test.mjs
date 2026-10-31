@@ -107,6 +107,27 @@ test("旧形式の重複イベントを一つにまとめる", async (t) => {
   assert.equal((await parseTaskTranscript(f.path, [])).turns.length, 1);
 });
 
+test("重複の行間隔は採用イベントから数え、除外イベントの伏字数と原文時刻を保つ", async (t) => {
+  const sourceTimestamp = "2026-09-11T01:02:03.456Z";
+  const f = fixture(t, [
+    assistant("依頼前の応答"),
+    user("依頼 test-only-secret", sourceTimestamp),
+    user("依頼 test-only-secret", "2026-09-11T01:03:00.000Z"),
+    null,
+    {},
+    assistant("途中経過", "commentary"),
+    user("依頼 test-only-secret"),
+    user("依頼 test-only-secret"),
+    assistant("完了 test-only-secret"),
+    user("未完了の依頼"),
+  ]);
+  appendFileSync(f.path, "{invalid\n");
+  assert.deepEqual(await parseTaskTranscript(f.path, ["test-only-secret"]), {
+    turns: [{ user: "依頼 [REDACTED]\n\n依頼 [REDACTED]", assistant: "完了 [REDACTED]", sourceTimestamp }],
+    redactions: 5,
+  });
+});
+
 test("実機のphase形式で進捗を完了応答と誤認しない", async (t) => {
   const progress = assistant("進捗");
   delete progress.payload.channel;

@@ -275,16 +275,32 @@ function extractTextBlocks(content, allowedTypes) {
 async function parseTaskTranscript(filePath, knownSecrets) {
   const input = createReadStream(filePath, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
-  const entries = [];
+  const turns = [];
   const counter = { count: 0 };
   let lineIndex = 0;
+  let previous = null;
+  let currentTurn = null;
 
   function push(role, rawContent, sourceTimestamp) {
     const content = sanitizeText(role === "user" ? cleanUserRequest(rawContent) : rawContent, knownSecrets, counter);
     if (!content) return;
-    const previous = entries.at(-1);
     if (previous?.role === role && previous.content === content && lineIndex - previous.lineIndex <= 5) return;
-    entries.push({ role, content, lineIndex, sourceTimestamp: typeof sourceTimestamp === "string" ? sourceTimestamp : "" });
+    previous = { role, content, lineIndex };
+    const timestamp = typeof sourceTimestamp === "string" ? sourceTimestamp : "";
+    if (role === "user") {
+      if (currentTurn && !currentTurn.assistant) {
+        // 作業中に届いた補足・訂正も、完了した要求と一緒に保持する。
+        currentTurn.user += `\n\n${content}`;
+      } else {
+        currentTurn = { user: content, assistant: "" };
+        if (timestamp) currentTurn.sourceTimestamp = timestamp;
+        turns.push(currentTurn);
+      }
+    } else if (currentTurn) {
+      // The last response after a user request is the task result; intermediate commentary stays local.
+      currentTurn.assistant = content;
+      if (!currentTurn.sourceTimestamp && timestamp) currentTurn.sourceTimestamp = timestamp;
+    }
   }
 
   try {
@@ -313,24 +329,6 @@ async function parseTaskTranscript(filePath, knownSecrets) {
     input.destroy();
   }
 
-  const turns = [];
-  let currentTurn = null;
-  for (const entry of entries) {
-    if (entry.role === "user") {
-      if (currentTurn && !currentTurn.assistant) {
-        // 作業中に届いた補足・訂正も、完了した要求と一緒に保持する。
-        currentTurn.user += `\n\n${entry.content}`;
-      } else {
-        currentTurn = { user: entry.content, assistant: "" };
-        if (entry.sourceTimestamp) currentTurn.sourceTimestamp = entry.sourceTimestamp;
-        turns.push(currentTurn);
-      }
-    } else if (currentTurn) {
-      // The last response after a user request is the task result; intermediate commentary stays local.
-      currentTurn.assistant = entry.content;
-      if (!currentTurn.sourceTimestamp && entry.sourceTimestamp) currentTurn.sourceTimestamp = entry.sourceTimestamp;
-    }
-  }
   return { turns: turns.filter((turn) => turn.assistant), redactions: counter.count };
 }
 
