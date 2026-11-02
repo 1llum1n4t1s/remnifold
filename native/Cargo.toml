@@ -24,7 +24,7 @@ tar = "0.4"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 unicode-normalization = "0.1"
-zip = { version = "7", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"
