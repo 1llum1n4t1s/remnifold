@@ -181,6 +181,86 @@ mod tests {
             assert!(!safe_name(name), "{name}");
         }
     }
+
+    fn zip_archive(names: &[&str]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for name in names {
+            writer
+                .start_file(
+                    *name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(b"bounded tar payload").unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn accepts_only_one_expected_regular_zip_entry() {
+        let name = "remnifold.tar.gz";
+        assert_eq!(
+            read_zip(&zip_archive(&[name]), name).unwrap(),
+            b"bounded tar payload"
+        );
+        assert!(read_zip(&zip_archive(&[name, "extra"]), name).is_err());
+        assert!(read_zip(&zip_archive(&["../outside"]), name).is_err());
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_symlink(name, "../outside", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        assert!(read_zip(&writer.finish().unwrap().into_inner(), name).is_err());
+    }
+
+    #[test]
+    fn rejects_zip_cloaking_and_oversized_metadata_before_reading_payload() {
+        let name = "remnifold.tar.gz";
+        let mut cloaked = zip_archive(&[name]);
+        assert_eq!(&cloaked[..4], b"PK\x03\x04");
+        assert_eq!(&cloaked[30..30 + name.len()], name.as_bytes());
+        // ZIP中央ディレクトリとローカルヘッダーが異なる名前を主張する入力を拒否する。
+        let hostile = b"../outside/evil!";
+        assert_eq!(hostile.len(), name.len());
+        cloaked[30..30 + name.len()].copy_from_slice(hostile);
+        assert!(read_zip(&cloaked, name).is_err());
+        let mut oversized = zip_archive(&[name]);
+        let central = oversized
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        oversized[22..26].copy_from_slice(&((LIMIT + 1) as u32).to_le_bytes());
+        oversized[central + 24..central + 28].copy_from_slice(&((LIMIT + 1) as u32).to_le_bytes());
+        assert_eq!(
+            read_zip(&oversized, name).unwrap_err().to_string(),
+            "UNSAFE_ARCHIVE"
+        );
+    }
+
+    #[test]
+    fn accepts_github_deflate_data_descriptor_entries() {
+        let name = "remnifold.tar.gz";
+        let mut bytes = zip_archive(&[name]);
+        let central = bytes
+            .windows(4)
+            .position(|part| part == b"PK\x01\x02")
+            .unwrap();
+        let mut descriptor = b"PK\x07\x08".to_vec();
+        descriptor.extend_from_slice(&bytes[14..26]);
+        // GitHub配布ZIP同様、ローカルのサイズは0で、実値を後続descriptorに置く。
+        let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) | 8;
+        bytes[6..8].copy_from_slice(&flags.to_le_bytes());
+        bytes[central + 8..central + 10].copy_from_slice(&flags.to_le_bytes());
+        bytes[14..26].fill(0);
+        bytes.splice(central..central, descriptor.iter().copied());
+        let end = bytes
+            .windows(4)
+            .rposition(|part| part == b"PK\x05\x06")
+            .unwrap();
+        bytes[end + 16..end + 20]
+            .copy_from_slice(&((central + descriptor.len()) as u32).to_le_bytes());
+        assert_eq!(read_zip(&bytes, name).unwrap(), b"bounded tar payload");
+    }
 }
 fn legacy_source(name: &str) -> bool {
     if name
@@ -339,9 +419,12 @@ fn parse_tar(bytes: &[u8]) -> Result<Files> {
 fn read_zip(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))?;
     ensure!(zip.len() == 1, "UNEXPECTED_ARTIFACT_CONTENTS");
-    let entry = zip.by_index(0)?;
+    let entry = zip.by_index_with_options(
+        0,
+        zip::read::ZipReadOptions::new().enforce_header_consistency(true),
+    )?;
     ensure!(
-        entry.name() == name
+        entry.name()?.as_ref() == name
             && !entry.is_dir()
             && entry.size() <= LIMIT
             && entry

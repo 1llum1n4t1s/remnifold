@@ -25,6 +25,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -38,7 +42,7 @@ jobs:
       - name: Exercise native client against authenticated Worker
         shell: bash
         env:
-          REMNIFOLD_VALIDATION_DIR: ${{ runner.temp }}/remnifold-native-client
+          REMNIFOLD_VALIDATION_DIR: ${{ github.workspace }}/dist/native-validation
         run: |
           binary="$PWD/native/target/debug/remnifold"
           if [[ "${{ runner.os }}" == "Windows" ]]; then binary="$binary.exe"; fi
@@ -48,7 +52,7 @@ jobs:
       - name: Validate native consumer plugin
         run: node scripts/validate-plugin.mjs dist/${{ matrix.target }}/remnifold
       - name: Create native plugin archive
-        run: tar --format ustar -czf dist/remnifold-${{ matrix.target }}.tar.gz -C dist/${{ matrix.target }} remnifold
+        run: node scripts/lib/tar.mjs --format ustar -czf dist/remnifold-${{ matrix.target }}.tar.gz -C dist/${{ matrix.target }} remnifold
       - name: Verify native archive before publication
         run: node scripts/verify-plugin-archive.mjs dist/remnifold-${{ matrix.target }}.tar.gz
       - name: Exercise native plugin update and recovery
@@ -68,15 +72,17 @@ jobs:
           name: remnifold-${{ matrix.target }}
           path: dist/remnifold-${{ matrix.target }}.tar.gz
           if-no-files-found: error
+      - name: Stage native updater validation evidence
+        if: always()
+        shell: bash
+        run: |
+          node --input-type=module -e 'import { existsSync, mkdirSync, copyFileSync } from "node:fs"; import path from "node:path"; const work = process.platform === "win32" ? "D:/Codex/remnifold/native-updater-ci" : path.join(process.env.RUNNER_TEMP, "remnifold-native-updater"); const input = path.join(work, "local-plugin-update-validation.json"); if (existsSync(input)) { mkdirSync("dist/native-validation", { recursive: true }); copyFileSync(input, "dist/native-validation/local-plugin-update-validation.json"); }'
       - name: Upload native validation results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: remnifold-native-validation-${{ matrix.target }}
-          path: |
-            ${{ runner.temp }}/remnifold-native-client/*.json
-            ${{ runner.temp }}/remnifold-native-updater/*.json
-            D:/Codex/remnifold/native-updater-ci/*.json
+          path: dist/native-validation/*.json
           if-no-files-found: warn
   test-and-package:
     runs-on: ubuntu-latest
@@ -115,7 +121,7 @@ jobs:
         run: pnpm run package:plugin
 
       - name: Create plugin archive
-        run: tar -czf dist/remnifold.tar.gz -C dist remnifold
+        run: node scripts/lib/tar.mjs -czf dist/remnifold.tar.gz -C dist remnifold
 
       - name: Verify final plugin archive before publication
         run: node scripts/verify-plugin-archive.mjs dist/remnifold.tar.gz

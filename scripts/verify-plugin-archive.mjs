@@ -6,10 +6,12 @@ import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import { collectPackageFiles, REPOSITORY_ROOT } from "./package-plugin.mjs";
 import { isNativeSourcePath, nativeHooks, nativeJson, nativeTarget, verifyNativeFiles } from "./native-distribution.mjs";
+import { tarExecutable } from "./lib/tar.mjs";
 
 // アップロードするアーカイブ自身を、同じcheckoutの配布対象と照合する。
 const archive = path.resolve(process.argv[2] ?? "dist/remnifold.tar.gz");
-const entries = execFileSync("tar", ["-tzf", archive], { encoding: "utf8" }).trim().split(/\r?\n/u);
+const tar = tarExecutable();
+const entries = execFileSync(tar, ["-tzf", archive], { encoding: "utf8" }).trim().split(/\r?\n/u);
 const files = entries.filter(entry => !entry.endsWith("/"));
 if (files.includes("remnifold/native-build.json")) {
   const bytes = new Map();
@@ -17,7 +19,7 @@ if (files.includes("remnifold/native-build.json")) {
     assert.ok(name.startsWith("remnifold/") && !name.includes("../") && !name.includes("\\"), "Unsafe archive path");
     const relative = name.slice("remnifold/".length);
     assert.ok(!bytes.has(relative), "Duplicate archive entry");
-    bytes.set(relative, execFileSync("tar", ["-xOf", archive, name], { maxBuffer: 64 * 1024 * 1024 }));
+    bytes.set(relative, execFileSync(tar, ["-xOf", archive, name], { maxBuffer: 64 * 1024 * 1024 }));
   }
   const commit = process.env.GITHUB_SHA ?? execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPOSITORY_ROOT, encoding: "utf8" }).trim();
   const manifest = verifyNativeFiles(bytes, { sourceCommit: commit });
@@ -44,13 +46,13 @@ if (files.includes("remnifold/native-build.json")) {
 const expected = (await collectPackageFiles()).map(file => `remnifold/${file}`).sort();
 assert.deepEqual([...files].sort(), expected, "Archive must contain exactly the release files");
 for (const entry of files) {
-  const bytes = execFileSync("tar", ["-xOf", archive, entry], { maxBuffer: 4 * 1024 * 1024 });
+  const bytes = execFileSync(tar, ["-xOf", archive, entry], { maxBuffer: 4 * 1024 * 1024 });
   const source = await readFile(path.join(REPOSITORY_ROOT, entry.slice("remnifold/".length)));
   assert.ok(bytes.equals(source), `Archive/source mismatch: ${entry}`);
 }
 const primary = JSON.parse(await readFile(path.join(REPOSITORY_ROOT, "package.json"), "utf8"));
 for (const file of [".codex-plugin/plugin.json", "server/package.json"]) {
-  const manifest = JSON.parse(execFileSync("tar", ["-xOf", archive, `remnifold/${file}`], { encoding: "utf8" }));
+  const manifest = JSON.parse(execFileSync(tar, ["-xOf", archive, `remnifold/${file}`], { encoding: "utf8" }));
   assert.equal(manifest.version, primary.version, `Release version mismatch: ${file}`);
 }
 console.log(JSON.stringify({ version: primary.version, files: files.length,

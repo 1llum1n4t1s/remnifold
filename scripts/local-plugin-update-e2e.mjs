@@ -9,6 +9,7 @@ import { constants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isNativeSourcePath } from "./native-distribution.mjs";
+import { tarExecutable } from "./lib/tar.mjs";
 
 const execute = promisify(execFile);
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -138,17 +139,18 @@ async function main() {
   const archive = path.join(root, "published.tar.gz");
   await copyFile(args["--archive"], archive);
   const archiveHash = hash(await readFile(archive));
-  const listing = (await command("tar", ["-tzf", archive])).stdout.trim().split(/\r?\n/u);
+  const tar = tarExecutable();
+  const listing = (await command(tar, ["-tzf", archive])).stdout.trim().split(/\r?\n/u);
   assert.ok(listing.length > 1);
   for (const entry of listing) {
     assert.ok(/^remnifold(?:\/|$)/u.test(entry) && !entry.includes("\\") && !entry.includes(":"));
     assert.ok(!entry.replace(/\/$/u, "").split("/").some((part) => !part || part === "." || part === ".."));
   }
-  const verboseListing = (await command("tar", ["-tvzf", archive])).stdout.trim().split(/\r?\n/u);
+  const verboseListing = (await command(tar, ["-tvzf", archive])).stdout.trim().split(/\r?\n/u);
   for (const entry of verboseListing) assert.match(entry, /^[-d]/u, "The published fixture must contain only files and directories");
   const extracted = path.join(root, "published");
   await mkdir(extracted);
-  await command("tar", ["-xzf", archive, "-C", extracted]);
+  await command(tar, ["-xzf", archive, "-C", extracted]);
   const packageRoot = path.join(extracted, "remnifold");
   const expected = await filesAt(packageRoot);
   const manifest = JSON.parse(await readFile(path.join(packageRoot, ".codex-plugin", "plugin.json"), "utf8"));
