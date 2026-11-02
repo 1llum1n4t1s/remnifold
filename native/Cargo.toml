@@ -9,7 +9,7 @@ publish = false
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-fancy-regex = "0.17"
+fancy-regex = "0.20"
 flate2 = "1"
 icu_segmenter = { version = "2", features = ["compiled_data"] }
 regex = "1"
