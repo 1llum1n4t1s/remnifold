@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -90,12 +90,18 @@ try {
   const { runSetup } = await import(pathToFileURL(join(runtimeRoot, "scripts", "setup-server.mjs")));
   const wranglerBin = join(fixture, "wrangler-fixture.cjs");
   await writeFile(wranglerBin, "");
+  // 開発者の実リソース設定を、決定的なセットアップfixtureへ混ぜない。
+  const setupServerDir = join(fixture, "server");
+  await mkdir(setupServerDir);
+  for (const name of ["package.json", "wrangler.example.jsonc", "migrations"]) {
+    await cp(join(runtimeRoot, "server", name), join(setupServerDir, name), { recursive: true });
+  }
   currentCheck = "server resources are reused in new-to-old priority without remote mutations";
   await check(currentCheck, async () => {
     for (const names of [["remnifold", "kagayoi-memory", "cloudflare-supermemory"], ["kagayoi-memory", "cloudflare-supermemory"], ["cloudflare-supermemory"]]) {
       const calls = [], lines = [];
       await runSetup([], {
-        serverDir: join(runtimeRoot, "server"), wranglerBin, env: {}, output: line => lines.push(line),
+        serverDir: setupServerDir, wranglerBin, env: {}, output: line => lines.push(line),
         runner: async ({ args }) => {
           calls.push(args);
           if (args[0] === "whoami") return { code: 0, stdout: "{}", stderr: "" };

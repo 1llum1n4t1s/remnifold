@@ -11,3 +11,4 @@ dist/
 *.cpuprofile
 server/wrangler.jsonc
 server/worker-configuration.d.ts
+native/target/

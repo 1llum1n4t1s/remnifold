@@ -6,7 +6,9 @@ The plugin saves completed work in a shared collection and keeps its project fol
 
 ## Requirements
 
-Remote MCP clients connect to the deployed server without installing Node.js or Codex locally. Server setup and maintenance require Node.js 24.18.0 or later in the 24 series, pnpm 12.16.1, and your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled. The optional Codex integration requires Codex with plugin and hook support; its Windows setup helper uses PowerShell 7. Its MCP server and capture hooks have no npm runtime dependencies.
+Remote MCP clients connect to the deployed server without installing Node.js or Codex locally. The optional Codex integration requires Codex with plugin and hook support and the package matching your operating system and CPU. Its MCP server, hooks, connection setup, history import, and local plugin updater run as a native executable without Node.js. Local plugin updates also require authenticated GitHub CLI and native Codex CLI.
+
+Server setup and maintenance require Node.js 24.18.0 or later in the 24 series, pnpm 12.16.1, and your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled.
 
 ## Connect a remote MCP client
 
@@ -20,17 +22,29 @@ The server asks the AI to search for relevant context, open full records when ne
 
 ## Connect an existing server
 
-Clone this repository or download and extract the CI package. In Codex, open the repository or extracted plugin folder and ask: “Use plugin-creator to install this Remnifold plugin in my personal marketplace.” The installer should register the source, validate it, and run `codex plugin add remnifold@personal`. For updates, replace the local source with the newer checkout or extracted CI package, then ask Codex to refresh that source and reinstall it. Building a distributable from a source checkout is covered in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#validation); the CI package is already built.
+Download the matching archive from the successful release commit's [CI artifacts](https://github.com/1llum1n4t1s/remnifold/actions/workflows/ci.yml) and extract it into an external folder.
+
+| Platform | Archive |
+| --- | --- |
+| Windows x64 | `remnifold-x86_64-pc-windows-msvc.tar.gz` |
+| Mac Apple Silicon | `remnifold-aarch64-apple-darwin.tar.gz` |
+| Mac Intel | `remnifold-x86_64-apple-darwin.tar.gz` |
+| Linux x64 | `remnifold-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `remnifold-aarch64-unknown-linux-gnu.tar.gz` |
+
+In Codex, open the extracted `remnifold` folder and ask: “Use plugin-creator to install this Remnifold plugin in my personal marketplace.” The installer should register the source, validate it, and run `codex plugin add remnifold@personal`. To move an existing JavaScript installation to the native version, run the extracted executable's `plugin-update` command using the [standalone updater procedure](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update). The new executable verifies and replaces the old managed source while preserving connection and capture state; the old Node updater cannot install native releases. Building from a source checkout is covered in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#validation).
 
 ```powershell
-pwsh -NoProfile -File scripts/setup-client.ps1 -BaseUrl https://your-worker.example.workers.dev
+./bin/remnifold.exe setup --base-url https://your-worker.example.workers.dev
 ```
 
-Enter the API key at the secure prompt if it is not already supplied. The script verifies an authenticated session before writing `remnifold.json` in the selected Codex home: `-CodexHome`, then `CODEX_HOME`, then the default `~/.codex`. Run Codex with the same home so it reads that connection. To update an existing connection, use `-Force`; unrelated settings are preserved. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` can supply process-level overrides.
+On macOS and Linux, use `./bin/remnifold` in place of `./bin/remnifold.exe` in these commands. Run them from the extracted plugin folder. Enter the API key at the hidden prompt if it is not already supplied. Setup verifies an authenticated session before writing `remnifold.json` in the selected Codex home: `--codex-home`, then `CODEX_HOME`, then the default `~/.codex`. Run Codex with the same home so it reads that connection. To update an existing connection, use `--force`; unrelated settings are preserved. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` can supply process-level overrides. For noninteractive setup, `--api-key-stdin` reads the key from standard input.
 
-On Windows, the existing `remnifold@personal` installation can also be updated on explicit request with the repository's [standalone local updater](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update). Publishing a release does not update that installation automatically.
+The existing `remnifold@personal` installation can also be updated on explicit request with the [standalone local updater](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update), which verifies the published package and uses the official Codex plugin CLI. Publishing a release does not update that installation automatically.
 
 After installing or updating the plugin, review any hook trust requested by Codex for its four hooks, then start a new task to load the updated plugin. Run the plugin's `whoAmI` MCP tool to verify connectivity and space discovery. Installing a plugin alone does not trust its hooks.
+
+To import existing Codex sessions, preview a bounded batch with `./bin/remnifold.exe import --limit 10` (macOS/Linux: `./bin/remnifold import --limit 10`). Add `--apply` when you want to upload the sanitized records. The preview does not write remote memories; repeat imports reuse deterministic capture identities.
 
 ## Create or update a server
 
@@ -71,12 +85,12 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 Capture failures include fixed `stage`, `cause`, and `action` codes without printing exception text or credentials. An `action=repair-required` result, such as `stage=receipt; cause=invalid`, requires repairing the corresponding local capture state; retries alone will keep failing. `action=retry-or-repair` retains the normal retry behavior while allowing a persistent connection or response problem to be investigated. To check API reachability separately, run this from the repository or extracted plugin folder:
 
 ```powershell
-node --input-type=module -e "import { showStatus } from './client/status.mjs'; await showStatus();"
+./bin/remnifold.exe status
 ```
 
 Topics are derived from record content during the existing Workers AI enrichment step. Classification is asynchronous. Brief acknowledgements without a substantial result, and similar low-information records, remain available to manual search but are excluded from automatic recall and enrichment; explicit topic labels are still retained. Folder names are retained as source metadata. Existing records keep their original document IDs and storage locations and appear in the same topic browser.
 
-Update the server and apply its migrations before installing a client that uses topic browsing or consolidation. To classify old records, preview a bounded batch using the existing memory connection:
+Update the server and apply its migrations before installing a client that uses topic browsing or consolidation. To classify old records, use a source checkout with the server maintenance requirements installed and preview a bounded batch using the existing memory connection:
 
 ```powershell
 node scripts/setup-topics.mjs --limit 10
@@ -88,7 +102,7 @@ The API key grants access to the records in one server installation. Use separat
 
 ## Upgrading from 1.x names
 
-Replace an installed `kagayoi-memory` or 1.x `cloudflare-supermemory` plugin with `remnifold`, enabling only the new plugin. The client reads `remnifold.json` first, then `kagayoi-memory.json` and `supermemory.json` in the selected Codex home. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` are the normal environment variables; the former `KAGAYOI_MEMORY_*`, `SUPERMEMORY_API_URL`, `SUPERMEMORY_CODEX_API_KEY`, and `CLOUDFLARE_MEMORY_API_KEY` readers remain for compatibility. Run `scripts/setup-client.ps1` to write the normal `remnifold.json` while keeping the previous files. Existing capture receipts and recall state remain readable from the former product folders. Server setup reuses resources named `remnifold`, then `kagayoi-memory`, then `cloudflare-supermemory`; explicit resource names always win. Renaming the plugin does not deploy a Worker or move a remote database. Existing document IDs, capture IDs, project provenance and persisted `sm_*` metadata remain unchanged. Storage compatibility details are in [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md#storage-and-provenance).
+Replace an installed `kagayoi-memory` or 1.x `cloudflare-supermemory` plugin with `remnifold`, enabling only the new plugin. The client reads `remnifold.json` first, then `kagayoi-memory.json` and `supermemory.json` in the selected Codex home. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` are the normal environment variables; the former `KAGAYOI_MEMORY_*`, `SUPERMEMORY_API_URL`, `SUPERMEMORY_CODEX_API_KEY`, and `CLOUDFLARE_MEMORY_API_KEY` readers remain for compatibility. Run `bin/remnifold setup` (`bin/remnifold.exe setup` on Windows) to write the normal `remnifold.json` while keeping the previous files. Existing capture receipts and recall state remain readable from the former product folders. Server setup reuses resources named `remnifold`, then `kagayoi-memory`, then `cloudflare-supermemory`; explicit resource names always win. Renaming the plugin does not deploy a Worker or move a remote database. Existing document IDs, capture IDs, project provenance and persisted `sm_*` metadata remain unchanged. Storage compatibility details are in [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md#storage-and-provenance).
 
 Remnifold implements its own self-hosted API. It is independent of the hosted Supermemory service and does not read or modify Codex's built-in local memory files.
 

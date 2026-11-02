@@ -6,6 +6,26 @@ import path from "node:path";
 import test from "node:test";
 import { buildPackage, isAllowedPackagePath, REPOSITORY_ROOT } from "./package-plugin.mjs";
 import { validatePlugin } from "./validate-plugin.mjs";
+import { NATIVE_TARGETS, nativeHooks, nativeJson, nativeMcp, sha256, verifyNativeFiles } from "./native-distribution.mjs";
+
+test("native packages have platform-specific launchers and reject modified executables", () => {
+  const sourceHooks = { hooks: Object.fromEntries(["SessionStart", "PreToolUse", "UserPromptSubmit", "Stop"].map(event => [event, [{ hooks: [{ type: "command", command: "development launcher", timeout: 12 }] }]])) };
+  for (const [target, info] of Object.entries(NATIVE_TARGETS)) {
+    const files = new Map([
+      [".codex-plugin/plugin.json", Buffer.from(nativeJson({ name: "remnifold", version: "1.0.13" }))],
+      [".mcp.json", Buffer.from(nativeJson(nativeMcp(target)))],
+      ["hooks/hooks.json", Buffer.from(nativeJson(nativeHooks(target, sourceHooks)))],
+      [info.executable, Buffer.from("native fixture executable")],
+    ]);
+    const sourceCommit = "a".repeat(40);
+    files.set("native-build.json", Buffer.from(nativeJson({ schema: 1, target, version: "1.0.13", sourceCommit, files: Object.fromEntries([...files].map(([name, bytes]) => [name, sha256(bytes)])) })));
+    assert.equal(verifyNativeFiles(files, { sourceCommit, target }).target, target);
+    assert.ok(!files.get("hooks/hooks.json").includes("node"));
+    assert.equal(JSON.parse(files.get(".mcp.json")).mcpServers.remnifold.command, `./${info.executable}`);
+    files.set(info.executable, Buffer.from("modified native fixture"));
+    assert.throws(() => verifyNativeFiles(files), /hash mismatch/u);
+  }
+});
 
 function testOutput(name) {
   return path.join(REPOSITORY_ROOT, "dist", `.test-${name}-${process.pid}`);

@@ -146,6 +146,9 @@ export async function run(argv = process.argv.slice(2)) {
   async function releaseFiles() {
     const tree = await api(`git/trees/${sha}?recursive=1`);
     if (tree.truncated !== false || !Array.isArray(tree.tree)) fail("INCOMPLETE_RELEASE_TREE");
+    // 新しい配布はOS別の署名対象CI成果物をnative updaterが検証する。
+    // 旧Node updaterが開発用source artifactを利用者へ導入しないよう止める。
+    if (tree.tree.some(entry => entry.type === "blob" && entry.path === "native/Cargo.toml")) fail("NATIVE_UPDATER_REQUIRED");
     const expected = new Map();
     const names = new Set();
     for (const entry of tree.tree) {

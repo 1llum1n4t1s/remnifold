@@ -8,11 +8,12 @@ import { access, copyFile, cp, lstat, mkdir, readFile, readdir, writeFile } from
 import { constants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isNativeSourcePath } from "./native-distribution.mjs";
 
 const execute = promisify(execFile);
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const updater = path.join(repository, "scripts", "update-local-plugin.mjs");
-const sha = "1234567890abcdef1234567890abcdef12345678";
+let sha = "1234567890abcdef1234567890abcdef12345678";
 const oldVersion = "0.0.0-e2e";
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const blob = (bytes) => createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
@@ -32,13 +33,20 @@ async function safeExternalDirectory(value) {
     assert.ok(inside(path.resolve("D:/Codex/remnifold"), absolute), "Updater work root must be under D:/Codex/remnifold");
   }
   let current = path.parse(absolute).root;
+  let existingParent = current;
   for (const component of absolute.slice(current.length).split(path.sep).filter(Boolean)) {
     assert.notEqual(component.toLowerCase(), "artifacts", "The fixture must not create an artifacts directory");
     current = path.join(current, component);
-    try { assert.equal((await lstat(current)).isSymbolicLink(), false, `Linked work path: ${current}`); }
+    try {
+      const stats = await lstat(current);
+      assert.equal(stats.isSymbolicLink(), false, `Linked work path: ${current}`);
+      assert.ok(stats.isDirectory(), `Work path is not a directory: ${current}`);
+      existingParent = current;
+    }
     catch (error) { if (error.code !== "ENOENT") throw error; }
   }
-  await access(path.parse(absolute).root, constants.W_OK);
+  // macOS/Linuxのルートが読取専用でも、実際の作成先の親が書ければよい。
+  await access(existingParent, constants.W_OK);
   await mkdir(absolute, { recursive: true });
   await access(absolute, constants.W_OK);
   return absolute;
@@ -86,7 +94,9 @@ async function fakeCli() {
       if (state.fault === "ci") run.conclusion = "failure";
       output({ workflow_runs: [run] });
     } else if (endpoint === "actions/runs/100/artifacts?per_page=100") {
-      output({ artifacts: state.fault === "artifact" ? [] : [{ id: 200, name: "remnifold", expired: state.fault === "expired", expires_at: "2999-01-01T00:00:00Z" }] });
+      output({ artifacts: state.fault === "artifact" ? [] : [{ id: 200, name: state.artifactName || "remnifold", digest: state.fault === "digest" ? `sha256:${"0".repeat(64)}` : state.artifactDigest, expired: state.fault === "expired", expires_at: "2999-01-01T00:00:00Z" }] });
+    } else if (endpoint === "actions/artifacts/200/zip" && state.zipPath) {
+      process.stdout.write(state.fault === "archive" ? Buffer.from("invalid zip") : await fs.readFile(state.zipPath));
     } else if (endpoint === `git/trees/${state.sha}?recursive=1`) {
       const tree = state.tree.map((entry, index) => ({ ...entry, sha: state.fault === "hash" && index === 0 ? "0".repeat(40) : entry.sha }));
       output({ truncated: state.fault === "tree", tree });
@@ -114,7 +124,7 @@ async function main() {
   const args = {};
   for (let index = 2; index < process.argv.length; index += 2) {
     const flag = process.argv[index];
-    assert.ok(["--archive", "--work-root"].includes(flag) && process.argv[index + 1] && !args[flag], "Usage: node scripts/local-plugin-update-e2e.mjs --archive <published.tar.gz> --work-root <external D:/Codex/remnifold/...>");
+    assert.ok(["--archive", "--work-root", "--updater-binary", "--legacy-root"].includes(flag) && process.argv[index + 1] && !args[flag], "Usage: node scripts/local-plugin-update-e2e.mjs --archive <published.tar.gz> --work-root <external directory> [--updater-binary <native executable>] [--legacy-root <source package>]");
     args[flag] = process.argv[index + 1];
   }
   assert.ok(args["--archive"] && path.isAbsolute(args["--archive"]), "--archive must name an absolute published plugin archive");
@@ -142,38 +152,55 @@ async function main() {
   const packageRoot = path.join(extracted, "remnifold");
   const expected = await filesAt(packageRoot);
   const manifest = JSON.parse(await readFile(path.join(packageRoot, ".codex-plugin", "plugin.json"), "utf8"));
-  const tree = await Promise.all(Object.keys(expected).map(async (name) => ({ path: name, type: "blob", mode: "100644", sha: blob(await readFile(path.join(packageRoot, name))) })));
+  const native = await readFile(path.join(packageRoot, "native-build.json"), "utf8").then(JSON.parse, () => null);
+  if (native) { assert.ok(args["--updater-binary"], "Native archive requires --updater-binary"); sha = native.sourceCommit; }
+  const tree = await Promise.all(Object.keys(expected).filter(name => !native || isNativeSourcePath(name)).map(async (name) => ({ path: name, type: "blob", mode: "100644", sha: blob(await readFile(path.join(packageRoot, name))) })));
+  if (native) tree.push({ path: "native/Cargo.toml", type: "blob", mode: "100644", sha: "a".repeat(40) });
+  let zipPath;
+  let artifactDigest;
+  if (native) {
+    const payload = await readFile(archive);
+    const name = Buffer.from(`remnifold-${native.target}.tar.gz`);
+    let crc = 0xffffffff;
+    for (const byte of payload) { crc ^= byte; for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0); }
+    crc = (crc ^ 0xffffffff) >>> 0;
+    const local = Buffer.alloc(30); local.writeUInt32LE(0x04034b50); local.writeUInt16LE(20, 4); local.writeUInt32LE(crc, 14); local.writeUInt32LE(payload.length, 18); local.writeUInt32LE(payload.length, 22); local.writeUInt16LE(name.length, 26);
+    const central = Buffer.alloc(46); central.writeUInt32LE(0x02014b50); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6); central.writeUInt32LE(crc, 16); central.writeUInt32LE(payload.length, 20); central.writeUInt32LE(payload.length, 24); central.writeUInt16LE(name.length, 28);
+    const end = Buffer.alloc(22); end.writeUInt32LE(0x06054b50); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10); end.writeUInt32LE(central.length + name.length, 12); end.writeUInt32LE(local.length + name.length + payload.length, 16);
+    const zip = Buffer.concat([local, name, payload, central, name, end]);
+    zipPath = path.join(root, "published.zip"); await writeFile(zipPath, zip); artifactDigest = `sha256:${hash(zip)}`;
+  }
   const cliPath = path.join(root, "fake-cli.mjs");
   await writeFile(cliPath, `(${fakeCli.toString()})().catch(error => { console.error(error.message); process.exitCode = 1; });\n`);
   const scenarios = [];
-  async function fixture(name, changes = {}) {
+  async function fixture(name, changes = {}, initialRoot = packageRoot, runFromSource = false, sourceName = "marketplace-source") {
     const directory = path.join(root, name);
-    const source = path.join(directory, "marketplace-source");
+    const source = path.join(directory, sourceName);
     const codexHome = path.join(directory, "codex-home");
     const work = path.join(directory, "work");
     await mkdir(directory);
-    await cp(packageRoot, source, { recursive: true });
+    await cp(initialRoot, source, { recursive: true });
     await writeFile(path.join(source, ".codex-plugin", "plugin.json"), JSON.stringify({ ...manifest, version: oldVersion }));
     await cp(source, path.join(codexHome, "plugins", "cache", "personal", "remnifold", oldVersion), { recursive: true });
     const statePath = path.join(directory, "state.json");
     const logPath = path.join(directory, "calls.jsonl");
     const configPath = path.join(directory, "config.json");
-    const state = { repository: "fixture/remnifold", version: manifest.version, manifest, sha, tree, source, codexHome, archive, logPath, installedVersion: oldVersion, ...changes };
+    const state = { repository: "fixture/remnifold", version: manifest.version, manifest, sha, tree, source, codexHome, archive, logPath, zipPath, artifactDigest, artifactName: native ? `remnifold-${native.target}` : "remnifold", installedVersion: oldVersion, ...changes };
     await writeFile(statePath, JSON.stringify(state));
     await writeFile(logPath, "");
     await writeFile(configPath, JSON.stringify({ localPlugin: { id: "remnifold@personal", repository: state.repository, workflow: "CI", artifact: "remnifold", sourcePath: source }, commands: { gh: [process.execPath, cliPath, "gh", statePath], codex: [process.execPath, cliPath, "codex", statePath] } }));
     const calls = async () => (await readFile(logPath, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
     const snapshot = async () => ({ source: await filesAt(source), cache: await filesAt(path.join(codexHome, "plugins", "cache")) });
-    async function run(mode = "--apply") {
+    async function run(mode = "--apply", workRoot = work) {
       let result;
       let exitCode = 0;
-      try { result = await command(process.execPath, [updater, "--version", manifest.version, "--work-root", work, "--config", configPath, mode], { env: { ...env, CODEX_HOME: codexHome } }); }
+      try { result = await command(runFromSource ? path.join(source, native.target.includes("windows") ? "bin/remnifold.exe" : "bin/remnifold") : (args["--updater-binary"] || process.execPath), [ ...(args["--updater-binary"] ? ["plugin-update"] : [updater]), "--version", manifest.version, "--work-root", workRoot, "--config", configPath, mode], { env: { ...env, CODEX_HOME: codexHome } }); }
       catch (error) { assert.equal(typeof error.code, "number", `Updater process failed to launch: ${error.message}`); result = error; exitCode = error.code; }
-      assert.equal(result.stderr, "", "Updater must use structured diagnostics");
+      assert.ok(result.stderr === "" || (args["--updater-binary"] && /LOCAL_PLUGIN_UPDATE_FAILED/u.test(result.stderr)), "Updater must use structured diagnostics");
       const value = JSON.parse(result.stdout.trim());
       for (const call of await calls()) {
-        assert.equal(path.resolve(call.temp), path.resolve(work));
-        assert.equal(path.resolve(call.tmp), path.resolve(work));
+        assert.equal(path.resolve(call.temp), path.resolve(workRoot));
+        assert.equal(path.resolve(call.tmp), path.resolve(workRoot));
       }
       return { ...value, exitCode };
     }
@@ -184,7 +211,7 @@ async function main() {
       assert.deepEqual(await filesAt(source), expected);
       assert.deepEqual(await filesAt(path.join(codexHome, "plugins", "cache", "personal", "remnifold", manifest.version)), expected);
     }
-    return { source, codexHome, statePath, snapshot, run, calls, addCount, assertInstalled };
+    return { source, codexHome, statePath, configPath, snapshot, run, calls, addCount, assertInstalled };
   }
   async function success(fixture, mode, status) {
     const result = await fixture.run(mode);
@@ -250,7 +277,52 @@ async function main() {
   assert.equal(await retry.addCount(), 2);
   scenarios.push({ name: "official-failure-resume", passed: true });
 
-  for (const [fault, code] of [["ref", "RELEASE_REF_MISMATCH"], ["version", "RELEASE_VERSION_MISMATCH"], ["ci", "RELEASE_CI_NOT_SUCCESSFUL"], ["ci-sha", "RELEASE_CI_NOT_SUCCESSFUL"], ["artifact", "RELEASE_ARTIFACT_UNAVAILABLE"], ["expired", "RELEASE_ARTIFACT_UNAVAILABLE"], ["hash", "PACKAGE_HASH_MISMATCH"], ["tree", "INCOMPLETE_RELEASE_TREE"], ["archive", "INVALID_ARCHIVE"], ["extra-file", "UNEXPECTED_ARTIFACT_CONTENTS"], ["source-edit", "LOCAL_SOURCE_MODIFIED"]]) {
+  if (native) {
+    const contained = await fixture("reject-work-inside-source");
+    const aliasedSource = contained.source.toUpperCase();
+    const caseAliasExists = await access(aliasedSource).then(() => true, () => false);
+    if (process.platform === "win32") assert.ok(caseAliasExists, "Windows must exercise mixed-case aliases");
+    if (caseAliasExists) {
+      const config = JSON.parse(await readFile(contained.configPath, "utf8"));
+      config.localPlugin.sourcePath = aliasedSource;
+      await writeFile(contained.configPath, JSON.stringify(config));
+    }
+    const containedBefore = await contained.snapshot();
+    const nestedWork = path.join(contained.source, "must-not-be-created");
+    const containedResult = await contained.run("--apply", nestedWork);
+    assert.equal(containedResult.code, "INVALID_WORK_ROOT"); assert.equal(containedResult.exitCode, 1);
+    assert.deepEqual(await contained.snapshot(), containedBefore);
+    await assert.rejects(access(nestedWork)); assert.equal((await contained.calls()).length, 0);
+    scenarios.push({ name: "reject-work-inside-source-before-any-write", caseAliasTested: caseAliasExists, passed: true });
+    const unicode = await fixture("reject-unicode-case-alias", {}, packageRoot, false, "Ä");
+    const unicodeAlias = path.join(path.dirname(unicode.source), "ä");
+    const unicodeAliasExists = await access(unicodeAlias).then(() => true, () => false);
+    if (process.platform === "win32") assert.ok(unicodeAliasExists, "Windows must exercise Unicode case aliases");
+    const unicodeBefore = await unicode.snapshot();
+    const unicodeWork = path.join(unicodeAliasExists ? unicodeAlias : unicode.source, "must-not-be-created");
+    const unicodeResult = await unicode.run("--apply", unicodeWork);
+    assert.equal(unicodeResult.code, "INVALID_WORK_ROOT"); assert.equal(unicodeResult.exitCode, 1);
+    assert.deepEqual(await unicode.snapshot(), unicodeBefore);
+    await assert.rejects(access(unicodeWork)); assert.equal((await unicode.calls()).length, 0);
+    scenarios.push({ name: "reject-unicode-case-aliased-work-before-any-write", caseAliasTested: unicodeAliasExists, passed: true });
+    const self = await fixture("running-from-installed-source", {}, packageRoot, true);
+    await success(self, "--apply", "updated"); await self.assertInstalled();
+    scenarios.push({ name: "running-from-installed-source", passed: true });
+    if (args["--legacy-root"]) {
+      const legacyRoot = path.resolve(args["--legacy-root"]);
+      await filesAt(legacyRoot); await access(path.join(legacyRoot, "scripts/mcp-launcher.mjs"));
+      const migration = await fixture("legacy-js-migration", {}, legacyRoot);
+      const sentinel = path.join(migration.codexHome, "connection-and-capture-receipt.json");
+      const sentinelContent = JSON.stringify({ connection: "existing-connection", captureReceipt: "existing-receipt" });
+      await writeFile(sentinel, sentinelContent);
+      await success(migration, "--apply", "updated"); await migration.assertInstalled();
+      assert.equal(await readFile(sentinel, "utf8"), sentinelContent);
+      await success(migration, "--verify-only", "verified");
+      scenarios.push({ name: "legacy-js-migration-preserves-external-connection-and-receipts", passed: true });
+    }
+  }
+
+  for (const [fault, code] of [["ref", "RELEASE_REF_MISMATCH"], ["version", "RELEASE_VERSION_MISMATCH"], ["ci", "RELEASE_CI_NOT_SUCCESSFUL"], ["ci-sha", "RELEASE_CI_NOT_SUCCESSFUL"], ["artifact", "RELEASE_ARTIFACT_UNAVAILABLE"], ["expired", "RELEASE_ARTIFACT_UNAVAILABLE"], ["hash", "PACKAGE_HASH_MISMATCH"], ["tree", "INCOMPLETE_RELEASE_TREE"], ...(!native ? [["archive", "INVALID_ARCHIVE"], ["extra-file", "UNEXPECTED_ARTIFACT_CONTENTS"]] : [["digest", "ARTIFACT_DIGEST_MISMATCH"]]), ["source-edit", "LOCAL_SOURCE_MODIFIED"]]) {
     const isolated = await fixture(`reject-${fault}`, { fault });
     if (fault === "source-edit") await writeFile(path.join(isolated.source, "README.md"), "User-maintained content that must survive.\n");
     const before = await isolated.snapshot();

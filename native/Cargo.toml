@@ -1,0 +1,32 @@
+[package]
+name = "remnifold"
+version = "1.0.13"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+fancy-regex = "0.17"
+flate2 = "1"
+icu_segmenter = { version = "2", features = ["compiled_data"] }
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rpassword = "7"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+sha1 = "0.10"
+tar = "0.4"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
+zip = { version = "7", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

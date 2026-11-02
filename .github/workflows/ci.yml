@@ -9,6 +9,75 @@ permissions:
   contents: read
 
 jobs:
+  native-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install locked Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.97.1 --profile minimal --target ${{ matrix.target }} && rustup default 1.97.1
+      - name: Test native runtime
+        run: cargo test --locked --manifest-path native/Cargo.toml
+      - name: Exercise native client against authenticated Worker
+        shell: bash
+        env:
+          REMNIFOLD_VALIDATION_DIR: ${{ runner.temp }}/remnifold-native-client
+        run: |
+          binary="$PWD/native/target/debug/remnifold"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then binary="$binary.exe"; fi
+          node --experimental-transform-types scripts/native-client-e2e.mjs --binary "$binary"
+      - name: Build native consumer plugin
+        run: node scripts/build-native.mjs --target ${{ matrix.target }} --source-commit ${{ github.sha }}
+      - name: Validate native consumer plugin
+        run: node scripts/validate-plugin.mjs dist/${{ matrix.target }}/remnifold
+      - name: Create native plugin archive
+        run: tar --format ustar -czf dist/remnifold-${{ matrix.target }}.tar.gz -C dist/${{ matrix.target }} remnifold
+      - name: Verify native archive before publication
+        run: node scripts/verify-plugin-archive.mjs dist/remnifold-${{ matrix.target }}.tar.gz
+      - name: Exercise native plugin update and recovery
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            work="D:/Codex/remnifold/native-updater-ci"
+            binary="$PWD/dist/${{ matrix.target }}/remnifold/bin/remnifold.exe"
+          else
+            work="${{ runner.temp }}/remnifold-native-updater"
+            binary="$PWD/dist/${{ matrix.target }}/remnifold/bin/remnifold"
+          fi
+          node scripts/package-plugin.mjs
+          node scripts/local-plugin-update-e2e.mjs --archive "$PWD/dist/remnifold-${{ matrix.target }}.tar.gz" --work-root "$work" --updater-binary "$binary" --legacy-root "$PWD/dist/remnifold"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: remnifold-${{ matrix.target }}
+          path: dist/remnifold-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+      - name: Upload native validation results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: remnifold-native-validation-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/remnifold-native-client/*.json
+            ${{ runner.temp }}/remnifold-native-updater/*.json
+            D:/Codex/remnifold/native-updater-ci/*.json
+          if-no-files-found: warn
   test-and-package:
     runs-on: ubuntu-latest
     steps:

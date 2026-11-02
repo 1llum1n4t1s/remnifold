@@ -2,6 +2,7 @@ import { access, lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { collectPackageFiles, isAllowedPackagePath, REPOSITORY_ROOT } from "./package-plugin.mjs";
+import { verifyNativeFiles } from "./native-distribution.mjs";
 
 const EXPECTED_HOOKS = new Set(["PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"]);
 const TEXT_EXTENSIONS = new Set([".js", ".json", ".jsonc", ".md", ".mjs", ".ps1", ".sql", ".ts", ".yaml", ".yml"]);
@@ -170,6 +171,17 @@ async function validateSources(root, files, errors) {
 
 export async function validatePlugin(root = REPOSITORY_ROOT) {
   const resolvedRoot = path.resolve(root);
+  if (await access(path.join(resolvedRoot, "native-build.json")).then(() => true, () => false)) {
+    const files = new Map();
+    for (const name of await listFiles(resolvedRoot)) {
+      await requirePath(resolvedRoot, name, "file", []);
+      const stats = await lstat(path.join(resolvedRoot, name));
+      if (!stats.isFile() || stats.isSymbolicLink()) throw new Error(`Native package path must be a regular file: ${name}`);
+      files.set(name, await readFile(path.join(resolvedRoot, name)));
+    }
+    verifyNativeFiles(files);
+    return { root: resolvedRoot, filesChecked: files.size };
+  }
   const errors = [];
   const plugin = await parseJson(resolvedRoot, ".codex-plugin/plugin.json", errors);
   const mcp = await parseJson(resolvedRoot, ".mcp.json", errors);
