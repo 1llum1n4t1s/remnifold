@@ -32,15 +32,15 @@ Download the matching archive from the successful release commit's [CI artifacts
 | Linux x64 | `remnifold-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux ARM64 | `remnifold-aarch64-unknown-linux-gnu.tar.gz` |
 
-In Codex, open the extracted `remnifold` folder and ask: “Use plugin-creator to install this Remnifold plugin in my personal marketplace.” The installer should register the source, validate it, and run `codex plugin add remnifold@personal`. To move an existing JavaScript installation to the native version, run the extracted executable's `plugin-update` command using the [standalone updater procedure](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update). The new executable verifies and replaces the old managed source while preserving connection and capture state; the old Node updater cannot install native releases. Building from a source checkout is covered in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#validation).
+In Codex, open the extracted `remnifold` folder and ask: “Use plugin-creator to install this Remnifold plugin in my personal marketplace.” The installer should register the source, validate it, and run `codex plugin add remnifold@personal`.
+
+To update an existing `remnifold@personal` installation, including migration from JavaScript to the native version, run the extracted executable's `plugin-update` command using the [standalone updater procedure](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update). It verifies the published package and replaces the old managed source through the official Codex plugin CLI while preserving connection and capture state. The old Node updater cannot install native releases. Publishing a release does not update your installation automatically. Building from a source checkout is covered in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#validation).
 
 ```powershell
 ./bin/remnifold.exe setup --base-url https://your-worker.example.workers.dev
 ```
 
 On macOS and Linux, use `./bin/remnifold` in place of `./bin/remnifold.exe` in these commands. Run them from the extracted plugin folder. Enter the API key at the hidden prompt if it is not already supplied. Setup verifies an authenticated session before writing `remnifold.json` in the selected Codex home: `--codex-home`, then `CODEX_HOME`, then the default `~/.codex`. Run Codex with the same home so it reads that connection. To update an existing connection, use `--force`; unrelated settings are preserved. `REMNIFOLD_API_URL` and `REMNIFOLD_API_KEY` can supply process-level overrides. For noninteractive setup, `--api-key-stdin` reads the key from standard input.
-
-The existing `remnifold@personal` installation can also be updated on explicit request with the [standalone local updater](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update), which verifies the published package and uses the official Codex plugin CLI. Publishing a release does not update that installation automatically.
 
 After installing or updating the plugin, review any hook trust requested by Codex for its four hooks, then start a new task to load the updated plugin. Run the plugin's `whoAmI` MCP tool to verify connectivity and space discovery. Installing a plugin alone does not trust its hooks.
 
@@ -82,7 +82,7 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 - Checkpoint content and metadata cannot be edited directly: updates return HTTP 409. Edit the original records and regenerate the checkpoint instead. Re-enrichment and deletion remain available.
 - Capture redacts the configured memory API key and common secret patterns, and retries unacknowledged records. Local capture state stays under `remnifold/capture-state/` in the selected Codex home.
 
-Capture failures include fixed `stage`, `cause`, and `action` codes without printing exception text or credentials. An `action=repair-required` result, such as `stage=receipt; cause=invalid`, requires repairing the corresponding local capture state; retries alone will keep failing. `action=retry-or-repair` retains the normal retry behavior while allowing a persistent connection or response problem to be investigated. To check API reachability separately, run this from the repository or extracted plugin folder:
+Capture failures include fixed `stage`, `cause`, and `action` codes without printing exception text or credentials. An `action=repair-required` result, such as `stage=receipt; cause=invalid`, requires repairing the corresponding local capture state; retries alone will keep failing. `action=retry-or-repair` retains the normal retry behavior while allowing a persistent connection or response problem to be investigated. To check API reachability separately, run this from the extracted plugin folder:
 
 ```powershell
 ./bin/remnifold.exe status
