@@ -1,8 +1,8 @@
-import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
-import { resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import test from "node:test";
+import { assert } from "./support/test.mjs";
+import { migrations, applyMigrations } from "./support/migrations.mjs";
+
+import { DatabaseSync } from "./support/sqlite.mjs";
+import test from "./support/test.mjs";
 import worker from "../src/index.ts";
 import { handleMcpRequest } from "../src/mcp.ts";
 import { adapter } from "./d1-adapter.mjs";
@@ -10,9 +10,7 @@ import { adapter } from "./d1-adapter.mjs";
 function fixture(withOAuth = true) {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  const migrations = resolve(import.meta.dirname, "../migrations");
-  for (const name of readdirSync(migrations).filter((name) => name.endsWith(".sql") && (withOAuth || !name.startsWith("0008_"))).sort()) db.exec(readFileSync(resolve(migrations, name), "utf8"));
-  const DB = adapter(db);
+  applyMigrations(db, withOAuth);  const DB = adapter(db);
   const pending = [];
   const ctx = { waitUntil: (promise) => pending.push(Promise.resolve(promise)) };
   const env = { DB, MEMORY_API_KEY: "test-configured-secret", AI_ENRICHMENT_MODE: "off", MEMORY_VECTORS: { deleteByIds: async () => ({}) } };
@@ -78,7 +76,7 @@ test("additive OAuth migration is repeatable and preserves existing memories and
     assert.equal((await f.rest("/v3/session", "GET")).status, 200);
     const registration = () => f.api(new Request("https://example.test/oauth/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ redirect_uris: ["https://client.example/callback"] }) }));
     assert.equal((await registration()).status, 503);
-    const migration = readFileSync(new URL("../migrations/0008_remote_mcp_oauth.sql", import.meta.url), "utf8");
+    const migration = migrations.find(m => m.name.startsWith("0008_")).sql;
     f.db.exec(migration);
     f.db.exec(migration);
     assert.equal((await registration()).status, 201);

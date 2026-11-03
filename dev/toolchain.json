@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "targets": {
+    "aarch64-apple-darwin": {
+      "esbuild": {
+        "version": "0.28.2",
+        "url": "https://registry.npmjs.org/@esbuild/darwin-arm64/-/darwin-arm64-0.28.2.tgz",
+        "integrity": "sha512-n4KqkOQrraxHJcgjM1RvwbigfQKIKJVpM7xp+KsxiyUSrRdIXnt73VhrPAx0fV44hgfmIVKjxMN9J1t5jySVkw==",
+        "entry": "package/bin/esbuild"
+      },
+      "tsc": {
+        "version": "7.0.2",
+        "url": "https://registry.npmjs.org/@typescript/typescript-darwin-arm64/-/typescript-darwin-arm64-7.0.2.tgz",
+        "integrity": "sha512-gowzar9MwS/aRWp6f3a4KUqzRjAZjOsmGNCM6LcTgXum+dBfgsBVMN+AgvOCCbguXyick6LJhpBszxMebJ8syA==",
+        "entry": "package/lib/tsc"
+      },
+      "workerd": {
+        "version": "1.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-arm64/-/workerd-darwin-arm64-1.20261102.1.tgz",
+        "integrity": "sha512-VanKNl3pLP2k8j9nEvETp/l3+dvfGvdWKI6bNJByKVz5szVVIMnGvDvrr+JmotreUZHWTDqfLh2RzPGRq1cZzg==",
+        "entry": "package/bin/workerd"
+      },
+      "cloudflare_types": {
+        "version": "5.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
+        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "entry": "package/index.d.ts"
+      }
+    },
+    "aarch64-unknown-linux-gnu": {
+      "esbuild": {
+        "version": "0.28.2",
+        "url": "https://registry.npmjs.org/@esbuild/linux-arm64/-/linux-arm64-0.28.2.tgz",
+        "integrity": "sha512-pW4AC0P3it8c7do9MVM4p51FzHzdM/TZrerurgRcHJ2WTa1VQ1CIq18xncfpBJw4ojkiZZrKW2yIBWBP92j6Ug==",
+        "entry": "package/bin/esbuild"
+      },
+      "tsc": {
+        "version": "7.0.2",
+        "url": "https://registry.npmjs.org/@typescript/typescript-linux-arm64/-/typescript-linux-arm64-7.0.2.tgz",
+        "integrity": "sha512-Qh4eU4/y3yDjnfjjyPYihMj5/ODIlmt+Bzu17OI+fiSRDW57QmU5SiN63exPRNJPKUzcc1INa1NXdrJ+MqHjUQ==",
+        "entry": "package/lib/tsc"
+      },
+      "workerd": {
+        "version": "1.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-1.20261102.1.tgz",
+        "integrity": "sha512-cqMnRpvDT6v6K80YClFs7XnZMq2RC5H6aHawlrVsIHrmVdSEXUm7OEVMQ9lY5nx3EI4JftiTeFpkLHFZqTSNVg==",
+        "entry": "package/bin/workerd"
+      },
+      "cloudflare_types": {
+        "version": "5.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
+        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "entry": "package/index.d.ts"
+      }
+    },
+    "x86_64-apple-darwin": {
+      "esbuild": {
+        "version": "0.28.2",
+        "url": "https://registry.npmjs.org/@esbuild/darwin-x64/-/darwin-x64-0.28.2.tgz",
+        "integrity": "sha512-uq6suIWYP37qzGddBKPw5QEQPi6HiLGsO7UmkpfyaYNQ3D+rN6w6WfwH+nuqcGXWvawGwxOEroO4YGnFh95azw==",
+        "entry": "package/bin/esbuild"
+      },
+      "tsc": {
+        "version": "7.0.2",
+        "url": "https://registry.npmjs.org/@typescript/typescript-darwin-x64/-/typescript-darwin-x64-7.0.2.tgz",
+        "integrity": "sha512-SZ9xZInqApNlNGc9s0W1VSsktYSOe9cFqNOIqmN1Gs8SmkjKZYFt017G4VwPxASInODuAdbTW7sXiFUf893RgA==",
+        "entry": "package/lib/tsc"
+      },
+      "workerd": {
+        "version": "1.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-64/-/workerd-darwin-64-1.20261102.1.tgz",
+        "integrity": "sha512-5vxE27qqftDMv9H0mCZt0B1cr+EvszT/lhpoFmdKqtS2Uu+Jo2PMIUYGepLe6yxbdV1hPKkgLBD2scnW3lXe/Q==",
+        "entry": "package/bin/workerd"
+      },
+      "cloudflare_types": {
+        "version": "5.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
+        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "entry": "package/index.d.ts"
+      }
+    },
+    "x86_64-pc-windows-msvc": {
+      "esbuild": {
+        "version": "0.28.2",
+        "url": "https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-0.28.2.tgz",
+        "integrity": "sha512-5ebpxr3nWMzrL/rnUI755Jkuee0bHL/Gq0WTF9lvcpv73wAp5eu8MfBUgWK9bhWvZjj7yX8etf/8tI8Ney695g==",
+        "entry": "package/esbuild.exe"
+      },
+      "tsc": {
+        "version": "7.0.2",
+        "url": "https://registry.npmjs.org/@typescript/typescript-win32-x64/-/typescript-win32-x64-7.0.2.tgz",
+        "integrity": "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g==",
+        "entry": "package/lib/tsc.exe"
+      },
+      "workerd": {
+        "version": "1.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-windows-64/-/workerd-windows-64-1.20261102.1.tgz",
+        "integrity": "sha512-s9iKBbAdNIdVjpMUHh48zbCfCHw5wbLl8I2aIW74H3OtxpWZP/cHeEwZZMq3xAz5kt4MmvwwO4hDbNYoAD4yhw==",
+        "entry": "package/bin/workerd.exe"
+      },
+      "cloudflare_types": {
+        "version": "5.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
+        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "entry": "package/index.d.ts"
+      }
+    },
+    "x86_64-unknown-linux-gnu": {
+      "esbuild": {
+        "version": "0.28.2",
+        "url": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.2.tgz",
+        "integrity": "sha512-4xTZr1FUmSoQW4XIWmit3tzQrUTZM+N3P0XV8xROKYF50XfI7xeO90+1bZvNwxIufQ9hDQVRJH5YhgPVF8A/HQ==",
+        "entry": "package/bin/esbuild"
+      },
+      "tsc": {
+        "version": "7.0.2",
+        "url": "https://registry.npmjs.org/@typescript/typescript-linux-x64/-/typescript-linux-x64-7.0.2.tgz",
+        "integrity": "sha512-EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A==",
+        "entry": "package/lib/tsc"
+      },
+      "workerd": {
+        "version": "1.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20261102.1.tgz",
+        "integrity": "sha512-hQdSdaHLS4UFGZRoue9TFVOO9UPnOAGWw3ZTZnUtXoUGWf4THwatq0l55F7IbOQYcOJfeKpHoFcMoGEH/88GCA==",
+        "entry": "package/bin/workerd"
+      },
+      "cloudflare_types": {
+        "version": "5.20261102.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
+        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "entry": "package/index.d.ts"
+      }
+    }
+  }
+}

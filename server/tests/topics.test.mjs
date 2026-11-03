@@ -1,5 +1,5 @@
-import assert from "node:assert/strict";
-import test from "node:test";
+import { assert } from "./support/test.mjs";
+import test from "./support/test.mjs";
 import { parseEnrichmentPayload } from "../src/index.ts";
 
 test("parses and normalizes facts and content topics from one enrichment payload", () => {

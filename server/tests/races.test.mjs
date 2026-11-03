@@ -1,8 +1,8 @@
-import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
-import { resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import test from "node:test";
+import { assert } from "./support/test.mjs";
+import { migrations, applyMigrations } from "./support/migrations.mjs";
+
+import { DatabaseSync } from "./support/sqlite.mjs";
+import test from "./support/test.mjs";
 import worker from "../src/index.ts";
 
 function d1Adapter(database) {
@@ -45,15 +45,7 @@ function d1Adapter(database) {
     prepare,
     batch: async (operations) => {
       if (beforeBatch) await beforeBatch(operations);
-      database.exec("BEGIN");
-      try {
-        const results = operations.map((operation) => operation.batch());
-        database.exec("COMMIT");
-        return results;
-      } catch (error) {
-        database.exec("ROLLBACK");
-        throw error;
-      }
+      return database.transaction(() => operations.map(operation => operation.batch()));
     },
     interceptFirst(callback) {
       beforeFirst = callback;
@@ -73,10 +65,7 @@ function d1Adapter(database) {
 function openDatabase() {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
-  const migrations = resolve(import.meta.dirname, "..", "migrations");
-  for (const name of readdirSync(migrations).filter((name) => name.endsWith(".sql")).sort()) {
-    database.exec(readFileSync(resolve(import.meta.dirname, "..", "migrations", name), "utf8"));
-  }
+  applyMigrations(database);
   return database;
 }
 
@@ -1574,8 +1563,7 @@ test("legacy vector hits beyond the D1 scan are cosine-scored and indexed vector
        ) VALUES (?, ?, ?, ?, '{}', 'done', 0, 'done', 'done', ?, 'indexed', 'done', ?, ?, ?)`,
     );
     const vectors = new Map();
-    database.exec("BEGIN");
-    try {
+    database.transaction(() => {
       for (let index = 0; index < 201; index += 1) {
         const suffix = String(index).padStart(3, "0");
         const id = `legacy-${suffix}`;
@@ -1585,11 +1573,7 @@ test("legacy vector hits beyond the D1 scan are cosine-scored and indexed vector
         insert.run(id, id, containerTag, `Stored legacy memory ${suffix}.`, JSON.stringify(values), revision, timestamp, timestamp);
         vectors.set(id, { id, values, metadata: {} });
       }
-      database.exec("COMMIT");
-    } catch (error) {
-      database.exec("ROLLBACK");
-      throw error;
-    }
+      });
 
     const migrated = new Set();
     const env = baseEnvironment(DB, {
@@ -2312,6 +2296,90 @@ test("Vectorize hits are hydrated even when the speculative D1 fallback query fa
   }
 });
 
+test("vector hydration transfers embeddings only for stale or missing revisions including duplicate hits", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const ctx = { waitUntil() {} };
+    const scenarios = [
+      { name: "current", revision: "current", hits: ["current"], projected: false, score: 0.8 },
+      { name: "stale", revision: "current", hits: ["stale"], projected: true, score: 0 },
+      { name: "missing", revision: "current", hits: [null], projected: true, score: 0 },
+      { name: "null-as-empty", revision: null, hits: [""], projected: false, score: 0.8 },
+      { name: "missing-vs-null", revision: null, hits: [null], projected: true, score: 0 },
+      { name: "empty", revision: "", hits: [""], projected: false, score: 0.8 },
+      { name: "duplicate-current-first", revision: "current", hits: ["current", "stale"], projected: true, score: 0.8 },
+      { name: "duplicate-stale-first", revision: "current", hits: ["stale", "current"], projected: true, score: 0.8 },
+    ];
+    const matches = [];
+    for (const scenario of scenarios) {
+      const saved = await worker.fetch(request("/v3/documents", {
+        containerTag: "revision-projection", customId: scenario.name, content: "Unrelated document.",
+      }), baseEnvironment(DB), ctx).then((response) => response.json());
+      scenario.id = saved.id;
+      database.prepare("UPDATE memories SET topic_revision = ?, embedding_json = ?, vector_status = 'indexed' WHERE id = ?")
+        .run(scenario.revision, JSON.stringify(embedding(0, 1)), saved.id);
+      matches.push(...scenario.hits.map((revision) => ({ id: saved.id, score: revision === "stale" ? 0.99 : 0.8,
+        ...(revision === null ? {} : { metadata: { topic_revision: revision } }),
+      })));
+    }
+    let hydrationCalls = 0;
+    DB.interceptAll((sql, rows) => {
+      if (sql.includes("json_each(?) AS hit")) {
+        hydrationCalls++;
+        for (const scenario of scenarios) {
+          const row = rows.find(({ id }) => id === scenario.id);
+          assert.equal(row.embedding_json !== null, scenario.projected, scenario.name);
+        }
+      }
+      return rows;
+    });
+    const search = await worker.fetch(request("/v4/search", {
+      containerTag: "revision-projection", q: "SemanticNeedle", limit: 20,
+    }), baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on", AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: { query: async () => ({ matches, count: matches.length }) },
+    }), ctx).then((response) => response.json());
+    assert.equal(hydrationCalls, 1);
+    for (const scenario of scenarios) {
+      assert.equal(search.results.find(({ id }) => id === scenario.id).semanticSimilarity, scenario.score, scenario.name);
+    }
+  } finally { database.close(); }
+});
+
+test("recent tasks paginate representatives before hydrating large metadata and Unicode previews", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const env = baseEnvironment(DB);
+    const ctx = { waitUntil() {} };
+    const ids = [];
+    const content = "😀あ".repeat(2000);
+    const metadata = { type: "conversation", sessionId: "shared", sm_project_id: "project", extra: "large".repeat(8000),
+      sourceTimestamp: "2026-10-20T10:00:00Z", turn: 1, part: 1 };
+    for (const [index, changes] of [
+      [0, { turn: 1 }], [1, { turn: 2, part: 2 }], [2, { turn: 2, part: 1 }],
+      [3, { sessionId: "older", sourceTimestamp: "2026-10-19T10:00:00Z" }],
+    ]) {
+      const response = await worker.fetch(request("/v3/documents", {
+        containerTag: "memories", content, metadata: { ...metadata, ...changes }, customId: `recent-${index}`,
+      }), env, ctx).then((response) => response.json());
+      assert.equal(typeof response.id, "string", JSON.stringify(response));
+      ids.push(response.id);
+    }
+    for (const [page, expected] of [[1, ids[2]], [2, ids[3]]]) {
+      const response = await worker.fetch(request("/v3/documents/list", {
+        projection: "index", recentTasks: true, page, limit: 1,
+      }), env, ctx).then((result) => result.json());
+      assert.equal(response.pagination.totalItems, 2);
+      assert.equal(response.documents.length, 1);
+      assert.equal(response.documents[0].id, expected);
+      assert.equal(response.documents[0].metadata.extra, metadata.extra);
+      assert.equal(response.documents[0].summary, [...content].slice(0, 300).join(""));
+    }
+  } finally { database.close(); }
+});
+
 test("recallable false preserves storage, explicit topics, and manual search without enrichment", async () => {
   const database = openDatabase();
   try {
@@ -2626,14 +2694,14 @@ test("large source history stays bounded on disk and active checkpoint wins inde
     const insertSource = database.prepare(
       "INSERT INTO memory_consolidation_sources(consolidation_id, memory_id, source_revision) VALUES ('large-consolidation-1', ?, ?)",
     );
-    database.exec("BEGIN");
+    database.transaction(() => {
     for (let index = 0; index < 1_720; index += 1) {
       const id = `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
       const revision = `revision-${index}`;
       insertMemory.run(id, `large-${index}`, `Archived source ${index}`, JSON.stringify({ sm_project_id: "large-project" }), revision, now, now);
       insertSource.run(id, revision);
     }
-    database.exec("COMMIT");
+    });
     const envOff = baseEnvironment(DB);
     await worker.fetch(request("/v3/documents", {
       containerTag: "memories",
@@ -2666,7 +2734,7 @@ test("large source history stays bounded on disk and active checkpoint wins inde
     assert.equal(consolidated.sourceMemoryIds.length, 1_000);
     assert.equal(consolidated.sourceMemoryIdsTruncated, true);
     const storedMetadata = database.prepare("SELECT metadata_json FROM memories WHERE id = ?").get(consolidated.memoryId).metadata_json;
-    assert.ok(Buffer.byteLength(storedMetadata, "utf8") < 64 * 1024);
+    assert.ok(new TextEncoder().encode(storedMetadata).length < 64 * 1024);
     assert.equal(JSON.parse(storedMetadata).sourceMemoryIds.length, 1_000);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_consolidation_sources WHERE consolidation_id = ?").get(consolidated.consolidationId).count, 1_721);
 
@@ -2685,7 +2753,7 @@ test("large source history stays bounded on disk and active checkpoint wins inde
       `INSERT INTO memory_consolidations(id, project_key, memory_id, revision, status, created_at, updated_at)
        VALUES (?, ?, ?, 1, 'active', ?, ?)`,
     );
-    database.exec("BEGIN");
+    database.transaction(() => {
     for (let index = 0; index < 101; index += 1) {
       const memoryId = `unrelated-summary-${index}`;
       const projectId = `unrelated-project-${index}`;
@@ -2700,7 +2768,7 @@ test("large source history stays bounded on disk and active checkpoint wins inde
       insertProject.run(projectKey, projectId, consolidationId, now, now, now);
       insertConsolidation.run(consolidationId, projectKey, memoryId, now, now);
     }
-    database.exec("COMMIT");
+    });
 
     for (let index = 0; index < 60; index += 1) {
       await worker.fetch(request("/v3/documents", {

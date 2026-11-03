@@ -12,3 +12,6 @@ dist/
 server/wrangler.jsonc
 server/worker-configuration.d.ts
 native/target/
+
+/target/
+/.devtools/

@@ -20,10 +20,69 @@ const TOPIC_BYTES: u64 = 8 * MIB;
 const CHUNK: usize = 128 * 1024;
 const RECORD: usize = 256 * 1024;
 fn now() -> u64 {
+    #[cfg(test)]
+    if let Some(time) = topic_probe::now() {
+        return time;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod topic_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default, Clone)]
+    pub struct State {
+        pub reads: Vec<(usize, usize)>,
+        pub time: u64,
+        pub expire_after: Option<usize>,
+        pub expired_time: u64,
+    }
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+    pub struct Probe;
+    impl Probe {
+        pub fn start(state: State) -> Self {
+            STATE.with(|slot| assert!(slot.borrow_mut().replace(state).is_none()));
+            Self
+        }
+        pub fn snapshot(&self) -> State {
+            STATE.with(|slot| slot.borrow().as_ref().unwrap().clone())
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            STATE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    pub fn now() -> Option<u64> {
+        STATE.with(|slot| slot.borrow().as_ref().map(|state| state.time))
+    }
+    pub struct Reader(pub File);
+    impl Read for Reader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.0.read(buffer)?;
+            STATE.with(|slot| {
+                if let Some(state) = slot.borrow_mut().as_mut() {
+                    state.reads.push((buffer.len(), count));
+                    if state.expire_after == Some(state.reads.len()) {
+                        state.time = state.expired_time;
+                    }
+                }
+            });
+            Ok(count)
+        }
+    }
+    impl Seek for Reader {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(position)
+        }
+    }
 }
 fn units(s: &str) -> usize {
     s.encode_utf16().count()
@@ -37,8 +96,13 @@ fn truthy(value: &Value) -> bool {
         _ => true,
     }
 }
-fn re(pattern: &str) -> regex::Regex {
-    regex::Regex::new(pattern).expect("constant regular expression")
+macro_rules! re {
+    ($pattern:literal) => {{
+        static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new($pattern).expect("constant regular expression")
+        });
+        &*PATTERN
+    }};
 }
 
 pub fn recall_query(value: &str) -> String {
@@ -47,11 +111,11 @@ pub fn recall_query(value: &str) -> String {
         .rsplit("### Current user request\n")
         .next()
         .unwrap_or("");
-    let stripped = re(r#"(?i)\[[^\]\n]*\]\((?:thread|codex)://[^)\s]+(?:\s+"[^"]*")?\)"#)
+    let stripped = re!(r#"(?i)\[[^\]\n]*\]\((?:thread|codex)://[^)\s]+(?:\s+"[^"]*")?\)"#)
         .replace_all(current, "");
-    let stripped = re(r"(?i)(?:thread|codex)://\S+").replace_all(&stripped, "");
-    let stripped = re(r"[ \t]+\n").replace_all(&stripped, "\n");
-    truncate_utf16(re(r"\n{3,}").replace_all(&stripped, "\n\n").trim(), 1000)
+    let stripped = re!(r"(?i)(?:thread|codex)://\S+").replace_all(&stripped, "");
+    let stripped = re!(r"[ \t]+\n").replace_all(&stripped, "\n");
+    truncate_utf16(re!(r"\n{3,}").replace_all(&stripped, "\n\n").trim(), 1000)
 }
 
 fn mismatched(row: &Value, session: &str) -> bool {
@@ -68,11 +132,15 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
         let path = payload["transcript_path"]
             .as_str()
             .filter(|s| !s.trim().is_empty())?;
-        let mut file = File::open(path).ok()?;
+        let file = File::open(path).ok()?;
         let meta = file.metadata().ok()?;
         if !meta.is_file() || now() + 250 >= deadline {
             return None;
         }
+        #[cfg(test)]
+        let mut file = topic_probe::Reader(file);
+        #[cfg(not(test))]
+        let mut file = file;
         let size = meta.len();
         let mut header = vec![0; size.min(64 * 1024) as usize];
         file.read_exact(&mut header).ok()?;
@@ -159,7 +227,7 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
                             } else {
                                 String::new()
                             };
-                            if !message.is_empty() && !re(r"^\s*(?:Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)\b|<subagent_notification\b)").is_match(&message) {
+                            if !message.is_empty() && !re!(r"^\s*(?:Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)\b|<subagent_notification\b)").is_match(&message) {
                                 let query = recall_query(&message);
                                 if !query.is_empty() {
                                     users += 1;
@@ -687,6 +755,44 @@ mod tests {
         assert_eq!(previous_user_topic(&payload, "continue", now() + 9000), "");
     }
 
+    #[test]
+    fn history_recovery_observes_real_read_bounds_and_stops_after_deadline() {
+        for expire_after in [None, Some(3)] {
+            let (_root, payload) = fixture();
+            append(&payload, &user("SnowRunner truck settings"));
+            let tool_bytes = if expire_after.is_some() {
+                2 * MIB
+            } else {
+                9 * MIB
+            };
+            let mut tool = serde_json::to_vec(&json!({"type":"response_item","payload":{"role":"tool","content":"x".repeat(tool_bytes as usize)}})).unwrap();
+            tool.push(b'\n');
+            append(&payload, &tool);
+            append(&payload, &user("/continue"));
+            // 実ファイルのreadを観測し、headerと2chunkを読んだ直後だけ期限へ進める。
+            let deadline = 20_000;
+            let probe = topic_probe::Probe::start(topic_probe::State {
+                time: 10_000,
+                expire_after,
+                expired_time: deadline - 250,
+                ..Default::default()
+            });
+            assert_eq!(previous_user_topic(&payload, "/continue", deadline), "");
+            let reads = probe.snapshot().reads;
+            let bytes: usize = reads.iter().map(|(_, count)| count).sum();
+            assert!(bytes <= TOPIC_BYTES as usize + 64 * 1024);
+            assert_eq!(
+                reads.iter().map(|(requested, _)| *requested).max(),
+                Some(CHUNK)
+            );
+            if expire_after.is_some() {
+                assert_eq!(reads.len(), 3, "deadline must stop further reads");
+                assert_eq!(bytes, 64 * 1024 + 2 * CHUNK);
+            } else {
+                assert_eq!(bytes, TOPIC_BYTES as usize + 64 * 1024);
+            }
+        }
+    }
     #[test]
     fn context_budget_does_not_mark_skipped_items_and_channels_are_independent() {
         let (root, payload) = fixture();

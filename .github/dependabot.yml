@@ -1,57 +1,18 @@
-# 更新方針: 毎週月曜09:00（日本時間）、minor/patchを集約、majorは個別PR。
-# マージ可否は既定ブランチのDependabot auto-mergeが最新CIで判定します。
+# Native workflows have no executable Actions; one Cargo workspace owns dependencies.
+# Major updates remain separate from the minor/patch groups.
 version: 2
 updates:
-- package-ecosystem: github-actions
-  directory: /
-  schedule:
-    interval: weekly
-    day: monday
-    time: '09:00'
-    timezone: Asia/Tokyo
-  open-pull-requests-limit: 5
-  groups:
-    minor-and-patch:
-      patterns:
-      - '*'
-      update-types:
-      - minor
-      - patch
-  commit-message:
-    prefix: deps
-- package-ecosystem: cargo
-  directory: /native
-  schedule:
-    interval: weekly
-    day: monday
-    time: '09:00'
-    timezone: Asia/Tokyo
-  open-pull-requests-limit: 5
-  groups:
-    minor-and-patch:
-      patterns:
-      - '*'
-      update-types:
-      - minor
-      - patch
-  commit-message:
-    prefix: deps
-- package-ecosystem: npm
-  directories:
-  - /
-  - /server
-  schedule:
-    interval: weekly
-    day: monday
-    time: '09:00'
-    timezone: Asia/Tokyo
-  open-pull-requests-limit: 5
-  groups:
-    minor-and-patch:
-      patterns:
-      - '*'
-      update-types:
-      - minor
-      - patch
-  commit-message:
-    prefix: deps
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '09:00'
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps

@@ -12,8 +12,20 @@ pub struct Config {
     pub codex_home: PathBuf,
 }
 
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 15) as usize] as char,
+            ]
+        })
+        .collect()
+}
 pub fn sha256(value: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(value.as_ref()))
+    encode_hex(&Sha256::digest(value.as_ref()))
 }
 pub fn text(value: &Value) -> &str {
     value.as_str().unwrap_or("")
@@ -560,7 +572,9 @@ mod tests {
             &sha256(format!("path:{}", folder.display()))[..16]
         );
         assert_eq!(context["containerTag"], expected);
-        fs::remove_dir_all(parent).unwrap();
+        if std::env::var("REMNIFOLD_KEEP_TEST_STATE").as_deref() != Ok("1") {
+            fs::remove_dir_all(parent).unwrap();
+        }
     }
     #[test]
     fn legacy_settings_preserve_integral_json_numbers_and_recall_limits() {
@@ -583,6 +597,8 @@ mod tests {
         assert_eq!(settings["maxMemories"].as_u64(), Some(4));
         assert_eq!(settings["maxRecentTasks"].as_u64(), Some(0));
         assert_eq!(settings["recallMode"], "off");
-        fs::remove_dir_all(home).unwrap();
+        if std::env::var("REMNIFOLD_KEEP_TEST_STATE").as_deref() != Ok("1") {
+            fs::remove_dir_all(home).unwrap();
+        }
     }
 }

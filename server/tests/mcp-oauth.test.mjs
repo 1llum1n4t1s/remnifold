@@ -1,16 +1,14 @@
-import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
-import test from "node:test";
+import { assert } from "./support/test.mjs";
+import { migrations, applyMigrations } from "./support/migrations.mjs";
+import { DatabaseSync } from "./support/sqlite.mjs";
+import test from "./support/test.mjs";
 import { authorizeMcp, oauthChallenge, routeOAuth } from "../src/mcp-oauth.ts";
 import worker from "../src/index.ts";
 
 function fixture() {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  const migrations = new URL("../migrations/", import.meta.url);
-  for (const name of readdirSync(migrations).filter(name => name.endsWith(".sql")).sort()) db.exec(readFileSync(new URL(name, migrations), "utf8"));
-  function prepare(sql, values = []) {
+  applyMigrations(db);  function prepare(sql, values = []) {
     return {
       bind: (...args) => prepare(sql, args),
       first: async () => db.prepare(sql).get(...values) ?? null,
@@ -20,7 +18,7 @@ function fixture() {
     };
   }
   const env = { MEMORY_API_KEY: "owner-secret", AI_ENRICHMENT_MODE: "off", DB: { prepare, batch: async (ops) => {
-    db.exec("BEGIN"); try { const results = ops.map(op => op.execute()); db.exec("COMMIT"); return results; } catch (error) { db.exec("ROLLBACK"); throw error; }
+    return db.transaction(() => ops.map(op => op.execute()));
   } } };
   const request = (path, options) => worker.fetch(new Request(`https://memory.example${path}`, options), env, { waitUntil() {} });
   const post = (path, values, extra = {}) => request(path, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...extra }, body: new URLSearchParams(values) });
@@ -32,7 +30,7 @@ async function register(f, redirects = ["https://client.example/callback"]) {
 }
 async function authorization(f, client, options = {}) {
   const verifier = "v".repeat(43);
-  const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))).toString("base64url");
+  const challenge = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))))).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
   const params = new URLSearchParams({ client_id: client.client_id, redirect_uri: client.redirect_uris[0], response_type: "code", code_challenge_method: "S256", code_challenge: challenge, resource: "https://memory.example/mcp", state: options.state ?? "test-state" });
   const response = await f.request(`/oauth/authorize?${params}`);
   assert.equal(response.status, 200);

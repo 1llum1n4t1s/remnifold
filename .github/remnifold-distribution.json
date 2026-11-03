@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "repository": "1llum1n4t1s/remnifold",
+  "stagingBucket": "remnifold-builds",
+  "publicBucket": "remnifold-updates",
+  "publicBaseUrl": "https://remnifold-updates.kagayoi.com",
+  "statusContext": "remnifold/r2/v1",
+  "workflowPath": ".github/workflows/ci.yml"
+}

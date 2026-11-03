@@ -1,11 +1,13 @@
+mod support;
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Command,
     thread,
+    time::{Duration, Instant},
 };
 
 struct Fixture(PathBuf);
@@ -18,11 +20,14 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if std::env::var("REMNIFOLD_KEEP_TEST_STATE").as_deref() != Ok("1") {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
 fn client(home: &Fixture) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_remnifold"));
+    support::isolate(&mut cmd);
     cmd.env("CODEX_HOME", &home.0);
     for name in [
         "REMNIFOLD_API_URL",
@@ -88,21 +93,13 @@ fn setup_legacy_state_and_secret_safe_output() {
     )
     .unwrap();
     // HTTP header credentials are ASCII. The old value remains intact until verification succeeds.
-    let mut child = client(&home)
-        .args(["setup", "--base-url", &endpoint, "--api-key-stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
     let key = "fixture-owner-private-key";
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(key.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = support::run(
+        client(&home).args(["setup", "--base-url", &endpoint, "--api-key-stdin"]),
+        key.as_bytes(),
+        Duration::from_secs(20),
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -128,11 +125,12 @@ fn setup_legacy_state_and_secret_safe_output() {
             .unwrap(),
         prior
     );
-    let again = client(&home)
-        .args(["setup", "--base-url", &endpoint, "--api-key-stdin"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let again = support::run(
+        client(&home).args(["setup", "--base-url", &endpoint, "--api-key-stdin"]),
+        b"",
+        Duration::from_secs(20),
+    )
+    .unwrap();
     assert!(!again.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(home.0.join("remnifold.json")).unwrap()).unwrap(),
@@ -155,33 +153,26 @@ fn setup_legacy_state_and_secret_safe_output() {
 #[test]
 fn invalid_endpoint_and_capture_payload_do_not_print_secrets() {
     let home = Fixture::new();
-    let bad = client(&home)
-        .args([
+    let bad = support::run(
+        client(&home).args([
             "setup",
             "--base-url",
             "https://user:do-not-log@example.com?api_key=do-not-log",
             "--api-key-stdin",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        ]),
+        b"",
+        Duration::from_secs(20),
+    )
+    .unwrap();
     assert!(!bad.status.success());
     assert!(!String::from_utf8_lossy(&bad.stderr).contains("do-not-log"));
     assert!(!home.0.join("remnifold.json").exists());
-    let mut child = client(&home)
-        .arg("capture")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"{\"private\":\"do-not-log\"")
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = support::run(
+        client(&home).arg("capture"),
+        b"{\"private\":\"do-not-log\"",
+        Duration::from_secs(20),
+    )
+    .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert_eq!(
@@ -193,26 +184,57 @@ fn invalid_endpoint_and_capture_payload_do_not_print_secrets() {
 #[test]
 fn native_help_and_no_config_hook_require_no_node() {
     let home = Fixture::new();
-    let help = client(&home)
-        .env("PATH", &home.0)
-        .arg("--help")
-        .output()
-        .unwrap();
+    let help = support::run(
+        client(&home).env("PATH", &home.0).arg("--help"),
+        b"",
+        Duration::from_secs(20),
+    )
+    .unwrap();
     assert!(help.status.success());
-    let mut child = client(&home)
-        .env("PATH", &home.0)
-        .args(["hook", "SessionStart"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"{}").unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = support::run(
+        client(&home)
+            .env("PATH", &home.0)
+            .args(["hook", "SessionStart"]),
+        b"{}",
+        Duration::from_secs(20),
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
+}
+#[test]
+fn blocked_stdin_and_full_output_pipes_cannot_escape_the_operation_deadline() {
+    const FIXTURE: &str = "REMNIFOLD_BLOCKED_IO_FIXTURE";
+    if std::env::var(FIXTURE).as_deref() == Ok("1") {
+        std::io::stdout()
+            .write_all(&vec![b'x'; 128 * 1024])
+            .unwrap();
+        std::io::stderr()
+            .write_all(&vec![b'y'; 128 * 1024])
+            .unwrap();
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    support::isolate(&mut command);
+    command
+        .args([
+            "--exact",
+            "blocked_stdin_and_full_output_pipes_cannot_escape_the_operation_deadline",
+            "--nocapture",
+        ])
+        .env(FIXTURE, "1");
+    let started = Instant::now();
+    let error = support::run(
+        &mut command,
+        &vec![b'x'; 16 * 1024 * 1024],
+        Duration::from_millis(500),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

@@ -1,4 +1,4 @@
-import { sanitizeText } from "../../client/memory-redaction.mjs";
+import { sanitizeText } from "./shared/memory-redaction.ts";
 
 // Stateless Streamable HTTP adapter. Authentication is performed by the caller.
 type Json = Record<string, unknown>;

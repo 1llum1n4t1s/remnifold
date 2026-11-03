@@ -1,9 +1,15 @@
 {
   "mcpServers": {
     "remnifold": {
-      "command": "node",
+      "command": "cargo",
       "args": [
-        "./scripts/mcp-launcher.mjs"
+        "run",
+        "--quiet",
+        "--locked",
+        "--manifest-path",
+        "./native/Cargo.toml",
+        "--",
+        "mcp"
       ],
       "cwd": "."
     }

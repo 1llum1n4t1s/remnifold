@@ -1,4 +1,4 @@
-import { documentIndex } from "../../client/memory-index.mjs";
+import { documentIndex } from "./shared/memory-index.ts";
 import packageMetadata from "../package.json" with { type: "json" };
 import { handleMcpRequest } from "./mcp.ts";
 import { authorizeMcp, oauthChallenge, routeOAuth } from "./mcp-oauth.ts";
@@ -141,11 +141,14 @@ type ConsolidationPayload = {
 };
 
 class HttpError extends Error {
+  readonly status: number;
+
   constructor(
-    readonly status: number,
+    status: number,
     message: string,
   ) {
     super(message);
+    this.status = status;
   }
 }
 
@@ -238,10 +241,42 @@ async function readJson(request: Request): Promise<JsonObject> {
   if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
     throw new HttpError(413, "Request body is too large");
   }
-  const body = await request.text();
-  if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
-    throw new HttpError(413, "Request body is too large");
+  const parts: string[] = [];
+  if (request.body) {
+    const reader = request.body.getReader();
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let decodedBytes = 0;
+    let pending = "";
+    const append = (part: string) => {
+      decodedBytes += encoder.encode(part).byteLength;
+      if (decodedBytes > MAX_BODY_BYTES) throw new HttpError(413, "Request body is too large");
+      pending += part;
+      if (pending.length >= 16_384) {
+        parts.push(pending);
+        pending = "";
+      }
+    };
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        // Request.text()と同じBOM除去・置換後の長さを、巨大chunkでも小分けに数える。
+        for (let offset = 0; offset < value.byteLength; offset += 16_384) {
+          append(decoder.decode(value.subarray(offset, offset + 16_384), { stream: true }));
+        }
+      }
+      append(decoder.decode());
+      if (pending) parts.push(pending);
+    } catch (error) {
+      // 上流のcancel完了が遅くても、既に確定した413応答を待たせない。
+      void reader.cancel().catch(() => undefined);
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
   }
+  const body = parts.join("");
   try {
     const parsed: unknown = JSON.parse(body || "{}");
     if (!isObject(parsed)) throw new HttpError(400, "JSON body must be an object");
@@ -2139,11 +2174,17 @@ async function semanticMemories(
       try {
         const result = await env.DB.prepare(
           `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at,
-                  embedding_json, topic_revision
+                  CASE WHEN EXISTS (
+                    SELECT 1 FROM json_each(?) AS hit
+                    WHERE json_extract(hit.value, '$.id') = memories.id
+                      AND json_extract(hit.value, '$.revision') IS NOT COALESCE(memories.topic_revision, '')
+                  ) THEN embedding_json ELSE NULL END AS embedding_json, topic_revision
            FROM memories
            WHERE ${hitClause} AND id IN (${placeholders})`,
         )
-          .bind(...hitParameters, ...missingIds)
+          .bind(JSON.stringify(vectorResult.matches.map((match) => ({
+            id: match.id, revision: vectorMetadataRevision(match),
+          }))), ...hitParameters, ...missingIds)
           .all<RankedMemoryRow>();
         for (const row of result.results) vectorRows.set(row.id, row);
       } catch (error) {
@@ -3160,7 +3201,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   const where = conditions.join(" AND ");
   const columns = projection === "index"
     ? `m.id, m.container_tag, m.metadata_json, m.status, m.created_at, m.updated_at,
-       ${recentTasks ? "m.content_preview" : "substr(m.content, 1, 300) AS content_preview"}`
+       substr(m.content, 1, 300) AS content_preview`
     : projection === "ids"
       ? "m.id"
       : projection === "capture"
@@ -3179,8 +3220,9 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
         THEN NULLIF(trim(json_extract(m.metadata_json, '$.sm_project_id')), '') END, m.container_tag)`;
   const taskSession = `json_extract(m.metadata_json, '$.sessionId')`;
   const recentPrefix = recentTasks ? `WITH candidates AS (
-    SELECT m.id, m.container_tag, m.metadata_json, m.status, m.created_at, m.updated_at,
-      substr(m.content, 1, 300) AS content_preview,
+    SELECT m.id, m.created_at, m.updated_at,
+      CASE WHEN json_type(m.metadata_json, '$.turn') = 'integer' THEN json_extract(m.metadata_json, '$.turn') ELSE 0 END AS task_turn,
+      CASE WHEN json_type(m.metadata_json, '$.part') = 'integer' THEN json_extract(m.metadata_json, '$.part') ELSE 1 END AS task_part,
       COALESCE(${["$.memoryIndex.sourceUpdatedAt", "$.sourceTimestamp", "$.sourceUpdatedAt", "$.completedAt"].map(sourceDate).join(", ")},
       julianday(m.created_at)) AS source_date,
       ${taskProject} AS task_project,
@@ -3190,20 +3232,22 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
     SELECT candidates.*, ROW_NUMBER() OVER (
       PARTITION BY task_project, task_session
       ORDER BY source_date DESC,
-        CASE WHEN json_type(metadata_json, '$.turn') = 'integer' THEN json_extract(metadata_json, '$.turn') ELSE 0 END DESC,
-        CASE WHEN json_type(metadata_json, '$.part') = 'integer' THEN json_extract(metadata_json, '$.part') ELSE 1 END ASC,
+        task_turn DESC, task_part ASC,
         created_at DESC, updated_at DESC, id DESC
     ) AS task_rank FROM candidates
-  ), recent AS (SELECT * FROM ranked WHERE task_rank = 1) ` : "";
-  const table = recentTasks ? "recent" : "memories";
+  ), recent AS (
+    SELECT id, source_date FROM ranked WHERE task_rank = 1
+    ORDER BY source_date DESC, id DESC LIMIT ? OFFSET ?
+  ) ` : "";
+  const table = "memories";
   const selection = recentTasks ? "1 = 1" : where;
   const [countResult, rowsResult] = await env.DB.batch([
     env.DB.prepare(recentTasks
       ? `SELECT COUNT(*) AS total FROM (SELECT 1 FROM memories AS m WHERE ${where} GROUP BY ${taskProject}, ${taskSession})`
       : `SELECT COUNT(*) AS total FROM ${table} AS m WHERE ${selection}`).bind(...parameters),
     env.DB.prepare(
-      `${recentPrefix}SELECT ${columns} FROM ${table} AS m WHERE ${selection}
-       ORDER BY ${recentTasks ? "m.source_date DESC, m.id DESC" : "m.updated_at DESC"} LIMIT ? OFFSET ?`,
+      `${recentPrefix}SELECT ${columns} FROM ${table} AS m ${recentTasks ? "JOIN recent ON recent.id = m.id" : ""} WHERE ${selection}
+       ORDER BY ${recentTasks ? "recent.source_date DESC, m.id DESC" : "m.updated_at DESC LIMIT ? OFFSET ?"}`,
     ).bind(...parameters, limit, offset),
   ]);
   if (!countResult || !rowsResult) {

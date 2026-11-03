@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   native-package:
+    name: native-package (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -25,118 +26,220 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
+    # Environment deployment-branch policies are the credential boundary. Only
+    # these environments own R2 secrets; validation has no distribution secrets.
+    environment:
+      name: ${{ github.event_name == 'push' && github.repository == '1llum1n4t1s/remnifold' && github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'r2-staging' || 'validation' }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_TARGET: ${{ matrix.target }}
+    # Each matrix job produces only its own key. GitHub merges unique names;
+    # a shared output name would be overwritten by the last finishing target.
+    outputs:
+      windows_x64: ${{ steps.stage.outputs.windows_x64 }}
+      macos_arm64: ${{ steps.stage.outputs.macos_arm64 }}
+      macos_x64: ${{ steps.stage.outputs.macos_x64 }}
+      linux_x64: ${{ steps.stage.outputs.linux_x64 }}
+      linux_arm64: ${{ steps.stage.outputs.linux_arm64 }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24.22.2
-      - name: Configure native temporary directories
-        shell: bash
-        run: |
-          printf 'TEMP=%s\nTMP=%s\nTMPDIR=%s\n' "$RUNNER_TEMP" "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: Install locked Rust toolchain
-        shell: bash
-        run: rustup toolchain install 1.97.1 --profile minimal --target ${{ matrix.target }} && rustup default 1.97.1
-      - name: Test native runtime
-        run: cargo test --locked --manifest-path native/Cargo.toml
-      - name: Exercise native client against authenticated Worker
-        shell: bash
+      - name: Check out exact source commit without executable Actions
         env:
-          REMNIFOLD_VALIDATION_DIR: ${{ github.workspace }}/dist/native-validation
+          CHECKOUT_TOKEN: ${{ github.token }}
         run: |
-          binary="$PWD/native/target/debug/remnifold"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then binary="$binary.exe"; fi
-          node --experimental-transform-types scripts/native-client-e2e.mjs --binary "$binary"
-      - name: Build native consumer plugin
-        run: node scripts/build-native.mjs --target ${{ matrix.target }} --source-commit ${{ github.sha }}
-      - name: Validate native consumer plugin
-        run: node scripts/validate-plugin.mjs dist/${{ matrix.target }}/remnifold
-      - name: Create native plugin archive
-        run: node scripts/lib/tar.mjs --format ustar -czf dist/remnifold-${{ matrix.target }}.tar.gz -C dist/${{ matrix.target }} remnifold
-      - name: Verify native archive before publication
-        run: node scripts/verify-plugin-archive.mjs dist/remnifold-${{ matrix.target }}.tar.gz
-      - name: Exercise native plugin update and recovery
-        shell: bash
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\r\n')"
+          printf '::add-mask::%s\n' "$authorization"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Configure isolated output directories
         run: |
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            work="D:/Codex/remnifold/native-updater-ci"
-            binary="$PWD/dist/${{ matrix.target }}/remnifold/bin/remnifold.exe"
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            root="D:/Codex/remnifold/ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+            executable=.exe
           else
-            work="${{ runner.temp }}/remnifold-native-updater"
-            binary="$PWD/dist/${{ matrix.target }}/remnifold/bin/remnifold"
+            root="$RUNNER_TEMP/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+            executable=
           fi
-          node scripts/package-plugin.mjs
-          node scripts/local-plugin-update-e2e.mjs --archive "$PWD/dist/remnifold-${{ matrix.target }}.tar.gz" --work-root "$work" --updater-binary "$binary" --legacy-root "$PWD/dist/remnifold"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: remnifold-${{ matrix.target }}
-          path: dist/remnifold-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
-      - name: Stage native updater validation evidence
-        if: always()
-        shell: bash
+          export CI_ROOT="$root"
+          pwsh -NoLogo -NoProfile -NonInteractive -Command '
+            $path = [System.IO.Path]::GetFullPath($env:CI_ROOT)
+            $ancestor = [System.IO.DirectoryInfo]$path
+            while ($null -ne $ancestor) {
+              if ($ancestor.Exists -and ($ancestor.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { throw "CI root has a linked ancestor" }
+              $ancestor = $ancestor.Parent
+            }
+            [System.IO.Directory]::CreateDirectory($path) | Out-Null
+          '
+          mkdir -p "$root/tmp" "$root/tools" "$root/validation" "$root/guard"
+          {
+            printf 'CI_ROOT=%s\n' "$root"
+            printf 'TEMP=%s/tmp\nTMP=%s/tmp\nTMPDIR=%s/tmp\n' "$root" "$root" "$root"
+            printf 'CARGO_TARGET_DIR=%s/build\nREMNIFOLD_TOOL_ROOT=%s/tools\n' "$root" "$root"
+            printf 'REMNIFOLD_VALIDATION_DIR=%s/validation\n' "$root"
+            printf 'REMNIFOLD_PACKAGE_BINARY=%s/build/%s/release/remnifold%s\n' "$root" "$CI_TARGET" "$executable"
+            printf 'REMNIFOLD_NODE_GUARD_LOG=%s/validation/node-invocations.log\n' "$root"
+          } >> "$GITHUB_ENV"
+      - name: Install locked Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --target "$CI_TARGET" && rustup default 1.99.1
+      - name: Reject Node and JavaScript package-manager subprocesses
         run: |
-          node --input-type=module -e 'import { existsSync, mkdirSync, copyFileSync } from "node:fs"; import path from "node:path"; const work = process.platform === "win32" ? "D:/Codex/remnifold/native-updater-ci" : path.join(process.env.RUNNER_TEMP, "remnifold-native-updater"); const input = path.join(work, "local-plugin-update-validation.json"); if (existsSync(input)) { mkdirSync("dist/native-validation", { recursive: true }); copyFileSync(input, "dist/native-validation/local-plugin-update-validation.json"); }'
-      - name: Upload native validation results
+          set -euo pipefail
+          cat > "$CI_ROOT/guard/main.rs" <<'RUST'
+          use std::{env,fs::OpenOptions,io::Write};
+          fn main() {
+              if env::var_os("REMNIFOLD_NODE_GUARD_CANARY").is_none() {
+                  let path = env::var("REMNIFOLD_NODE_GUARD_LOG").expect("guard log required");
+                  let mut log = OpenOptions::new().create(true).append(true).open(path).expect("guard log unavailable");
+                  writeln!(log,"forbidden JavaScript tool invocation").expect("guard log failed");
+              }
+              eprintln!("Node.js and JavaScript package managers are excluded from this validation");
+              std::process::exit(91);
+          }
+          RUST
+          executable=
+          if [[ "$RUNNER_OS" == "Windows" ]]; then executable=.exe; fi
+          rustc --edition 2024 "$CI_ROOT/guard/main.rs" -o "$CI_ROOT/guard/node$executable"
+          for name in nodejs npm npx pnpm yarn corepack wrangler; do
+            cp "$CI_ROOT/guard/node$executable" "$CI_ROOT/guard/$name$executable"
+          done
+          guard_path="$CI_ROOT/guard"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then guard_path="$(cygpath -u "$guard_path")"; fi
+          export PATH="$guard_path:$PATH"
+          if REMNIFOLD_NODE_GUARD_CANARY=1 node --version; then exit 1; else test "$?" = 91; fi
+          printf '%s/guard\n' "$CI_ROOT" >> "$GITHUB_PATH"
+          printf 'REMNIFOLD_NODE_GUARD_READY=1\n' >> "$GITHUB_ENV"
+      - name: Prepare pinned native build tools
+        run: cargo xtask prepare
+      - name: Type-check Worker source
+        run: cargo xtask type-check
+      - name: Test native runtime and development contracts
+        run: cargo xtask native-test
+      - name: Test authenticated Worker in local workerd
+        run: cargo xtask server-test --work-root "$CI_ROOT/validation/server"
+      - name: Test native client, capture, recall, and ranking
+        run: cargo xtask client-test --work-root "$CI_ROOT/validation/client"
+      - name: Build native consumer archive
+        run: cargo xtask package --target "$CI_TARGET" --source-commit "$GITHUB_SHA"
+      - name: Verify final native archive before publication
+        run: cargo xtask verify --target "$CI_TARGET" --binary "$REMNIFOLD_PACKAGE_BINARY" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --source-commit "$GITHUB_SHA"
+      - name: Exercise native plugin update and recovery
+        run: cargo xtask updater-test --binary "$REMNIFOLD_PACKAGE_BINARY" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --work-root "$CI_ROOT/validation/updater"
+      - name: Verify no JavaScript runtime was invoked through PATH
         if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: remnifold-native-validation-${{ matrix.target }}
-          path: dist/native-validation/*.json
-          if-no-files-found: warn
-  test-and-package:
+        run: |
+          set -euo pipefail
+          test "${REMNIFOLD_NODE_GUARD_READY:-0}" = 1
+          if [[ -s "$REMNIFOLD_NODE_GUARD_LOG" ]]; then
+            printf 'A forbidden JavaScript tool invocation was recorded.\n' >&2
+            exit 1
+          fi
+          printf '{"nativeGuard":true,"forbiddenPathInvocations":0,"scope":"PATH-resolved tools; absolute executable paths are not intercepted"}\n' > "$CI_ROOT/validation/node-free-validation.json"
+      - name: Check whitespace errors
+        run: git diff --check
+      - name: Retain validation evidence in job diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${CI_ROOT:-}/validation" ]]; then
+            {
+              printf '### Native validation: %s\n\n' "$CI_TARGET"
+              printf 'Validation reports retained during this job (PRs receive no distribution credentials):\n\n'
+              find "$CI_ROOT/validation" -type f -name '*validation.json' -print
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Stage verified native archive in private R2
+        id: stage
+        if: >-
+          github.event_name == 'push' &&
+          github.repository == '1llum1n4t1s/remnifold' &&
+          github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        env:
+          CI_R2_ENVIRONMENT: r2-staging
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          R2_CI_ACCESS_KEY_ID: ${{ secrets.R2_CI_ACCESS_KEY_ID }}
+          R2_CI_SECRET_ACCESS_KEY: ${{ secrets.R2_CI_SECRET_ACCESS_KEY }}
+        run: cargo xtask r2-stage --target "$CI_TARGET" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --binary "$REMNIFOLD_PACKAGE_BINARY" --source-commit "$GITHUB_SHA" --apply
+
+  publish-r2:
+    name: publish-r2
+    needs: native-package
+    if: >-
+      needs.native-package.result == 'success' &&
+      github.event_name == 'push' &&
+      github.repository == '1llum1n4t1s/remnifold' &&
+      github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) &&
+      startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-latest
+    environment: r2-release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      statuses: write
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v6.1.0
-        with:
-          version: 12.16.1
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24.22.2
-          cache: pnpm
-          cache-dependency-path: server/pnpm-lock.yaml
-
-      - name: Install server dependencies from lockfile
-        run: pnpm -C server install --frozen-lockfile
-
-      - name: Test client
-        run: pnpm run test:client
-
-      - name: Test setup and packaging scripts
-        run: pnpm run test:scripts
-
-      - name: Test and type-check server
-        run: pnpm -C server check
-
-      - name: Validate source plugin
-        run: pnpm run validate:plugin
-
-      - name: Build and validate distributable plugin
-        run: pnpm run package:plugin
-
-      - name: Create plugin archive
-        run: node scripts/lib/tar.mjs -czf dist/remnifold.tar.gz -C dist remnifold
-
-      - name: Verify final plugin archive before publication
-        run: node scripts/verify-plugin-archive.mjs dist/remnifold.tar.gz
-
-      - name: Upload plugin archive
-        uses: actions/upload-artifact@v7
-        with:
-          name: remnifold
-          path: dist/remnifold.tar.gz
-          if-no-files-found: error
-
-      - name: Upload reproducible validation results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: remnifold-validation
-          path: dist/*validation.json
-          if-no-files-found: warn
+      - name: Check out exact publication source without executable Actions
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\r\n')"
+          printf '::add-mask::%s\n' "$authorization"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Require the release branch to match package version
+        run: |
+          pwsh -NoLogo -NoProfile -NonInteractive -Command '
+            $version = (Get-Content -LiteralPath .codex-plugin/plugin.json -Raw | ConvertFrom-Json).version
+            if ($env:GITHUB_REF -ne "refs/heads/release/$version") { throw "Release branch does not match package version" }
+          '
+      - name: Configure isolated publication output
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/remnifold-publish-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -L "$root"
+          mkdir -p "$root/tmp"
+          {
+            printf 'CI_ROOT=%s\nCARGO_TARGET_DIR=%s/build\n' "$root" "$root"
+            printf 'REMNIFOLD_R2_WORK_ROOT=%s/validation\n' "$root"
+            printf 'TEMP=%s/tmp\nTMP=%s/tmp\nTMPDIR=%s/tmp\n' "$root" "$root" "$root"
+          } >> "$GITHUB_ENV"
+      - name: Install locked Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
+      - name: Verify all staged targets and publish immutable R2 release
+        env:
+          CI_R2_ENVIRONMENT: r2-release
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          R2_RELEASE_ACCESS_KEY_ID: ${{ secrets.R2_RELEASE_ACCESS_KEY_ID }}
+          R2_RELEASE_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASE_SECRET_ACCESS_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REMNIFOLD_R2_STAGE_RECORDS: ${{ toJSON(needs.native-package.outputs) }}
+          REMNIFOLD_R2_NEEDS_RESULT: ${{ needs.native-package.result }}
+        run: cargo xtask r2-publish --apply

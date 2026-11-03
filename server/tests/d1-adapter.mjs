@@ -13,8 +13,6 @@ export function adapter(database) {
   }
   return { hooks, prepare, batch: async (operations) => {
     await hooks.batch?.(operations);
-    database.exec("BEGIN");
-    try { const results = operations.map((operation) => operation.execute()); database.exec("COMMIT"); return results; }
-    catch (error) { database.exec("ROLLBACK"); throw error; }
+    return database.transaction(() => operations.map(operation => operation.execute()));
   } };
 }

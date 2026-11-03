@@ -1,117 +1,13 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { spawn, spawnSync } from "node:child_process";
-import { createInterface } from "node:readline";
-import assert from "node:assert/strict";
-import { api, readDocument } from "../../client/memory-client.mjs";
-import { runHook } from "../../client/memory-hooks.mjs";
-
-const root = resolve(import.meta.dirname, "..");
-const wrangler = join(root, "node_modules", "wrangler", "bin", "wrangler.js");
-const state = mkdtempSync(join(tmpdir(), "remnifold-test-"));
-const token = "sm_cf_test_only";
-const port = 8900 + (process.pid % 500);
-const baseUrl = `http://127.0.0.1:${port}`;
-
-function run(args) {
-  const result = spawnSync(process.execPath, [wrangler, ...args, "--config", "wrangler.test.jsonc"], {
-    cwd: root,
-    encoding: "utf8",
-    env: { ...process.env, MEMORY_API_KEY: token },
-  });
-  assert.equal(result.status, 0, `${result.error ?? ""}\n${result.stdout}\n${result.stderr}`);
-}
-
-async function stopChild(child) {
-  if (!child || child.exitCode !== null) return;
-  const exited = new Promise((resolvePromise) => child.once("exit", resolvePromise));
-  // WindowsではWrangler配下のworkerdも終了し、ローカルD1のロックを解放する。
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
-    });
-  } else {
-    child.kill();
-  }
-  await Promise.race([
-    exited,
-    new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000)),
-  ]);
-}
-
-async function waitForServer() {
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseUrl}/health`);
-      if (response.ok) return;
-    } catch {
-      // The local Worker is still starting.
-    }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 125));
-  }
-  throw new Error("Timed out waiting for wrangler dev");
-}
-
-async function request(path, options = {}) {
-  return fetch(`${baseUrl}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-}
-
-async function callMcp() {
-  const child = spawn(process.execPath, [join(root, "..", "client", "mcp-server.mjs")], {
-    cwd: root,
-    env: { ...process.env, REMNIFOLD_API_URL: baseUrl, REMNIFOLD_API_KEY: token },
-    stdio: ["pipe", "pipe", "inherit"],
-  });
-  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  const responses = [];
-  lines.on("line", (line) => responses.push(JSON.parse(line)));
-  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } })}\n`);
-  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`);
-  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "search_memory", arguments: { query: "Cloudflare", containerTag: "repo_test__0123456789abcdef" } } })}\n`);
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline && responses.length < 3) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
-  }
-  await stopChild(child);
-  assert.equal(responses.find((item) => item.id === 1)?.result?.serverInfo?.name, "remnifold");
-  assert.ok(responses.find((item) => item.id === 2)?.result?.tools?.some((tool) => tool.name === "whoAmI"));
-  assert.equal(responses.find((item) => item.id === 3)?.result?.isError, undefined);
-}
-
-let worker;
-try {
-  run(["d1", "migrations", "apply", "remnifold", "--local", "--persist-to", state]);
-  worker = spawn(
-    process.execPath,
-    [
-      wrangler,
-      "dev",
-      "--config",
-      "wrangler.test.jsonc",
-      "--local",
-      "--port",
-      String(port),
-      "--persist-to",
-      state,
-      "--var",
-      `MEMORY_API_KEY:${token}`,
-      "--var",
-      "AI_ENRICHMENT_MODE:off",
-    ],
-    { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
-  );
-  await waitForServer();
-
+import test,{assert} from './support/test.mjs';
+import worker from '../src/index.ts';
+import {fixture} from './worker-fixture.mjs';
+const utf8Bytes=value=>new TextEncoder().encode(value).length;
+test('authenticated Worker API smoke, source capacity and remote MCP', {timeout:90000}, async()=>{
+ const f=fixture();f.env.AI=undefined;f.env.MEMORY_VECTORS=undefined;
+ const token=f.env.MEMORY_API_KEY;const baseUrl='https://smoke.example';
+ const fetch=(url,options)=>worker.fetch(new Request(url,options),f.env,f.ctx);
+ const request=(path,options={})=>fetch(`${baseUrl}${path}`,{...options,headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json',...options.headers}});
+ try {
   const health = await fetch(`${baseUrl}/health`).then((response) => response.json());
   assert.equal(health.semanticSearch, "disabled");
   assert.equal(health.factGraph, "disabled");
@@ -385,33 +281,14 @@ try {
   });
   assert.deepEqual(await graph.json(), { facts: [], relations: [] });
 
-  await callMcp();
+
 
   const responseSource = "# Transport reliability\n\n### User request\n接続を直して\n\n### Final assistant response\nHttpRecallNeedle は AbortSignal.timeout の設定で解決しました。";
   const responseRecord = await request("/v3/documents", {
     method: "POST", body: JSON.stringify({ containerTag: "http-recall", customId: "http-response-only", content: responseSource,
       metadata: { sm_project_id: "http-project", topics: ["HTTP Recall"], memoryIndex: { version: 1, title: "Transport reliability", description: "接続を直して", sections: [], recallable: true } } }),
   }).then((response) => response.json());
-  const recallCalls = [];
-  const localApi = (path, options = {}) => {
-    recallCalls.push({ path, body: options.body });
-    return api(path, { ...options, config: { baseUrl, apiKey: token } });
-  };
-  const hook = await runHook("UserPromptSubmit", { prompt: "HttpRecallNeedle" }, {
-    settings: { recallMode: "direct", maxMemories: 5, minimumSimilarity: 0.7 }, context: {}, request: localApi,
-  });
-  assert.match(hook.hookSpecificOutput.additionalContext, new RegExp(responseRecord.id));
-  assert.match(hook.hookSpecificOutput.additionalContext, /原文の該当箇所.*HttpRecallNeedle/u);
-  assert.deepEqual(recallCalls.map((call) => call.path), ["/v4/search", "/v3/documents/list"]);
-  assert.deepEqual(recallCalls[1].body, { projection: "index", recentTasks: true, page: 1, limit: 2 });
-  const recallHttpRequests = recallCalls.length;
-  const original = await readDocument(responseRecord.id, localApi);
-  assert.match(original.text, /AbortSignal\.timeout/u);
-  const artifact = resolve(root, "../dist/recall-http-validation.json");
-  mkdirSync(resolve(artifact, ".."), { recursive: true });
-  writeFileSync(artifact, `${JSON.stringify({ node: process.version, runtime: "Wrangler local/workerd + local D1 + authenticated HTTP + real hook/API/getDocument", passed: true, recallHttpRequests, fullSourcePreserved: true }, null, 2)}\n`);
-
-  const forgotten = await request("/v4/memories", {
+  const sourceRead=await request(`/v3/documents/${responseRecord.id}`);assert.equal(sourceRead.status,200);assert.match((await sourceRead.json()).content,/AbortSignal\.timeout/u);  const forgotten = await request("/v4/memories", {
     method: "DELETE",
     body: JSON.stringify({ containerTag, content: "記憶データはRemnifoldからCloudflare D1へ保存する" }),
   });
@@ -451,11 +328,7 @@ try {
   const capacityBody = JSON.parse(capacityText);
   assert.equal(capacityBody.results.length, 50);
   assert.ok(capacityBody.results.every((record) => !record.content && !record.memory && record.metadata.memoryIndex.version === 1));
-  assert.ok(Buffer.byteLength(capacityText) < 100_000);
-  writeFileSync(artifact, `${JSON.stringify({ node: process.version, runtime: "Wrangler local/workerd + local D1 + authenticated HTTP + real hook/API/getDocument", passed: true,
-    recallHttpRequests, fullSourcePreserved: true, capacity: { records: 50, sourceCharactersEach: longSource.length, legacyRecords: 25,
-      responseBytes: Buffer.byteLength(capacityText), elapsedMs: performance.now() - capacityStarted, cloudflareProductionLatencyMeasured: false } }, null, 2)}\n`);
-
+  assert.ok(utf8Bytes(capacityText) < 100_000);
   // リモートMCPも実workerdと認証付きHTTPを通し、旧記憶と同じD1へ接続する。
   let rpcId = 0;
   const rpc = async (method, params = {}) => {
@@ -483,8 +356,5 @@ try {
   assert.equal(remoteSearch.results[0].content, undefined);
   await remoteCall("add_memory", { action: "forget", documentId: remoteSaved.id, containerTag: "remote-mcp-smoke" });
   assert.equal((await fetch(`${baseUrl}/mcp`)).status, 401);
-  console.log("Remnifold smoke tests passed: auth, save/upsert, search, topics, list, graph, MCP, remote MCP HTTP, forget");
-} finally {
-  await stopChild(worker);
-  rmSync(state, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-}
+
+} finally {await f.drain();f.db.close()} });

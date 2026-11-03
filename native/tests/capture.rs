@@ -1,4 +1,5 @@
 //! Real native CLI + authenticated loopback API checks. Fixtures are retained for inspection.
+mod support;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -6,13 +7,13 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Child, Command, Output, Stdio},
+    process::{Command, Output, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const KEY: &str = "native-capture-fixture-key";
@@ -261,6 +262,7 @@ impl Fixture {
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_remnifold"));
+        support::isolate(&mut command);
         command
             .args(args)
             .env("CODEX_HOME", &self.home)
@@ -282,10 +284,10 @@ impl Fixture {
         }
         command
     }
-    fn spawn(&self, args: &[&str]) -> Child {
-        let mut child = self.command(args).spawn().unwrap();
-        write!(child.stdin.take().unwrap(),"{}",json!({"session_id":self.session,"transcript_path":self.transcript,"cwd":self.root.join("project")})).unwrap();
-        child
+    fn spawn(&self, args: &[&str]) -> support::BoundedChild {
+        let input=json!({"session_id":self.session,"transcript_path":self.transcript,"cwd":self.root.join("project")}).to_string().into_bytes();
+        support::BoundedChild::spawn(&mut self.command(args), input, Duration::from_secs(30))
+            .unwrap()
     }
     fn run(&self, args: &[&str]) -> Output {
         finish(self.spawn(args))
@@ -298,7 +300,7 @@ impl Fixture {
         if apply {
             command.arg("--apply");
         }
-        let output = finish(command.spawn().unwrap());
+        let output = support::run(&mut command, b"", Duration::from_secs(30)).unwrap();
         assert!(
             output.status.success(),
             "import failed: {}",
@@ -316,17 +318,8 @@ impl Fixture {
         serde_json::from_slice(&fs::read(files[0].path()).unwrap()).unwrap()
     }
 }
-fn finish(mut child: Child) -> Output {
-    let start = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if start.elapsed() > Duration::from_secs(30) {
-            child.kill().ok();
-            child.wait().ok();
-            panic!("native CLI exceeded 30 second deadline")
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    child.wait_with_output().unwrap()
+fn finish(child: support::BoundedChild) -> Output {
+    child.wait().unwrap()
 }
 fn success(output: &Output) {
     assert!(
@@ -446,14 +439,15 @@ fn import_plan_apply_and_cross_container_history_deduplication() {
     assert!(server.state.lock().unwrap().requests.is_empty());
     assert!(!fixture.root.join("import-state.json").exists());
     // Explicit --codex-home still overrides a different environment default.
-    let explicit = finish(
+    let explicit = support::run(
         fixture
             .command(&["import", "--include-recent", "--codex-home"])
             .arg(&fixture.home)
-            .env("CODEX_HOME", fixture.root.join("missing-codex-home"))
-            .spawn()
-            .unwrap(),
-    );
+            .env("CODEX_HOME", fixture.root.join("missing-codex-home")),
+        b"",
+        Duration::from_secs(30),
+    )
+    .unwrap();
     success(&explicit);
     let explicit_plan: Value = serde_json::from_slice(&explicit.stdout).unwrap();
     assert_eq!(explicit_plan["plannedDocuments"], 2);

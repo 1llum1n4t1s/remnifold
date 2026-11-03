@@ -1,8 +1,9 @@
+mod support;
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -10,17 +11,22 @@ use std::{
 
 struct Mcp {
     child: Child,
-    input: Option<ChildStdin>,
-    output: mpsc::Receiver<Value>,
+    input: Option<support::QueuedStdin>,
+    output: mpsc::Receiver<Result<Value, String>>,
 }
 impl Mcp {
     fn send(&mut self, value: Value) {
-        writeln!(self.input.as_mut().unwrap(), "{value}").unwrap();
+        self.input
+            .as_ref()
+            .unwrap()
+            .send(format!("{value}\n").into_bytes())
+            .unwrap();
     }
     fn receive(&self) -> Value {
         self.output
             .recv_timeout(Duration::from_secs(10))
             .expect("bounded MCP response")
+            .expect("bounded MCP output")
     }
     fn exchange(&mut self, id: u64, method: &str, params: Value) -> Value {
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
@@ -108,7 +114,9 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{encoded}",encoded.len()).unwrap();
         }
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_remnifold"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_remnifold"));
+    support::isolate(&mut command);
+    let mut child = command
         .arg("mcp")
         .env("REMNIFOLD_API_URL", endpoint)
         .env("REMNIFOLD_API_KEY", "local-mcp-fixture-key")
@@ -123,14 +131,38 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
         .unwrap();
     let input = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::sync_channel(16);
+    let err_tx = tx.clone();
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
+        if support::read_limited(stderr).is_err() {
+            let _ = err_tx.try_send(Err("MCP stderr exceeded its limit or failed".into()));
+        }
+    });
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut total = 0;
+        loop {
+            let mut line = Vec::new();
+            match Read::by_ref(&mut reader)
+                .take(8 * 1024 * 1024 + 1)
+                .read_until(b'\n', &mut line)
+            {
+                Ok(0) => break,
+                Ok(_) if line.len() <= 8 * 1024 * 1024 => (),
+                _ => {
+                    let _ =
+                        tx.try_send(Err("MCP stdout frame exceeded its limit or failed".into()));
+                    break;
+                }
+            }
+            total += line.len();
+            if total > 16 * 1024 * 1024 {
+                let _ = tx.try_send(Err("MCP stdout exceeded its total limit".into()));
                 break;
-            };
-            if let Ok(value) = serde_json::from_str(&line) {
-                if tx.send(value).is_err() {
+            }
+            if let Ok(value) = serde_json::from_slice(&line) {
+                if tx.try_send(Ok(value)).is_err() {
                     break;
                 }
             }
@@ -138,7 +170,7 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
     });
     let mut mcp = Mcp {
         child,
-        input,
+        input: input.map(support::QueuedStdin::new),
         output: rx,
     };
     let initialize = mcp.exchange(
@@ -171,7 +203,11 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
         mcp.exchange(6, "unknown", json!({}))["error"]["code"],
         -32601
     );
-    writeln!(mcp.input.as_mut().unwrap(), "{{bad-json").unwrap();
+    mcp.input
+        .as_ref()
+        .unwrap()
+        .send(b"{bad-json\n".to_vec())
+        .unwrap();
     assert_eq!(mcp.receive()["error"]["code"], -32700);
     mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
     let source = std::env::current_dir().unwrap().canonicalize().unwrap();

@@ -580,6 +580,33 @@ fn has(words: &str, s: &str) -> bool {
 fn stopped(s: &str, automatic: bool) -> bool {
     has(STOP, s) || automatic && (has(AUTO_STOP, s) || has(AUTO_ACTION, s))
 }
+fn automatic_stop_ranges(query: &str) -> Vec<(usize, usize)> {
+    // 分かち書きが「してください」を「てく」「さい」へ分割しても、
+    // 既存の隣接する除外語の範囲内にある断片を話題として残さない。
+    let mut ranges: Vec<_> = [STOP, AUTO_STOP, AUTO_ACTION]
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .filter(|s| s.chars().all(|c| !c.is_ascii()))
+        .flat_map(|s| {
+            query
+                .match_indices(s)
+                .map(move |(start, _)| (start, start + s.len()))
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = vec![];
+    for (start, end) in ranges {
+        if let Some(previous) = merged
+            .last_mut()
+            .filter(|(_, previous_end)| start <= *previous_end)
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
 fn path_topic(s: &str) -> String {
     let normalized = s.replace('\\', "/");
     let normalized = normalized.trim_end_matches('/');
@@ -610,12 +637,13 @@ pub fn automatic_search_text(query: &str) -> String {
     let normalized: String = query.nfkc().collect();
     let quoted = re(r#"(?i)["']([a-z]:[\\/][^\r\n]*?|\\\\[^"'\r\n]*?|/[^\r\n]*?)["']"#)
         .replace_all(&normalized, |c: &regex::Captures| path_topic(&c[1]));
-    let pattern = fancy_regex::Regex::new(
+    static PATH_PATTERN: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    let pattern = PATH_PATTERN.get_or_init(|| fancy_regex::Regex::new(
         r#"(?i)(?<![A-Za-z0-9_])[a-z]:[\\/][^\s"'<>|]+|\\\\[^\s"'<>|]+|(?<![:A-Za-z0-9_/])(?:~)?/[^\s"'<>|]+"#,
     )
-    .unwrap();
+    .unwrap());
     pattern
-        .replace_all(&quoted, |c: &fancy_regex::Captures| path_topic(&c[0]))
+        .replace_all(&quoted, |c: &fancy_regex::Captures<str>| path_topic(&c[0]))
         .to_string()
 }
 fn words(s: &str) -> Vec<(String, usize, usize)> {
@@ -647,11 +675,17 @@ pub fn query_terms(query: &str, automatic: bool) -> Vec<String> {
     } else {
         vec![]
     };
+    let stop_ranges = if automatic {
+        automatic_stop_ranges(&query)
+    } else {
+        vec![]
+    };
     let useful: Vec<_> = words(&query)
         .into_iter()
-        .filter(|(w, start, _)| {
+        .filter(|(w, start, end)| {
             w.encode_utf16().count() >= 2
                 && !stopped(w, automatic)
+                && !stop_ranges.iter().any(|(a, b)| start >= a && end <= b)
                 && !identifiers.iter().any(|(_, a, b)| start >= a && start < b)
         })
         .collect();
@@ -1088,26 +1122,28 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
             let handles: Vec<_> = chunk
                 .iter()
                 .map(|c| {
-                    scope.spawn(move || {
-                        if c.row["metadata"]["memoryIndex"]["version"] == 1 {
-                            return None;
-                        }
+                    if c.row["metadata"]["memoryIndex"]["version"] == 1 {
+                        return None;
+                    }
+                    Some(scope.spawn(move || {
                         let id = text(&c.index["id"]);
                         let path = format!("/v3/documents/{}", encode(id));
-                        Some(request(config, &path, None, options).and_then(|d| {
+                        request(config, &path, None, options).and_then(|d| {
                             if text(&d["id"]) != id || !d["content"].is_string() {
                                 bail!("Invalid memory document response")
                             }
                             Ok(d)
-                        }))
-                    })
+                        })
+                    }))
                 })
                 .collect();
             handles
                 .into_iter()
                 .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Some(Err(anyhow::anyhow!("Memory hydration worker failed")))
+                    h.map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("Memory hydration worker failed"))
+                        })
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1127,14 +1163,12 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
                         c.index["recallable"] = json!(false)
                     }
                 }
+                score(c, &terms, automatic)
             }
         }
     }
     if automatic {
         candidates = latest(candidates)
-    }
-    for c in &mut candidates {
-        score(c, &terms, automatic)
     }
     candidates.retain(|c| {
         (semantic(c, minimum) || lexical(c) || c.relevance > 0.)
@@ -1481,6 +1515,23 @@ mod tests {
     }
 
     #[test]
+    fn project_path_recall_excludes_generic_repair_request() {
+        let query = r#""C:\Users\IMT\dev\remnifold" メモリー機能側で修正で最適化が出来そうな部分が発見できていたら修正してください"#;
+        let terms = recall_topic_terms(query);
+        assert!(
+            matching_topic_terms("Remnifold 索引の読込", &terms).contains(&"remnifold".to_owned())
+        );
+        assert!(
+            matching_topic_terms("請求書 修正してください", &terms).is_empty(),
+            "terms: {terms:?}"
+        );
+        assert!(recall_topic_terms("修正してください").is_empty());
+        let adjacent = recall_topic_terms("Kirihaを修正してください Rust_api-v2 拡張機能");
+        assert_eq!(adjacent, vec!["rust_api-v2", "kiriha", "拡張"]);
+        assert_eq!(query_terms("改善 修正", false), vec!["改善", "修正"]);
+        assert_eq!(recall_topic_terms("fixkit"), vec!["fixkit"]);
+    }
+    #[test]
     fn japanese_topics_and_technical_boundaries() {
         assert_eq!(
             query_terms("この その あの どの ここ そこ this that", false),
@@ -1609,6 +1660,38 @@ mod tests {
         assert!(!text(&read["document"]["content"]).contains("Session:"));
         assert!(!text(&read["document"]["content"]).contains("Part:"));
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+    #[test]
+    fn mixed_index_and_legacy_hydration_keeps_results_and_failures_aligned() {
+        for valid in [true, false] {
+            let document = if valid {
+                json!({"id":"legacy","containerTag":"memories","content":"### User request\nKiriha legacy detail\n### Final assistant response\n完了","metadata":{"title":"Kiriha legacy"}})
+            } else {
+                json!({"id":"wrong-document","content":"Kiriha"})
+            };
+            let (config, handle, requests) = fixture(vec![
+                json!({"searchScope":"all-containers","searchedContainers":["memories"],"spaceDiscoveryComplete":true,"results":[row("first","Kiriha first"),{"id":"legacy","containerTag":"memories","semanticSimilarity":0.9},row("last","Kiriha last")]}),
+                document,
+            ]);
+            let result =
+                search_index(&config, &json!({"query":"Kiriha","automatic":true})).unwrap();
+            handle.join().unwrap();
+            let ids: Vec<_> = result["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| text(&r["id"]))
+                .collect();
+            assert!(ids.contains(&"first") && ids.contains(&"last"));
+            assert_eq!(ids.contains(&"legacy"), valid);
+            assert_eq!(
+                result["failedDocuments"],
+                if valid { json!([]) } else { json!(["legacy"]) }
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1]["path"], "/v3/documents/legacy");
+        }
     }
     #[test]
     fn older_server_recent_list_is_not_recent_work() {

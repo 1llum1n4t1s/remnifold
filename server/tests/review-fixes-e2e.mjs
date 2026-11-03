@@ -2,56 +2,19 @@
 // 検証する失敗: source忘却/PATCH/upsertの無効化失敗による部分commit、遅延cleanupによる復元済みfacts/topics消失、
 // 状態だけのUPDATEによるFTS再索引、本文/container更新やDELETEの索引不整合、project優先/fallbackの変化、
 // 初回40件backfillで全project集計を繰り返すこと、expression indexが対象照会に使われないこと。
-// 実行: node --experimental-transform-types server/tests/review-fixes-e2e.mjs
+// 実行: cargo xtask server-test
 // 認証済み Worker API、全 migration 適用済み SQLite、非同期完了を通す統合検証。
-import assert from "node:assert/strict";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import test, { assert } from "./support/test.mjs";
 import worker from "../src/index.ts";
-import { adapter } from "./d1-adapter.mjs";
+import { checkpoint, embedding, fixture, migrations, output } from "./worker-fixture.mjs";
 
-const artifactPath = resolve(import.meta.dirname, "../../dist/server-review-fixes-validation.json");
-const migrations = readdirSync(resolve(import.meta.dirname, "../migrations")).filter((name) => name.endsWith(".sql")).sort();
-const checkpoint = { title: "Checkpoint", overview: "Verified restart state.", verified: ["Sources stored."], unverified: [], unresolved: [], nextActions: [] };
-const output = (value, finish_reason = "stop") => ({ choices: [{ finish_reason, message: { content: typeof value === "string" ? value : JSON.stringify(value) } }] });
-const embedding = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
 
-function fixture() {
-  const db = new DatabaseSync(":memory:");
-  db.exec("PRAGMA foreign_keys = ON");
-  for (const migration of migrations) db.exec(readFileSync(resolve(import.meta.dirname, "../migrations", migration), "utf8"));
-  const DB = adapter(db);
-  const waits = [];
-  const ctx = { waitUntil(promise) { waits.push(Promise.resolve(promise).then(() => ({ status: "fulfilled" }), (error) => ({ status: "rejected", error: String(error) }))); } };
-  const calls = [];
-  let respond = async () => output(checkpoint);
-  const env = { DB, MEMORY_API_KEY: "local-fixture", AI_ENRICHMENT_MODE: "off",
-    AI: { run: async (_model, input) => {
-      if (input.text) return { data: [embedding] };
-      if (input.response_format?.json_schema?.name === "memory_consolidation") { calls.push(input); return respond(input, calls.length); }
-      return output({ facts: [{ subject: "Source", predicate: "has", object: "evidence", confidence: 1, exclusive: false }], topics: ["Validation"] });
-    } },
-    MEMORY_VECTORS: { upsert: async () => ({ mutationId: "local-vector" }), deleteByIds: async () => ({}), getByIds: async () => [] },
-  };
-  const api = async (path, body, method = "POST") => {
-    const response = await worker.fetch(new Request(`https://local.example${path}`, { method,
-      headers: { Authorization: "Bearer local-fixture", "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) }), env, ctx);
-    return { status: response.status, body: response.status === 204 ? null : await response.json() };
-  };
-  return { db, DB, env, ctx, calls, api, metrics: {}, respond(callback) { respond = callback; },
-    drain: async () => { const results = []; while (waits.length) results.push(...await Promise.all(waits.splice(0))); return results; },
-    seed: async (count = 2) => { const ids = []; env.AI_ENRICHMENT_MODE = "off";
-      for (let i = 0; i < count; i++) { const saved = await api("/v3/documents", { containerTag: "memories", customId: `source-${i}`, content: `Verified source ${i}`, metadata: { sm_project_id: "log-project" } }); assert.equal(saved.status, 201, JSON.stringify(saved.body)); ids.push(saved.body.id); }
-      env.AI_ENRICHMENT_MODE = "on"; return ids; },
-    consolidate: () => api("/v4/consolidate", { projectId: "log-project", force: true }),
-    active: () => db.prepare("SELECT * FROM memory_consolidations WHERE status = 'active'").all(),
-    lease: () => db.prepare("SELECT lease_token FROM memory_consolidation_projects").get()?.lease_token,
-  };
-}
 
-const cases = [];
-function scenario(name, run) { cases.push({ name, run }); }
+function scenario(name, run) { test(name, async () => {
+ const f=fixture(); const logs=[]; const original={log:console.log,error:console.error,warn:console.warn};
+ const capture=(...values)=>{for(const value of values){try{logs.push(JSON.parse(value))}catch{}}};Object.keys(original).forEach(k=>console[k]=capture);
+ try { await run(f, logs); } catch(error) { original.error(JSON.stringify({test:name,events:logs})); throw error; } finally { await f.drain(); Object.assign(console,original); f.db.close(); }
+}); }
 for (const operation of ["forget", "patch", "upsert"]) scenario(`${operation} invalidation failure rolls back source and checkpoint together`, async (f) => {
   const [id] = await f.seed(); const first = (await f.consolidate()).body; await f.drain();
   const before = f.db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
@@ -189,15 +152,3 @@ scenario("checkpoint publication between upsert preflight and write preserves ca
   assert.equal((await f.consolidate()).body.status, "no_unconsolidated_memories");
   f.metrics.upsertStatus = result.status; f.metrics.checkpointStatus = active[0].status; f.metrics.sourceMembershipCount = membership.length;
 });
-const report = { baseline: { originalCases: 6, originalFailures: 6, statusOnlySqliteChanges: 9, checkpointPublicationRaceUpsertStatus: 201 }, command: "node --experimental-transform-types server/tests/review-fixes-e2e.mjs", node: process.version, migrations, scope: "authenticated Worker API with migrated real SQLite and deterministic local AI/vector fixtures", results: [] };
-for (const { name, run } of cases) {
-  const f = fixture(); const original = { log: console.log, error: console.error, warn: console.warn }; const logs = [];
-  console.log = console.warn = console.error = (...values) => { for (const value of values) { try { logs.push(JSON.parse(value)); } catch {} } };
-  try { await run(f, logs); report.results.push({ name, status: "passed", measurements: f.metrics }); }
-  catch (error) { report.results.push({ name, status: "failed", error: String(error), stack: error.stack, events: logs }); }
-  finally { await f.drain(); Object.assign(console, original); f.db.close(); }
-}
-report.passed = report.results.filter((result) => result.status === "passed").length; report.failed = report.results.length - report.passed;
-mkdirSync(resolve(artifactPath, ".."), { recursive: true }); writeFileSync(artifactPath, `${JSON.stringify(report, null, 2)}\n`);
-console.log(JSON.stringify({ artifact: artifactPath, passed: report.passed, failed: report.failed }));
-if (report.failed) process.exitCode = 1;

@@ -14,17 +14,19 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+mod private_work;
+mod r2;
 
 type Files = BTreeMap<String, Vec<u8>>;
-const LIMIT: u64 = 128 * 1024 * 1024;
+const LIMIT: u64 = crate::release_manifest::MAX_ARCHIVE;
 fn sha(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::common::encode_hex(&Sha256::digest(bytes))
 }
 fn blob(bytes: &[u8]) -> String {
     let mut hash = Sha1::new();
     hash.update(format!("blob {}\0", bytes.len()));
     hash.update(bytes);
-    format!("{:x}", hash.finalize())
+    crate::common::encode_hex(&hash.finalize())
 }
 fn hex(value: &str, length: usize) -> bool {
     value.len() == length
@@ -146,6 +148,195 @@ fn native_source(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    // 独立プロセスでのみ起動する、標準出力継承の再現用 fixture。
+    #[test]
+    #[ignore]
+    fn inherited_stdout_fixture() {
+        if std::env::args().any(|arg| arg == "--show-output") {
+            thread::sleep(Duration::from_secs(2));
+            return;
+        }
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "updater::tests::inherited_stdout_fixture",
+                "--ignored",
+                "--nocapture",
+                "--show-output",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    fn child_exit_does_not_remove_stdout_deadline() {
+        let command = vec![
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let args = strings(&[
+            "--exact",
+            "updater::tests::inherited_stdout_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        let start = Instant::now();
+        let error = execute_with_timeout(
+            &command,
+            &args,
+            &std::env::temp_dir(),
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "CLI_TIMEOUT");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn physical_roots_resolve_missing_suffixes_and_valid_external_aliases() {
+        let root = physical_path(&std::env::temp_dir())
+            .unwrap()
+            .join(format!("remnifold-updater-roots-{}", uuid::Uuid::new_v4()));
+        #[cfg(windows)]
+        no_links(&std::env::temp_dir(), false).unwrap();
+        #[cfg(not(windows))]
+        no_links(&root, true).unwrap();
+        fs::create_dir(&root).unwrap();
+        for directory in ["source", "work", "external"] {
+            fs::create_dir(root.join(directory)).unwrap();
+        }
+        let work = root.join("work/not-created");
+        let source = root.join("source");
+        assert!(path_equal(
+            &physical_path(&work).unwrap(),
+            &physical_path(&root.join("work"))
+                .unwrap()
+                .join("not-created")
+        ));
+        assert!(isolated_physical_roots(&source, &work, &root.join("external/missing")).is_ok());
+        assert!(isolated_physical_roots(&source, &work, &root.join("work")).is_err());
+        assert!(!work.exists());
+        #[cfg(any(unix, windows))]
+        {
+            fn alias(alias: &Path, target: &Path) {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, alias).unwrap();
+                #[cfg(windows)]
+                {
+                    let result = Command::new("cmd.exe")
+                        .args(["/D", "/C", "mklink", "/J"])
+                        .arg(alias)
+                        .arg(target)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap();
+                    assert!(result.success());
+                }
+            }
+            for name in ["work", "source", "external"] {
+                alias(&root.join(format!("alias-{name}")), &root.join(name));
+            }
+            assert!(isolated_physical_roots(&source, &work, &root.join("alias-work")).is_err());
+            assert!(
+                isolated_physical_roots(
+                    &source,
+                    &root.join("work"),
+                    &root.join("alias-work/missing")
+                )
+                .is_err()
+            );
+            assert!(
+                isolated_physical_roots(&source, &work, &root.join("alias-source/missing"))
+                    .is_err()
+            );
+            assert!(
+                isolated_physical_roots(&source, &work, &root.join("alias-external/missing"))
+                    .is_ok()
+            );
+            assert!(!work.exists());
+        }
+        #[cfg(windows)]
+        assert!(path_equal(
+            &physical_path(&work).unwrap(),
+            &physical_path(&PathBuf::from(work.to_string_lossy().to_uppercase())).unwrap()
+        ));
+        eprintln!("retained updater root-boundary fixture: {}", root.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_unicode_case_variants_share_the_same_windows_root() {
+        let root = physical_path(&std::env::temp_dir()).unwrap();
+        let source = root.join("unicode-source-uncreated");
+        let work = root.join("Ä/work");
+        let codex = root.join("ä/work");
+        assert!(isolated_physical_roots(&source, &work, &codex).is_err());
+        assert!(path_equal(&work, &codex));
+    }
+
+    #[test]
+    fn r2_release_tree_rejects_a_downgraded_legacy_receipt_offline() {
+        let tree = json!({"tree":[{"path":".github/remnifold-distribution.json","type":"blob"}]});
+        assert!(verify_receipt_schema(&json!({"schema":1}), &tree).is_err());
+        assert!(verify_receipt_schema(&json!({"schema":2}), &tree).is_ok());
+        assert!(verify_receipt_schema(&json!({"schema":1}), &json!({"tree":[]})).is_ok());
+    }
+
+    #[test]
+    fn preserves_sha256_and_git_blob_identities() {
+        for (input, digest, object) in [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f",
+            ),
+        ] {
+            assert_eq!(sha(input.as_bytes()), digest);
+            assert_eq!(crate::common::sha256(input), digest);
+            assert_eq!(blob(input.as_bytes()), object);
+        }
+    }
+
+    #[test]
+    fn streamed_hash_matches_bytes_and_retries_interrupted_reads() {
+        struct InterruptedReader<'a> {
+            remaining: &'a [u8],
+            interrupt: bool,
+        }
+        impl Read for InterruptedReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.interrupt = !self.interrupt;
+                if self.interrupt {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.remaining.read(buffer)
+            }
+        }
+        let large: Vec<u8> = (0..(3 * 64 * 1024 + 17)).map(|index| index as u8).collect();
+        for bytes in [b"".as_slice(), b"abc".as_slice(), large.as_slice()] {
+            assert_eq!(hash_reader(bytes).unwrap(), sha(bytes));
+            assert_eq!(
+                hash_reader(InterruptedReader {
+                    remaining: bytes,
+                    interrupt: false
+                })
+                .unwrap(),
+                sha(bytes)
+            );
+        }
+    }
 
     fn archive(name: &str, kind: u8, trailing: bool) -> Vec<u8> {
         let mut header = tar::Header::new_ustar();
@@ -291,8 +482,34 @@ fn allowed(name: &str) -> bool {
         )
 }
 fn files_at(root: &Path) -> Result<Files> {
+    walk_files(root, &mut |path| Ok(fs::read(path)?))
+}
+fn hashes_at(root: &Path) -> Result<BTreeMap<String, String>> {
+    walk_files(root, &mut |path| hash_reader(fs::File::open(path)?))
+}
+fn hash_reader(mut reader: impl Read) -> Result<String> {
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(crate::common::encode_hex(&hash.finalize())),
+            Ok(count) => hash.update(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+fn walk_files<T>(
+    root: &Path,
+    read: &mut impl FnMut(&Path) -> Result<T>,
+) -> Result<BTreeMap<String, T>> {
     no_links(root, false)?;
-    fn walk(root: &Path, here: &Path, result: &mut Files) -> Result<()> {
+    fn walk<T>(
+        root: &Path,
+        here: &Path,
+        result: &mut BTreeMap<String, T>,
+        read: &mut impl FnMut(&Path) -> Result<T>,
+    ) -> Result<()> {
         for item in fs::read_dir(here)? {
             let item = item?;
             let path = item.path();
@@ -305,19 +522,19 @@ fn files_at(root: &Path) -> Result<Files> {
             ensure!(safe_name(&name), "UNKNOWN_LOCAL_FILE");
             if info.is_dir() {
                 ensure!(item.file_name() != ".git", "SOURCE_MUST_NOT_BE_GIT");
-                walk(root, &path, result)?;
+                walk(root, &path, result, read)?;
             } else {
                 ensure!(
                     info.is_file() && allowed(&name) && info.len() <= LIMIT,
                     "UNKNOWN_LOCAL_FILE"
                 );
-                result.insert(name, fs::read(path)?);
+                result.insert(name, read(&path)?);
             }
         }
         Ok(())
     }
-    let mut result = Files::new();
-    walk(root, root, &mut result)?;
+    let mut result = BTreeMap::new();
+    walk(root, root, &mut result, read)?;
     Ok(result)
 }
 fn hashes(files: &Files) -> BTreeMap<String, String> {
@@ -438,6 +655,23 @@ fn read_zip(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 fn execute(command: &[String], args: &[String], work: &Path) -> Result<Vec<u8>> {
+    execute_with_timeout(command, args, work, Duration::from_secs(120))
+}
+fn execute_with_timeout(
+    command: &[String],
+    args: &[String],
+    work: &Path,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    execute_with_limits(command, args, work, timeout, LIMIT)
+}
+fn execute_with_limits(
+    command: &[String],
+    args: &[String],
+    work: &Path,
+    timeout: Duration,
+    limit: u64,
+) -> Result<Vec<u8>> {
     ensure!(
         !command.is_empty()
             && ![".cmd", ".bat"]
@@ -451,6 +685,7 @@ fn execute(command: &[String], args: &[String], work: &Path) -> Result<Vec<u8>> 
         .args(args)
         .env("TEMP", work)
         .env("TMP", work)
+        .env("TMPDIR", work)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(windows)]
@@ -463,28 +698,36 @@ fn execute(command: &[String], args: &[String], work: &Path) -> Result<Vec<u8>> 
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("CLI_PIPE_FAILED"))?;
-    let reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        stdout.take(LIMIT + 1).read_to_end(&mut bytes)?;
-        Ok(bytes)
+    let (sender, reader) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (|| -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            stdout.take(limit + 1).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })();
+        let _ = sender.send(result);
     });
-    let start = Instant::now();
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             ensure!(status.success(), "CLI_FAILED");
             break;
         }
-        if start.elapsed() > Duration::from_secs(120) {
+        if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             bail!("CLI_TIMEOUT");
         }
         thread::sleep(Duration::from_millis(50));
     }
+    // 子が終了しても、標準出力を継承した孫の EOF を同じ期限より長く待たない。
     let bytes = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("CLI_PIPE_FAILED"))??;
-    ensure!(bytes.len() as u64 <= LIMIT, "CLI_OUTPUT_TOO_LARGE");
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!("CLI_TIMEOUT"),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => anyhow::anyhow!("CLI_PIPE_FAILED"),
+        })??;
+    ensure!(bytes.len() as u64 <= limit, "CLI_OUTPUT_TOO_LARGE");
     Ok(bytes)
 }
 fn strings(values: &[&str]) -> Vec<String> {
@@ -495,6 +738,7 @@ struct Context {
     codex: Vec<String>,
     repository: String,
     work: PathBuf,
+    gh_log_escape: std::sync::OnceLock<bool>,
 }
 impl Context {
     fn cli(&self, command: &[String], args: &[String], code: &str) -> Result<Value> {
@@ -506,7 +750,12 @@ impl Context {
     fn api(&self, suffix: &str) -> Result<Value> {
         self.cli(
             &self.gh,
-            &strings(&["api", &format!("repos/{}/{suffix}", self.repository)]),
+            &strings(&[
+                "api",
+                "--hostname",
+                "github.com",
+                &format!("repos/{}/{suffix}", self.repository),
+            ]),
             "GITHUB_QUERY_FAILED",
         )
     }
@@ -565,10 +814,26 @@ fn path_equal(a: &Path, b: &Path) -> bool {
             }
         }
     }
-    if cfg!(windows) {
-        a.to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy())
-    } else {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let left: Vec<u16> = a.as_os_str().encode_wide().collect();
+        let right: Vec<u16> = b.as_os_str().encode_wide().collect();
+        if left.len() > i32::MAX as usize || right.len() > i32::MAX as usize {
+            return false;
+        }
+        unsafe {
+            windows_sys::Win32::Globalization::CompareStringOrdinal(
+                left.as_ptr(),
+                left.len() as i32,
+                right.as_ptr(),
+                right.len() as i32,
+                1,
+            ) == windows_sys::Win32::Globalization::CSTR_EQUAL
+        }
+    }
+    #[cfg(not(windows))]
+    {
         a == b
     }
 }
@@ -583,6 +848,54 @@ fn within(parent: &Path, child: &Path) -> bool {
     child
         .ancestors()
         .any(|ancestor| path_equal(parent, ancestor))
+}
+// 未作成の末尾だけを保存し、存在する最長 prefix の実体を解決する。
+fn physical_path(path: &Path) -> Result<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                let mut resolved = fs::canonicalize(&existing)?;
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    existing
+                        .file_name()
+                        .ok_or_else(|| anyhow::anyhow!("INVALID_WORK_ROOT"))?
+                        .to_os_string(),
+                );
+                ensure!(existing.pop(), "INVALID_WORK_ROOT");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+fn isolated_physical_roots(source: &Path, work: &Path, codex_home: &Path) -> Result<()> {
+    let source = physical_path(source)?;
+    let work = physical_path(work)?;
+    let codex = physical_path(codex_home)?;
+    for (left, right) in [(&source, &work), (&source, &codex), (&work, &codex)] {
+        ensure!(
+            !within(left, right) && !within(right, left),
+            "INVALID_WORK_ROOT"
+        );
+    }
+    Ok(())
+}
+fn verify_receipt_schema(receipt: &Value, tree: &Value) -> Result<()> {
+    if tree["tree"].as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry["path"] == ".github/remnifold-distribution.json")
+    }) {
+        ensure!(receipt["schema"] == 2, "NATIVE_RECEIPT_MISMATCH");
+    }
+    Ok(())
 }
 fn command_config(config: &Value, name: &str, fallback: Vec<String>) -> Result<Vec<String>> {
     let Some(value) = config
@@ -809,7 +1122,10 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         Err(error) => {
             let message = error.to_string();
-            let code = if message.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
+            let code = if message
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
                 message.as_str()
             } else {
                 "LOCAL_PLUGIN_UPDATE_FAILED"
@@ -901,7 +1217,9 @@ fn update(argv: &[String]) -> Result<Value> {
     );
     no_links(&work, true)?;
     no_links(&source, false)?;
-    fs::create_dir_all(&work)?;
+    isolated_physical_roots(&source, &work, &codex_home)?;
+    let _private_work = private_work::PrivateWorkGuard::open(&work)?;
+    isolated_physical_roots(&source, &work, &codex_home)?;
     let gh = command_config(
         &config,
         "gh",
@@ -917,6 +1235,7 @@ fn update(argv: &[String]) -> Result<Value> {
         codex,
         repository: repository.into(),
         work: work.clone(),
+        gh_log_escape: std::sync::OnceLock::new(),
     };
     let reference = context.api(&format!("git/ref/heads/release/{version}"))?;
     let commit = reference["object"]["sha"].as_str().unwrap_or("");
@@ -956,6 +1275,7 @@ fn update(argv: &[String]) -> Result<Value> {
     };
     let archive_name = format!("{artifact_name}.tar.gz");
     let receipt_path = work.join(format!("verified-{commit}-{target}.json"));
+    private_work::validate_receipt(&receipt_path)?;
     let installed = context.installed(&source)?;
     let cache_path = |installed: &Value| -> Result<PathBuf> {
         Ok(codex_home.join("plugins/cache/personal/remnifold").join(
@@ -966,21 +1286,18 @@ fn update(argv: &[String]) -> Result<Value> {
     };
     if args.contains_key("--verify-only") {
         let local = files_at(&source)?;
-        let cached = files_at(&cache_path(&installed)?)?;
+        let cached = hashes_at(&cache_path(&installed)?)?;
         ensure!(
-            installed["version"] == *version && hashes(&local) == hashes(&cached),
+            installed["version"] == *version && hashes(&local) == cached,
             "INSTALLED_PLUGIN_CONTENT_MISMATCH"
         );
         if native {
             verify_native(&local, commit, version, target, &tree)?;
             no_links(&receipt_path, false)?;
+            private_work::validate_receipt(&receipt_path)?;
             let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
-            ensure!(
-                receipt["sourceCommit"] == commit
-                    && receipt["target"] == target
-                    && receipt["manifestSha256"] == sha(local.get("native-build.json").unwrap()),
-                "NATIVE_RECEIPT_MISMATCH"
-            );
+            verify_receipt_schema(&receipt, &tree)?;
+            r2::verify_receipt(&receipt, &local, &context, version, commit, target)?;
         } else {
             verify_sources(&local, &tree, false)?;
         }
@@ -988,121 +1305,149 @@ fn update(argv: &[String]) -> Result<Value> {
             json!({"status":"verified","version":version,"sha":commit,"files":local.len(),"workRoot":work}),
         );
     }
-    let runs = context.api(&format!(
-        "actions/runs?head_sha={commit}&event=push&per_page=100"
-    ))?;
-    let run = runs["workflow_runs"]
-        .as_array()
-        .and_then(|runs| {
-            runs.iter()
-                .filter(|run| {
-                    run["name"] == "CI"
-                        && run["head_sha"] == commit
-                        && run["event"] == "push"
-                        && run["head_branch"] == format!("release/{version}")
-                })
-                .max_by_key(|run| {
-                    (
-                        run["id"].as_u64().unwrap_or(0),
-                        run["run_attempt"].as_u64().unwrap_or(0),
-                    )
-                })
-        })
-        .ok_or_else(|| anyhow::anyhow!("RELEASE_CI_NOT_SUCCESSFUL"))?;
-    ensure!(
-        run["status"] == "completed" && run["conclusion"] == "success",
-        "RELEASE_CI_NOT_SUCCESSFUL"
-    );
-    let run_id = run["id"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("RELEASE_CI_NOT_SUCCESSFUL"))?;
-    let artifacts = context.api(&format!("actions/runs/{run_id}/artifacts?per_page=100"))?;
-    let artifact = artifacts["artifacts"]
-        .as_array()
-        .and_then(|items| {
-            items
-                .iter()
-                .filter(|item| item["name"] == artifact_name)
-                .max_by_key(|item| item["id"].as_u64().unwrap_or(0))
-        })
-        .ok_or_else(|| anyhow::anyhow!("RELEASE_ARTIFACT_UNAVAILABLE"))?;
-    ensure!(
-        artifact["expired"] == false
-            && artifact["expires_at"]
-                .as_str()
-                .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
-                .is_some_and(|date| date > chrono::Utc::now()),
-        "RELEASE_ARTIFACT_UNAVAILABLE"
-    );
-    let artifact_id = artifact["id"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("RELEASE_ARTIFACT_UNAVAILABLE"))?;
-    let digest = artifact["digest"].as_str().unwrap_or("");
-    if native {
-        ensure!(
-            digest
-                .strip_prefix("sha256:")
-                .is_some_and(|hash| hex(hash, 64)),
-            "ARTIFACT_DIGEST_UNAVAILABLE"
-        );
-    }
-    let evidence = json!({"version":version,"sha":commit,"runId":run_id,"artifactId":artifact_id,"workRoot":work});
-    if args.contains_key("--check-published") {
-        let mut result = evidence;
-        result["status"] = json!("published");
-        return Ok(result);
-    }
+    let distribution = r2::config(&context, &tree, commit)?;
     let staging = work.join(format!("update-{version}-{}", uuid::Uuid::new_v4()));
-    no_links(&staging, true)?;
-    fs::create_dir(&staging)?;
-    let incoming = if native {
-        let bytes = execute(
-            &context.gh,
-            &strings(&[
-                "api",
-                &format!("repos/{repository}/actions/artifacts/{artifact_id}/zip"),
-            ]),
-            &work,
+    let (incoming, evidence, receipt) = if let Some(distribution) = distribution {
+        ensure!(native, "R2_REQUIRES_NATIVE_PACKAGE");
+        let publication = r2::published(&context, &distribution, commit, version, target, &tree)?;
+        if args.contains_key("--check-published") {
+            let mut result = publication.evidence;
+            result["status"] = json!("published");
+            return Ok(result);
+        }
+        no_links(&staging, true)?;
+        fs::create_dir(&staging)?;
+        (
+            publication.files,
+            publication.evidence,
+            Some(publication.receipt),
         )
-        .map_err(|_| anyhow::anyhow!("ARTIFACT_DOWNLOAD_FAILED"))?;
-        ensure!(
-            format!("sha256:{}", sha(&bytes)) == digest,
-            "ARTIFACT_DIGEST_MISMATCH"
-        );
-        parse_tar(&read_zip(&bytes, &archive_name)?)?
     } else {
-        execute(
-            &context.gh,
-            &strings(&[
-                "run",
-                "download",
-                &run_id.to_string(),
-                "--repo",
-                repository,
-                "--name",
-                &artifact_name,
-                "--dir",
-                &staging.to_string_lossy(),
-            ]),
-            &work,
-        )
-        .map_err(|_| anyhow::anyhow!("ARTIFACT_DOWNLOAD_FAILED"))?;
-        let entries: Vec<_> = fs::read_dir(&staging)?.collect::<std::io::Result<_>>()?;
+        let runs = context.api(&format!(
+            "actions/runs?head_sha={commit}&event=push&per_page=100"
+        ))?;
+        let run = runs["workflow_runs"]
+            .as_array()
+            .and_then(|runs| {
+                runs.iter()
+                    .filter(|run| {
+                        run["name"] == "CI"
+                            && run["head_sha"] == commit
+                            && run["event"] == "push"
+                            && run["head_branch"] == format!("release/{version}")
+                    })
+                    .max_by_key(|run| {
+                        (
+                            run["id"].as_u64().unwrap_or(0),
+                            run["run_attempt"].as_u64().unwrap_or(0),
+                        )
+                    })
+            })
+            .ok_or_else(|| anyhow::anyhow!("RELEASE_CI_NOT_SUCCESSFUL"))?;
         ensure!(
-            entries.len() == 1 && entries[0].file_name().to_string_lossy() == archive_name,
-            "UNEXPECTED_ARTIFACT_CONTENTS"
+            run["status"] == "completed" && run["conclusion"] == "success",
+            "RELEASE_CI_NOT_SUCCESSFUL"
         );
-        no_links(&staging.join(&archive_name), false)?;
-        parse_tar(&fs::read(staging.join(&archive_name))?)?
+        let run_id = run["id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("RELEASE_CI_NOT_SUCCESSFUL"))?;
+        let artifacts = context.api(&format!("actions/runs/{run_id}/artifacts?per_page=100"))?;
+        let artifact = artifacts["artifacts"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["name"] == artifact_name)
+                    .max_by_key(|item| item["id"].as_u64().unwrap_or(0))
+            })
+            .ok_or_else(|| anyhow::anyhow!("RELEASE_ARTIFACT_UNAVAILABLE"))?;
+        ensure!(
+            artifact["expired"] == false
+                && artifact["expires_at"]
+                    .as_str()
+                    .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+                    .is_some_and(|date| date > chrono::Utc::now()),
+            "RELEASE_ARTIFACT_UNAVAILABLE"
+        );
+        let artifact_id = artifact["id"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("RELEASE_ARTIFACT_UNAVAILABLE"))?;
+        let digest = artifact["digest"].as_str().unwrap_or("");
+        if native {
+            ensure!(
+                digest
+                    .strip_prefix("sha256:")
+                    .is_some_and(|hash| hex(hash, 64)),
+                "ARTIFACT_DIGEST_UNAVAILABLE"
+            );
+        }
+        let evidence = json!({"version":version,"sha":commit,"runId":run_id,"artifactId":artifact_id,"workRoot":work});
+        if args.contains_key("--check-published") {
+            let mut result = evidence;
+            result["status"] = json!("published");
+            return Ok(result);
+        }
+        no_links(&staging, true)?;
+        fs::create_dir(&staging)?;
+        let incoming = if native {
+            let bytes = execute(
+                &context.gh,
+                &strings(&[
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    &format!("repos/{repository}/actions/artifacts/{artifact_id}/zip"),
+                ]),
+                &work,
+            )
+            .map_err(|_| anyhow::anyhow!("ARTIFACT_DOWNLOAD_FAILED"))?;
+            ensure!(
+                format!("sha256:{}", sha(&bytes)) == digest,
+                "ARTIFACT_DIGEST_MISMATCH"
+            );
+            parse_tar(&read_zip(&bytes, &archive_name)?)?
+        } else {
+            execute(
+                &context.gh,
+                &strings(&[
+                    "run",
+                    "download",
+                    &run_id.to_string(),
+                    "--repo",
+                    &format!("github.com/{repository}"),
+                    "--name",
+                    &artifact_name,
+                    "--dir",
+                    &staging.to_string_lossy(),
+                ]),
+                &work,
+            )
+            .map_err(|_| anyhow::anyhow!("ARTIFACT_DOWNLOAD_FAILED"))?;
+            let entries: Vec<_> = fs::read_dir(&staging)?.collect::<std::io::Result<_>>()?;
+            ensure!(
+                entries.len() == 1 && entries[0].file_name().to_string_lossy() == archive_name,
+                "UNEXPECTED_ARTIFACT_CONTENTS"
+            );
+            no_links(&staging.join(&archive_name), false)?;
+            parse_tar(&fs::read(staging.join(&archive_name))?)?
+        };
+        if native {
+            verify_native(&incoming, commit, version, target, &tree)?;
+        } else {
+            verify_sources(&incoming, &tree, false)?;
+        }
+        let receipt = if native {
+            Some(
+                json!({"schema":1,"sourceCommit":commit,"target":target,"manifestSha256":sha(incoming.get("native-build.json").unwrap()),"artifactDigest":digest,"artifactId":artifact_id,"runId":run_id}),
+            )
+        } else {
+            None
+        };
+        (incoming, evidence, receipt)
     };
-    if native {
-        verify_native(&incoming, commit, version, target, &tree)?;
-    } else {
-        verify_sources(&incoming, &tree, false)?;
-    }
     let wanted = hashes(&incoming);
-    let local = hashes(&files_at(&source)?);
-    let cached = hashes(&files_at(&cache_path(&installed)?)?);
+    let local = hashes_at(&source)?;
+    let cached = hashes_at(&cache_path(&installed)?)?;
     for (name, hash) in &local {
         ensure!(
             cached.get(name) == Some(hash) || wanted.get(name) == Some(hash),
@@ -1116,10 +1461,20 @@ fn update(argv: &[String]) -> Result<Value> {
         );
     }
     // A minimal receipt survives CI retention expiry. It authenticates the installed build manifest.
-    if native {
-        let receipt = json!({"schema":1,"sourceCommit":commit,"target":target,"manifestSha256":sha(incoming.get("native-build.json").unwrap()),"artifactDigest":digest,"artifactId":artifact_id,"runId":run_id});
+    if let Some(receipt) = receipt {
         no_links(&receipt_path, true)?;
-        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+        private_work::validate_receipt(&receipt_path)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write as _;
+        options
+            .open(&receipt_path)?
+            .write_all(&serde_json::to_vec_pretty(&receipt)?)?;
     }
     if installed["version"] == *version && local == wanted && cached == wanted {
         let mut result = evidence;
@@ -1148,15 +1503,14 @@ fn update(argv: &[String]) -> Result<Value> {
             }
         }
         ensure!(
-            hashes(&files_at(&replacement)?) == wanted,
+            hashes_at(&replacement)? == wanted,
             "SOURCE_COPY_VERIFICATION_FAILED"
         );
         // Same-volume rename preserves the previous source without deleting obsolete legacy assets.
         let backup = source.with_file_name(format!("remnifold-backup-{}", uuid::Uuid::new_v4()));
         no_links(&backup, true)?;
         ensure!(
-            hashes(&files_at(&source)?) == local
-                && hashes(&files_at(&cache_path(&installed)?)?) == cached,
+            hashes_at(&source)? == local && hashes_at(&cache_path(&installed)?)? == cached,
             "LOCAL_SOURCE_MODIFIED"
         );
         fs::rename(&source, &backup)?;
@@ -1171,7 +1525,7 @@ fn update(argv: &[String]) -> Result<Value> {
         )?;
     }
     ensure!(
-        hashes(&files_at(&source)?) == wanted,
+        hashes_at(&source)? == wanted,
         "SOURCE_COPY_VERIFICATION_FAILED"
     );
     let added = context.cli(
@@ -1182,8 +1536,8 @@ fn update(argv: &[String]) -> Result<Value> {
     let after = context.installed(&source)?;
     ensure!(
         after["version"] == *version
-            && hashes(&files_at(&source)?) == wanted
-            && hashes(&files_at(&cache_path(&after)?)?) == wanted,
+            && hashes_at(&source)? == wanted
+            && hashes_at(&cache_path(&after)?)? == wanted,
         "INSTALLED_PLUGIN_CONTENT_MISMATCH"
     );
     let mut result = evidence;

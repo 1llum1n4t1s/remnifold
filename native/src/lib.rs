@@ -1,7 +1,12 @@
 pub mod capture;
 pub mod common;
+pub mod embedded;
 pub mod hooks;
+pub mod live_test;
 pub mod local;
 pub mod mcp;
+pub mod provision;
+pub mod release_manifest;
 pub mod search;
+pub mod topics_setup;
 pub mod updater;

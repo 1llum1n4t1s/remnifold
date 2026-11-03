@@ -8,6 +8,7 @@ use std::{
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::{LazyLock, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -44,23 +45,55 @@ pub fn failure_message(error: &anyhow::Error) -> String {
         "Remnifold capture failed; unacknowledged records will be retried. [stage={s}; cause={c}; action={a}]\n"
     )
 }
-fn re(p: &str) -> Regex {
+fn compile_regex(p: &str) -> Regex {
     // JavaScript's word boundary is ASCII, including next to Japanese prose.
     Regex::new(&p.replace(r"\b", r"(?-u:\b)")).expect("constant regex")
 }
+// 固定式だけを呼出し箇所ごとに共有し、動的なskill名は保持しない。
+macro_rules! re {
+    ($pattern:literal) => {{
+        static PATTERN: LazyLock<Regex> = LazyLock::new(|| compile_regex($pattern));
+        &*PATTERN
+    }};
+}
 fn strip_tag(s: &str, tag: &str) -> String {
-    re(&format!(
-        r"(?is)<{}\b[^>]*>.*?</{}\s*>",
-        regex::escape(tag),
-        regex::escape(tag)
-    ))
-    .replace_all(s, "")
-    .into_owned()
+    static TAGS: LazyLock<HashMap<&'static str, OnceLock<Regex>>> = LazyLock::new(|| {
+        [
+            "recommended_plugins",
+            "environment_context",
+            "codex_internal_context",
+            "remnifold-context",
+            "remnifold-recall",
+            "remnifold-index",
+            "kagayoi-memory-context",
+            "kagayoi-memory-recall",
+            "kagayoi-memory-index",
+            "supermemory-context",
+            "supermemory-recall",
+            "supermemory-index",
+            "system-reminder",
+            "supermemory-containers",
+            "image",
+        ]
+        .into_iter()
+        .map(|tag| (tag, OnceLock::new()))
+        .collect()
+    });
+    TAGS[tag]
+        .get_or_init(|| {
+            compile_regex(&format!(
+                r"(?is)<{}\b[^>]*>.*?</{}\s*>",
+                regex::escape(tag),
+                regex::escape(tag)
+            ))
+        })
+        .replace_all(s, "")
+        .into_owned()
 }
 
 pub fn clean_user_request(value: &str) -> String {
     let mut s = value.replace("\r\n", "\n").trim().to_string();
-    let agents = re(r"(?i)^# AGENTS\.md instructions(?: for [^\n]*)?\s*\n");
+    let agents = re!(r"(?i)^# AGENTS\.md instructions(?: for [^\n]*)?\s*\n");
     if agents.is_match(&s) {
         return String::new();
     }
@@ -83,7 +116,7 @@ pub fn clean_user_request(value: &str) -> String {
     }
     let mut blocks = Vec::new();
     let mut had = false;
-    s = re(r"(?is)<response-annotations\b[^>]*>(.*?)</response-annotations>")
+    s = re!(r"(?is)<response-annotations\b[^>]*>(.*?)</response-annotations>")
         .replace_all(&s, |c: &regex::Captures| {
             had = true;
             if let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(&c[1]) {
@@ -109,7 +142,7 @@ pub fn clean_user_request(value: &str) -> String {
             String::new()
         })
         .into_owned();
-    s = re(r"(?s)\[SUPERMEMORY CONTAINERS\].*?\[END SUPERMEMORY CONTAINERS\]")
+    s = re!(r"(?s)\[SUPERMEMORY CONTAINERS\].*?\[END SUPERMEMORY CONTAINERS\]")
         .replace_all(&s, "")
         .into_owned();
     s = strip_tag(&s, "supermemory-containers").trim().to_string();
@@ -165,8 +198,8 @@ fn add_edit(edits: &mut Vec<Edit>, mut start: usize, mut end: usize, value: Stri
 }
 fn projection_edits(s: &str, keep: bool) -> Vec<Edit> {
     let mut edits: Vec<Edit> = vec![];
-    let mut add = |p: &str, replacement: Option<&str>| {
-        for c in re(p).captures_iter(s) {
+    let mut add = |pattern: &Regex, replacement: Option<&str>| {
+        for c in pattern.captures_iter(s) {
             let m = c.get(0).unwrap();
             let value = replacement
                 .map(|_| format!("${}", &c[1]))
@@ -175,28 +208,30 @@ fn projection_edits(s: &str, keep: bool) -> Vec<Edit> {
         }
     };
     add(
-        r"(?is)<skill\b[^>]*>\s*<name>[^<]+</name>\s*<path>[^<]+</path>.*?</skill\s*>",
+        re!(r"(?is)<skill\b[^>]*>\s*<name>[^<]+</name>\s*<path>[^<]+</path>.*?</skill\s*>"),
         None,
     );
     add(
-        r#"(?is)<in-app-browser-context\b[^>]*\bsource\s*=\s*["']ambient-ui-state["'][^>]*>.*?</in-app-browser-context\s*>"#,
+        re!(
+            r#"(?is)<in-app-browser-context\b[^>]*\bsource\s*=\s*["']ambient-ui-state["'][^>]*>.*?</in-app-browser-context\s*>"#
+        ),
         None,
     );
     add(
-        r"(?is)<external_codex_apps_open_page\b[^>]*>.*?</external_codex_apps_open_page\s*>",
+        re!(r"(?is)<external_codex_apps_open_page\b[^>]*>.*?</external_codex_apps_open_page\s*>"),
         None,
     );
     add(
-        r"(?i)\[\$([A-Za-z0-9_:-]+)\]\([^\r\n)]*\bSKILL\.md(?:[?#][^\r\n)]*)?\)",
+        re!(r"(?i)\[\$([A-Za-z0-9_:-]+)\]\([^\r\n)]*\bSKILL\.md(?:[?#][^\r\n)]*)?\)"),
         if keep { Some("") } else { None },
     );
     if !keep {
         for c in
-            re(r"(?is)<skill\b[^>]*>\s*<name>([A-Za-z0-9_:-]+)</name>\s*<path>").captures_iter(s)
+            re!(r"(?is)<skill\b[^>]*>\s*<name>([A-Za-z0-9_:-]+)</name>\s*<path>").captures_iter(s)
         {
             // Preserve whitespace after the invocation, just as the original zero-width assertion does.
             let p = format!(r"(?im)^[ \t]*[$/]{}(?:\s|$)", regex::escape(&c[1]));
-            for m in re(&p).find_iter(s) {
+            for m in compile_regex(&p).find_iter(s) {
                 let mut end = m.end();
                 if let Some(ch) = m.as_str().chars().last() {
                     if ch.is_whitespace() {
@@ -235,11 +270,11 @@ pub fn project_request_text(value: &str, keep_invocation: bool) -> String {
     )
 }
 pub fn project_document_content(value: &str) -> String {
-    let Some(m) = re(r"(?m)^### User request\s*\n").find(value) else {
+    let Some(m) = re!(r"(?m)^### User request\s*\n").find(value) else {
         return value.to_string();
     };
     let start = m.end();
-    let end = re(r"(?m)^### Final assistant response\s*$")
+    let end = re!(r"(?m)^### Final assistant response\s*$")
         .find(&value[start..])
         .map(|m| start + m.start())
         .unwrap_or(value.len());
@@ -252,11 +287,11 @@ pub fn project_document_content(value: &str) -> String {
 }
 
 pub fn sanitize_text(value: &str, secrets: &[&str], count: &mut usize) -> String {
-    let mut s = re(r"(?is)<private>.*?</private>")
+    let mut s = re!(r"(?is)<private>.*?</private>")
         .replace_all(value, "[REDACTED]")
         .into_owned();
     s = strip_tag(&s, "system-reminder");
-    s=re(r"(?is)<(?:remnifold|kagayoi-memory|supermemory)-context>.*?</(?:remnifold|kagayoi-memory|supermemory)-context>").replace_all(&s,"").into_owned();
+    s=re!(r"(?is)<(?:remnifold|kagayoi-memory|supermemory)-context>.*?</(?:remnifold|kagayoi-memory|supermemory)-context>").replace_all(&s,"").into_owned();
     s = s.replace("\r\n", "\n").trim().to_string();
     for secret in secrets {
         if !secret.is_empty() && s.contains(secret) {
@@ -264,38 +299,47 @@ pub fn sanitize_text(value: &str, secrets: &[&str], count: &mut usize) -> String
             *count += 1
         }
     }
-    let patterns = [
-        (
-            r"(?s)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*?-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
-            "[REDACTED]",
-        ),
-        (
-            r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b",
-            "Bearer [REDACTED]",
-        ),
-    ];
-    for (p, r) in patterns {
-        s = re(p)
+    static PATTERNS: LazyLock<[(Regex, &str); 2]> = LazyLock::new(|| {
+        [
+            (
+                compile_regex(
+                    r"(?s)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*?-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
+                ),
+                "[REDACTED]",
+            ),
+            (
+                compile_regex(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b"),
+                "Bearer [REDACTED]",
+            ),
+        ]
+    });
+    for (pattern, r) in PATTERNS.iter() {
+        s = pattern
             .replace_all(&s, |_: &regex::Captures| {
                 *count += 1;
-                r.to_string()
+                (*r).to_string()
             })
             .into_owned()
     }
-    let name = r"(?:[a-z0-9]+[_-])*(?:api[_-]?key|api[_-]?token|access[_-]?key|access[_-]?token|refresh[_-]?token|authorization|auth[_-]?token|client[_-]?secret|secret|password|private[_-]?key|token)";
-    let quoted = r#"(?:"((?:\\[\s\S]|[^"\\])*)"|'((?:\\[\s\S]|''|[^'\\])*)'|(\[REDACTED\]|[^\s,"'`}\]\)]+))"#;
-    let shell = r#"(?:"((?:\\[\s\S]|\x60[\s\S]|[^"\\\x60])*)"|'((?:\\[\s\S]|''|[^'\\])*)'|(\[REDACTED\]|[^\s,"'`}\]\)]+))"#;
-    for (prefix, val) in [
-        (format!(r#"(?<![A-Za-z0-9_-])(["'])({name})\1"#), quoted),
-        (
-            format!(r#"(?<![A-Za-z0-9_"'-])(?<!\$env:)()({name})"#),
-            quoted,
-        ),
-        (format!(r"(?<=\$env:)()({name})"), shell),
-    ] {
-        let pattern = fancy_regex::Regex::new(&format!("(?i){prefix}(\\s*[:=]\\s*){val}")).unwrap();
+    static ASSIGNMENTS: LazyLock<[fancy_regex::Regex; 3]> = LazyLock::new(|| {
+        let name = r"(?:[a-z0-9]+[_-])*(?:api[_-]?key|api[_-]?token|access[_-]?key|access[_-]?token|refresh[_-]?token|authorization|auth[_-]?token|client[_-]?secret|secret|password|private[_-]?key|token)";
+        let quoted = r#"(?:"((?:\\[\s\S]|[^"\\])*)"|'((?:\\[\s\S]|''|[^'\\])*)'|(\[REDACTED\]|[^\s,"'`}\]\)]+))"#;
+        let shell = r#"(?:"((?:\\[\s\S]|\x60[\s\S]|[^"\\\x60])*)"|'((?:\\[\s\S]|''|[^'\\])*)'|(\[REDACTED\]|[^\s,"'`}\]\)]+))"#;
+        [
+            (format!(r#"(?<![A-Za-z0-9_-])(["'])({name})\1"#), quoted),
+            (
+                format!(r#"(?<![A-Za-z0-9_"'-])(?<!\$env:)()({name})"#),
+                quoted,
+            ),
+            (format!(r"(?<=\$env:)()({name})"), shell),
+        ]
+        .map(|(prefix, val)| {
+            fancy_regex::Regex::new(&format!("(?i){prefix}(\\s*[:=]\\s*){val}")).unwrap()
+        })
+    });
+    for pattern in ASSIGNMENTS.iter() {
         s = pattern
-            .replace_all(&s, |c: &fancy_regex::Captures| {
+            .replace_all(&s, |c: &fancy_regex::Captures<str>| {
                 let q = if c.get(4).is_some() {
                     "\""
                 } else if c.get(5).is_some() {
@@ -312,8 +356,8 @@ pub fn sanitize_text(value: &str, secrets: &[&str], count: &mut usize) -> String
             })
             .into_owned();
     }
-    s=re(r"(?i)([?&](?:api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|authorization|auth[_-]?token|client[_-]?secret|secret|password|token)=)[^&#\s]+").replace_all(&s,|c:&regex::Captures|{*count+=1;format!("{}[REDACTED]",&c[1])}).into_owned();
-    s=re(r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|sm_[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})\b").replace_all(&s,|_:&regex::Captures|{*count+=1;"[REDACTED]"}).into_owned();
+    s=re!(r"(?i)([?&](?:api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|authorization|auth[_-]?token|client[_-]?secret|secret|password|token)=)[^&#\s]+").replace_all(&s,|c:&regex::Captures|{*count+=1;format!("{}[REDACTED]",&c[1])}).into_owned();
+    s=re!(r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|sm_[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})\b").replace_all(&s,|_:&regex::Captures|{*count+=1;"[REDACTED]"}).into_owned();
     s.trim().to_string()
 }
 
@@ -537,16 +581,6 @@ fn titles(home: &Path) -> Result<HashMap<String, String>> {
 fn utf16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
-fn boundary(s: &str, limit: usize) -> usize {
-    let mut n = 0;
-    for (i, c) in s.char_indices() {
-        n += c.len_utf16();
-        if n > limit {
-            return i;
-        }
-    }
-    s.len()
-}
 pub fn build_turn_documents(
     candidate: &Candidate,
     transcript: &Transcript,
@@ -606,8 +640,19 @@ pub fn build_turn_documents(
         }
         let mut parts = vec![];
         let mut start = 0;
+        let mut cursor = body.char_indices().peekable();
+        let mut consumed_units = 0;
         for offset in (0..units.len()).step_by(size) {
-            let end = boundary(&body, (offset + size).min(units.len()));
+            let limit = (offset + size).min(units.len());
+            // surrogateの途中ならその文字を次のpartへ残す。hashは旧UTF-16境界を使う。
+            while let Some(&(_, ch)) = cursor.peek() {
+                if consumed_units + ch.len_utf16() > limit {
+                    break;
+                }
+                consumed_units += ch.len_utf16();
+                cursor.next();
+            }
+            let end = cursor.peek().map(|&(index, _)| index).unwrap_or(body.len());
             let old = String::from_utf16_lossy(&units[offset..(offset + size).min(units.len())]);
             parts.push((
                 project_slice(&body, start, end, &edits),
@@ -625,7 +670,7 @@ pub fn build_turn_documents(
         for (p, (content, hash)) in parts.iter().enumerate() {
             let key = format!("{identity}:{}:{hash}", p + 1);
             let mut index = memory_index.clone();
-            if re(r"(?m)^### (?:User request|Final assistant response)\s*$")
+            if re!(r"(?m)^### (?:User request|Final assistant response)\s*$")
                 .replace_all(content, "")
                 .trim()
                 .is_empty()
@@ -1210,6 +1255,64 @@ mod tests {
         assert_eq!(transcript.turns[0].assistant, "done\0😀");
         assert_eq!(transcript.turns[0].source_timestamp, "2026-01-01T00:00:00Z");
         assert_eq!(transcript.redactions, 2);
+    }
+
+    #[test]
+    fn multipart_preserves_three_split_surrogates_and_legacy_ids() {
+        let candidate = Candidate {
+            file_path: PathBuf::new(),
+            meta: json!({"id":"session","rootSessionId":"session","isSubagent":false}),
+            size: 0,
+            modified: SystemTime::UNIX_EPOCH,
+            recent: false,
+        };
+        let transcript = Transcript {
+            turns: vec![Turn {
+                user: format!(
+                    "{}😀{}🚀{}🌸z",
+                    "a".repeat(124),
+                    "b".repeat(140),
+                    "c".repeat(140)
+                ),
+                assistant: "response".into(),
+                source_timestamp: String::new(),
+            }],
+            redactions: 0,
+        };
+        let docs = build_turn_documents(
+            &candidate,
+            &transcript,
+            &json!({"containerTag":"project"}),
+            "Task",
+            256,
+            None,
+        )
+        .unwrap();
+        // JavaScriptの142 UTF-16単位sliceから算出した固定fixture。
+        let hashes = [
+            "3760505106760124",
+            "dfec22f7a0d7ec56",
+            "e2006a3c5e4cf1ae",
+            "e6dd4e12ac9b331d",
+        ];
+        let bodies = [
+            format!("### User request\n{}", "a".repeat(124)),
+            format!("😀{}", "b".repeat(140)),
+            format!("🚀{}", "c".repeat(140)),
+            "🌸z\n\n### Final assistant response\nresponse".into(),
+        ];
+        assert_eq!(docs.len(), 4);
+        for (i, doc) in docs.iter().enumerate() {
+            let key = format!(
+                "session:1:cdf4717441177f49f84b0d1e30f14e92204c2642e665b41341efcd802b099b6f:{}:{}",
+                i + 1,
+                hashes[i]
+            );
+            assert_eq!(doc["customId"], format!("codex-turn-v2:{key}"));
+            assert_eq!(doc["metadata"]["captureKey"], key);
+            assert_eq!(doc["metadata"]["parts"], 4);
+            assert_eq!(doc["content"], format!("# Task\n\n{}", bodies[i]));
+        }
     }
 
     #[test]

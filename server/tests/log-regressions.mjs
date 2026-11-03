@@ -1,53 +1,16 @@
-// 実行: node --experimental-transform-types server/tests/log-regressions.mjs
+// 実行: cargo xtask server-test
 // 認証済み Worker API、全 migration 適用済み SQLite、非同期完了を通す統合検証。
-import assert from "node:assert/strict";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import test, { assert } from "./support/test.mjs";
 import worker from "../src/index.ts";
-import { adapter } from "./d1-adapter.mjs";
+import { checkpoint, embedding, fixture, migrations, output } from "./worker-fixture.mjs";
 
-const artifactPath = resolve(import.meta.dirname, "../../dist/server-log-validation.json");
-const migrations = readdirSync(resolve(import.meta.dirname, "../migrations")).filter((name) => name.endsWith(".sql")).sort();
-const checkpoint = { title: "Checkpoint", overview: "Verified restart state.", verified: ["Sources stored."], unverified: [], unresolved: [], nextActions: [] };
-const output = (value, finish_reason = "stop") => ({ choices: [{ finish_reason, message: { content: typeof value === "string" ? value : JSON.stringify(value) } }] });
-const embedding = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
 
-function fixture() {
-  const db = new DatabaseSync(":memory:");
-  db.exec("PRAGMA foreign_keys = ON");
-  for (const migration of migrations) db.exec(readFileSync(resolve(import.meta.dirname, "../migrations", migration), "utf8"));
-  const DB = adapter(db);
-  const waits = [];
-  const ctx = { waitUntil(promise) { waits.push(Promise.resolve(promise).then(() => ({ status: "fulfilled" }), (error) => ({ status: "rejected", error: String(error) }))); } };
-  const calls = [];
-  let respond = async () => output(checkpoint);
-  const env = { DB, MEMORY_API_KEY: "local-fixture", AI_ENRICHMENT_MODE: "off",
-    AI: { run: async (_model, input) => {
-      if (input.text) return { data: [embedding] };
-      if (input.response_format?.json_schema?.name === "memory_consolidation") { calls.push(input); return respond(input, calls.length); }
-      return output({ facts: [{ subject: "Source", predicate: "has", object: "evidence", confidence: 1, exclusive: false }], topics: ["Validation"] });
-    } },
-    MEMORY_VECTORS: { upsert: async () => ({ mutationId: "local-vector" }), deleteByIds: async () => ({}), getByIds: async () => [] },
-  };
-  const api = async (path, body, method = "POST") => {
-    const response = await worker.fetch(new Request(`https://local.example${path}`, { method,
-      headers: { Authorization: "Bearer local-fixture", "Content-Type": "application/json" }, body: JSON.stringify(body) }), env, ctx);
-    return { status: response.status, body: response.status === 204 ? null : await response.json() };
-  };
-  return { db, DB, env, ctx, calls, api, respond(callback) { respond = callback; },
-    drain: async () => { const results = []; while (waits.length) results.push(...await Promise.all(waits.splice(0))); return results; },
-    seed: async (count = 2) => { const ids = []; env.AI_ENRICHMENT_MODE = "off";
-      for (let i = 0; i < count; i++) { const saved = await api("/v3/documents", { containerTag: "memories", customId: `source-${i}`, content: `Verified source ${i}`, metadata: { sm_project_id: "log-project" } }); assert.equal(saved.status, 201, JSON.stringify(saved.body)); ids.push(saved.body.id); }
-      env.AI_ENRICHMENT_MODE = "on"; return ids; },
-    consolidate: () => api("/v4/consolidate", { projectId: "log-project", force: true }),
-    active: () => db.prepare("SELECT * FROM memory_consolidations WHERE status = 'active'").all(),
-    lease: () => db.prepare("SELECT lease_token FROM memory_consolidation_projects").get()?.lease_token,
-  };
-}
 
-const cases = [];
-function scenario(name, run) { cases.push({ name, run }); }
+function scenario(name, run) { test(name, async () => {
+ const f=fixture(); const logs=[]; const original={log:console.log,error:console.error,warn:console.warn};
+ const capture=(...values)=>{for(const value of values){try{logs.push(JSON.parse(value))}catch{}}};Object.keys(original).forEach(k=>console[k]=capture);
+ try { await run(f, logs); } catch(error) { original.error(JSON.stringify({test:name,events:logs})); throw error; } finally { await f.drain(); Object.assign(console,original); f.db.close(); }
+}); }
 scenario("truncated output retries once with compact schema and identical source input", async (f) => {
   const ids = await f.seed(41);
   f.respond(async (_input, call) => call === 1 ? output(checkpoint, "length") : output(checkpoint));
@@ -379,18 +342,3 @@ scenario("restored vector repair failure persists safe diagnostics and permits l
   assert.equal(row.enrichment_error.length, 2_000); assert.ok(!row.enrichment_error.includes(f.env.MEMORY_API_KEY));
   boundedDiagnostics(f, logs, "vector_restore_after_delete_failed");
 });
-
-const report = { command: "node --experimental-transform-types server/tests/log-regressions.mjs", node: process.version, migrations, scope: "authenticated Worker API and scheduled entry points with migrated real SQLite and deterministic local AI/vector fixtures", results: [] };
-for (const { name, run } of cases) {
-  const f = fixture(); const logs = []; const original = { log: console.log, error: console.error, warn: console.warn };
-  const capture = (...values) => { for (const value of values) { try { logs.push(JSON.parse(value)); } catch { /* 非 JSON ログは成果物へ転記しない。 */ } } };
-  console.log = capture; console.error = capture; console.warn = capture;
-  try { await run(f, logs); report.results.push({ name, status: "passed", events: logs.map((entry) => ({ event: entry.event, ok: entry.ok, cron: entry.cron, facts: entry.facts, topics: entry.topics, attempt: entry.attempt, finishReason: entry.finishReason, sourceCount: entry.sourceCount, retrying: entry.retrying, errors: entry.errors, error: entry.error })) }); }
-  catch (error) { report.results.push({ name, status: "failed", error: String(error), events: logs.map((entry) => ({ event: entry.event, error: entry.error })) }); }
-  finally { await f.drain(); console.log = original.log; console.error = original.error; console.warn = original.warn; f.db.close(); }
-}
-report.passed = report.results.filter((result) => result.status === "passed").length;
-report.failed = report.results.length - report.passed;
-mkdirSync(resolve(artifactPath, ".."), { recursive: true }); writeFileSync(artifactPath, `${JSON.stringify(report, null, 2)}\n`);
-console.log(JSON.stringify({ artifact: artifactPath, passed: report.passed, failed: report.failed }));
-if (report.failed) process.exitCode = 1;

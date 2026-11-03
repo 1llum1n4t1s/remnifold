@@ -1,4 +1,5 @@
 //! Exercise the shipped hook command against authenticated loopback HTTP.
+mod support;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -11,7 +12,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Fixture {
@@ -164,6 +165,7 @@ impl Drop for Fixture {
 
 fn hook(root: &Path, url: &str, event: &str, input: &[u8]) -> Value {
     let mut command = Command::new(env!("CARGO_BIN_EXE_remnifold"));
+    support::isolate(&mut command);
     command
         .args(["hook", event])
         .env("CODEX_HOME", root)
@@ -181,18 +183,7 @@ fn hook(root: &Path, url: &str, event: &str, input: &[u8]) -> Value {
     ] {
         command.env_remove(name);
     }
-    let mut child = command.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("hook command exceeded bounded 15-second wait");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().unwrap();
+    let output = support::run(&mut command, input, Duration::from_secs(15)).unwrap();
     assert!(
         output.status.success(),
         "hook failed: {}",

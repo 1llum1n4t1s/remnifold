@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'PreToolUse'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "command": "cargo run --quiet --locked --manifest-path \"${PLUGIN_ROOT}/native/Cargo.toml\" -- hook PreToolUse",
             "timeout": 5,
             "statusMessage": "Checking memory access..."
           }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'SessionStart'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "command": "cargo run --quiet --locked --manifest-path \"${PLUGIN_ROOT}/native/Cargo.toml\" -- hook SessionStart",
             "timeout": 30,
             "statusMessage": "Loading memory index..."
           }
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'UserPromptSubmit'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "command": "cargo run --quiet --locked --manifest-path \"${PLUGIN_ROOT}/native/Cargo.toml\" -- hook UserPromptSubmit",
             "timeout": 12,
             "statusMessage": "Searching memory index..."
           }
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'Stop'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "command": "cargo run --quiet --locked --manifest-path \"${PLUGIN_ROOT}/native/Cargo.toml\" -- hook Stop",
             "timeout": 120,
             "async": true,
             "statusMessage": "Saving memory index..."
