@@ -95,8 +95,6 @@ Resume state is stored outside the repository and plugin at `<CODEX_HOME>/remnif
 
 Migrations run before deployment and client changes; the additive OAuth migration retains existing documents, physical spaces, provenance, and `sm_*` metadata. A supplied memory key enables authenticated session, remote MCP initialization, and required tool discovery checks. Without the local key, setup retains the existing secret and reports that authenticated verification was skipped. Failed steps can be resumed against the same resources. Capture receipts remain in the existing Codex home and are not migrated to the server.
 
-The native `topics-setup` command previews a finite unclassified-record batch (default 10; `--limit` 1–50). Only `--apply` submits existing asynchronous enrichment, with its AI billing, vector/fact refresh, checkpoint invalidation, opt-outs, and revision guards. Accepted submissions are not completion; inspect documents and topics before the next batch.
-
 ## Remote MCP
 
 The stateless Streamable HTTP endpoint is `/mcp`. It accepts the existing API key as a Bearer credential or MCP-scoped OAuth access tokens issued through protected-resource and authorization-server discovery, public dynamic client registration, authorization code with PKCE S256, refresh, and revocation. Owner consent requires the existing API key. OAuth tokens do not authorize the existing REST API. Remote tools search existing spaces and retrieve or save records using the same backend; they do not move or duplicate stored memories. Server instructions ask clients to search, open details when needed, and save durable results, but client and model behavior determines whether tools are called. The Codex stdio transport and hooks remain separate and unchanged.
