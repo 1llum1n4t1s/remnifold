@@ -1,32 +1,40 @@
 [package]
 name = "remnifold"
-version = "1.0.15"
+version = "1.0.16"
 edition = "2024"
 rust-version = "1.97"
 publish = false
 
 [dependencies]
+same-file = "1.0.6"
+md-5 = "0.11"
+jsonc-parser = { version = "0.34", features = ["serde"] }
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-fancy-regex = "0.17"
+fancy-regex = "0.20"
 flate2 = "1"
 icu_segmenter = { version = "2", features = ["compiled_data"] }
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "multipart"] }
 rpassword = "7"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
-sha1 = "0.10"
+sha2 = "0.11"
+sha1 = "0.11"
 tar = "0.4"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 unicode-normalization = "0.1"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
-[profile.release]
-lto = "thin"
-strip = true
-codegen-units = 1
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[build-dependencies]
+serde_json = "1"
+base64 = "0.23"
+sha2 = "0.11"
+flate2 = "1"
+tar = "0.4"

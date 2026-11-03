@@ -8,7 +8,7 @@ The plugin saves completed work in a shared collection and keeps its project fol
 
 Remote MCP clients connect to the deployed server without installing Node.js or Codex locally. The optional Codex integration requires Codex with plugin and hook support and the package matching your operating system and CPU. Its MCP server, hooks, connection setup, history import, and local plugin updater run as a native executable without Node.js. Local plugin updates also require authenticated GitHub CLI and native Codex CLI.
 
-Server setup and maintenance require Node.js 24.18.0 or later in the 24 series, pnpm 12.16.1, and your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled.
+Server setup and maintenance use the same native executable and your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled. No Node.js, package manager, Wrangler, or Rust installation is required to use the platform package.
 
 ## Connect a remote MCP client
 
@@ -22,19 +22,31 @@ The server asks the AI to search for relevant context, open full records when ne
 
 ## Connect an existing server
 
-Download the matching archive from the successful release commit's [CI artifacts](https://github.com/1llum1n4t1s/remnifold/actions/workflows/ci.yml) and extract it into an external folder.
+Starting with 1.0.16, published native packages are served from [Remnifold updates](https://remnifold-updates.kagayoi.com). Earlier releases retain their existing distribution path. The version index is `releases/<version>/index.json`; its manifest selects a hash-named archive for each target below. Authenticate publication through GitHub before running a downloaded executable; an R2 URL or a commit-status link alone does not establish its origin.
 
-| Platform | Archive |
+| Platform | Rust target |
 | --- | --- |
-| Windows x64 | `remnifold-x86_64-pc-windows-msvc.tar.gz` |
-| Mac Apple Silicon | `remnifold-aarch64-apple-darwin.tar.gz` |
-| Mac Intel | `remnifold-x86_64-apple-darwin.tar.gz` |
-| Linux x64 | `remnifold-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `remnifold-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `x86_64-pc-windows-msvc` |
+| Mac Apple Silicon | `aarch64-apple-darwin` |
+| Mac Intel | `x86_64-apple-darwin` |
+| Linux x64 | `x86_64-unknown-linux-gnu` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` |
 
-In Codex, open the extracted `remnifold` folder and ask: “Use plugin-creator to install this Remnifold plugin in my personal marketplace.” The installer should register the source, validate it, and run `codex plugin add remnifold@personal`.
+For an existing `remnifold@personal` installation, use the native executable's `plugin-update` command with authenticated native GitHub CLI and Codex CLI. The updater verifies the release commit, successful CI publisher logs, R2 manifest, archive hashes, and package source before using Codex's official plugin CLI. Follow the [standalone updater procedure](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update). Publication does not update your installation automatically.
 
-To update an existing `remnifold@personal` installation, including migration from JavaScript to the native version, run the extracted executable's `plugin-update` command using the [standalone updater procedure](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#standalone-local-plugin-update). It verifies the published package and replaces the old managed source through the official Codex plugin CLI while preserving connection and capture state. The old Node updater cannot install native releases. Publishing a release does not update your installation automatically. Building from a source checkout is covered in [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#validation).
+An older 1.0.15 executable cannot discover the new R2 distribution itself. Obtain and review the appropriate bootstrap script from the trusted [GitHub source](https://github.com/1llum1n4t1s/remnifold/tree/main/scripts), saving it outside the work directory. The bootstrap requires native `gh`, the OS shell and tar, plus curl and `sha256sum` or `shasum` on macOS/Linux. It verifies GitHub's publisher-log witness and the archive's size and SHA-256 before extracting a new executable. It calls that executable's `--check-published` by default; installation requires explicit `-Apply` or `--apply`.
+
+```powershell
+.\bootstrap-plugin.ps1 -Version <published-version> -WorkRoot D:/Codex/remnifold/bootstrap
+```
+
+```sh
+bash ./bootstrap-plugin.sh --version <published-version> --work-root /absolute/external/remnifold-bootstrap
+```
+
+Repeat with `-Apply` (Windows) or `--apply` (macOS/Linux) to install and verify. The work directory must remain outside the repository, plugin source, and Codex home, with no linked ancestors; Windows requires a child of `D:/Codex/remnifold`. The scripts retain their invocation directories and never send GitHub credentials to R2. Apply creates a verification receipt; a default publication check creates none. A failed later installation step can leave the receipt for recovery. Do not pipe a network download directly into a shell or bypass your system's script policy. When logs have expired, a fresh download fails closed; an existing verification receipt still supports `--verify-only` without retained R2 objects or CI logs. GitHub access to the release ref and source metadata remains required.
+
+For a first installation, add `-DownloadOnly` (Windows) or `--download-only` (macOS/Linux) to the bootstrap command. This returns the verified archive path without running its executable, requiring an existing plugin, or invoking Codex. On Windows the formal download is copied and rehashed into a new private folder under the OS user profile's `Remnifold/Downloads`; the `D:/Codex/remnifold` work root holds processing state only. Unsafe delivery ancestors are rejected, and existing ACLs are not changed. Extract that archive under `$env:USERPROFILE/plugins` on Windows or `~/plugins` on macOS/Linux, so its source is `$env:USERPROFILE/plugins/remnifold` or `~/plugins/remnifold`, matching the updater default. Open that `remnifold` folder in Codex and ask plugin-creator to register this source in the personal marketplace and install through `codex plugin add remnifold@personal`. For a custom marketplace source, use download-only and the verified executable's `plugin-update --config <absolute-local-config>` procedure instead of the bootstrap's default update mode. Rust is not required. Alternatively, build and verify a platform package from trusted GitHub source using the [Rust development procedure](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md#validation); local checkout checks do not establish release-commit identity. The old JavaScript and native releases without an R2 distribution configuration retain their historical GitHub-artifact update path.
 
 ```powershell
 ./bin/remnifold.exe setup --base-url https://your-worker.example.workers.dev
@@ -48,23 +60,25 @@ To import existing Codex sessions, preview a bounded batch with `./bin/remnifold
 
 ## Create or update a server
 
-```powershell
-pnpm -C server install --frozen-lockfile
-pnpm -C server exec wrangler login
-node scripts/setup-server.mjs
-```
-
-The default command performs read-only discovery and prints the proposed resources. To apply it, supply your chosen API key through the process environment `REMNIFOLD_API_KEY`, then run:
+The package includes the Worker bundle and migrations. Provide a Cloudflare API token through the process environment `CLOUDFLARE_API_TOKEN` or `--token-stdin`, then preview the existing resources:
 
 ```powershell
-node scripts/setup-server.mjs --apply --location apac
+./bin/remnifold.exe server-setup --account-id <Cloudflare-account-id>
 ```
 
-The setup reuses resources by name, checks the Vectorize dimensions and metric, creates missing resources, writes the ignored `server/wrangler.jsonc`, installs the Worker secret, applies D1 migrations, deploys, and verifies the endpoint. For an existing installation, retain its Wrangler configuration and first run the read-only command to check that it selects the existing Worker, D1 database and Vectorize index. If its configuration is unavailable or it used custom names, provide the original names with `--worker-name`, `--database-name`, and `--vector-index-name`; verify the plan before applying. An existing configured D1 ID must match the selected account. Do not create a replacement server or copy memories for this upgrade.
+On macOS and Linux use `./bin/remnifold`. The default is authenticated, read-only discovery. The token needs account read, Workers scripts, D1, and Vectorize permissions; domain or route changes also require the corresponding Zone, Routes, or Custom Domain permissions. Setup does not import Wrangler OAuth credentials. Keep the token and memory API key private.
 
-Apply the server update and migrations before connecting or updating clients. The additive OAuth migration keeps existing REST and Codex clients compatible. Supply the existing key locally as `REMNIFOLD_API_KEY` to verify the authenticated session and remote MCP initialization and discovery of `search_memory`, `getDocument`, and `add_memory`. Supplying a key also writes it to the Worker, so use the existing key rather than an accidental replacement. If no local key is supplied, the existing secret is retained and only health is checked; authenticated verification is explicitly skipped. Use `--base-url` for a custom domain when Wrangler does not report a workers.dev URL. If a step fails, correct the cause and rerun the same command; resource discovery and migrations are safe to resume. The command reports the `/mcp` endpoint after deployment, and reports verified migration only after the authenticated checks pass. `--help` lists all options.
+For an existing installation, pass `--config <absolute-existing-jsonc-path>` to read its configuration without overwriting it. Setup reuses resource names in the order `remnifold`, `kagayoi-memory`, then `cloudflare-supermemory`; explicit `--worker-name`, `--database-name`, and `--vector-index-name` take priority. Check the plan selects the existing Worker, D1 database, and Vectorize index. Configured IDs and vector dimensions/metric must match. Existing bindings, cron schedules, and routes are preserved; conflicts stop setup. Do not create a replacement server or copy memories for this upgrade.
 
-Keep the local Wrangler configuration for future updates. Never commit generated resource IDs, credentials, or `.wrangler/` state. Cloudflare usage is billed to the account that hosts the server.
+When you intend to provision or deploy, provide the chosen memory key through `REMNIFOLD_API_KEY` and apply the plan:
+
+```powershell
+./bin/remnifold.exe server-setup --account-id <Cloudflare-account-id> --apply --location apac
+```
+
+Use the same configuration and names as the preview. `--apply` creates missing resources, installs a supplied key as the Worker secret, applies additive D1 migrations, deploys the embedded Worker, and checks the endpoint. For an existing server, supply its existing key to avoid replacing it unintentionally. Without a supplied key, setup retains the secret and reports authenticated verification as skipped; health alone does not verify migration and MCP access. A supplied key enables session verification, remote MCP initialization, and discovery of `search_memory`, `getDocument`, and `add_memory`.
+
+Apply the server update and migrations before connecting or updating clients. Setup stores resumable configuration outside the repository and plugin in `<CODEX_HOME>/remnifold/server/config.json` (default `~/.codex/remnifold/server/config.json`); `--state <absolute-json-path>` selects another external location. Keep this state for updates, never commit generated IDs or credentials, and rerun the same command after correcting a failed step. Use `--base-url` for an existing custom endpoint and `--help` for all options. Cloudflare usage is billed to the account hosting the server.
 
 ## Memory behavior
 
@@ -90,13 +104,13 @@ Capture failures include fixed `stage`, `cause`, and `action` codes without prin
 
 Topics are derived from record content during the existing Workers AI enrichment step. Classification is asynchronous. Brief acknowledgements without a substantial result, and similar low-information records, remain available to manual search but are excluded from automatic recall and enrichment; explicit topic labels are still retained. Folder names are retained as source metadata. Existing records keep their original document IDs and storage locations and appear in the same topic browser.
 
-Update the server and apply its migrations before installing a client that uses topic browsing or consolidation. To classify old records, use a source checkout with the server maintenance requirements installed and preview a bounded batch using the existing memory connection:
+Update the server and apply its migrations before installing a client that uses topic browsing or consolidation. To classify old records, preview a bounded batch with the platform executable using the existing memory connection:
 
 ```powershell
-node scripts/setup-topics.mjs --limit 10
+./bin/remnifold.exe topics-setup --limit 10
 ```
 
-Add `--apply` to queue the selected records for enrichment. This uses the backend's existing Workers AI billing and refreshes the records' derived enrichment. The result reports accepted jobs, not completed classification. Wait for processing to finish before selecting the next batch; inspect `getDocument` and `listTopics` to verify the result.
+On macOS and Linux use `./bin/remnifold topics-setup --limit 10`. The default batch is 10; `--limit` accepts 1–50. Add `--apply` to queue that finite batch when remote enrichment is intended. This uses existing Workers AI billing, refreshes derived AI/vector/fact enrichment, and invalidates affected project checkpoints while preserving opt-outs and revision guards. The result reports accepted jobs, not completed classification. Wait for processing to finish before selecting the next batch; inspect `getDocument` and `listTopics` to verify the result.
 
 The API key grants access to the records in one server installation. Use separate installations for separate trust boundaries. Redaction reduces accidental secret capture; review what you choose to store in your own backend.
 
