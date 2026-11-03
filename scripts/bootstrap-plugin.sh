@@ -147,7 +147,7 @@ run_bound() {
 }
 query() {
   counter=$((counter+1)); result="$session/query-$counter.txt"
-  run_bound 1048576 120 "$result" gh api --hostname github.com "repos/$repo/$1" --jq "$2"
+  run_bound 1048576 120 "$result" gh api --hostname github.com "repos/$repo${1:+/$1}" --jq "$2"
   value=$(cat "$result")
 }
 query '' 'if .full_name == "1llum1n4t1s/remnifold" and (.id|type)=="number" then .id else error("repository identity") end'

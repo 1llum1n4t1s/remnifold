@@ -346,7 +346,9 @@ function Read-Text([string]$Path) { return [IO.File]::ReadAllText($Path, [Text.U
 function Get-GitHub([string]$Endpoint) {
     $script:Counter++
     $out = Join-Path $Session ('query-' + $script:Counter + '.json')
-    Invoke-Bounded $Gh @('api', '--hostname', 'github.com', "repos/$Repository/$Endpoint", '--jq', '.') $out
+    $resource = "repos/$Repository"
+    if ($Endpoint) { $resource += "/$Endpoint" }
+    Invoke-Bounded $Gh @('api', '--hostname', 'github.com', $resource, '--jq', '.') $out
     return (Read-Text $out | ConvertFrom-Json)
 }
 function Assert-Run($Run) {
