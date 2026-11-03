@@ -158,7 +158,14 @@ jobs:
             {
               printf '### Native validation: %s\n\n' "$CI_TARGET"
               printf 'Validation reports retained during this job (PRs receive no distribution credentials):\n\n'
-              find "$CI_ROOT/validation" -type f -name '*validation.json' -print
+              pwsh -NoLogo -NoProfile -NonInteractive -Command '
+                $ErrorActionPreference = "Stop"
+                $options = [System.IO.EnumerationOptions]::new()
+                $options.RecurseSubdirectories = $true
+                $options.AttributesToSkip = [System.IO.FileAttributes]::ReparsePoint
+                $options.IgnoreInaccessible = $false
+                [System.IO.Directory]::EnumerateFiles((Join-Path $env:CI_ROOT "validation"), "*validation.json", $options)
+              '
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Stage verified native archive in private R2
