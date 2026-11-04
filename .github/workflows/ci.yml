@@ -2,6 +2,12 @@ name: CI
 
 on:
   push:
+    # Dependabot pull requests already run the full matrix on the merge result.
+    branches-ignore:
+      - 'dependabot/**'
+    # Release publication is verified on release/*, not on tag pushes.
+    tags-ignore:
+      - '**'
   pull_request:
   workflow_dispatch:
 
