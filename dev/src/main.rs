@@ -1,3 +1,4 @@
+mod bootstrap_release;
 mod ci;
 #[cfg(test)]
 #[allow(dead_code)]
@@ -39,6 +40,9 @@ fn run() -> Result<()> {
         .to_path_buf();
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());
+    if command == "bootstrap-release" {
+        return bootstrap_release::run(&repo, &args.collect::<Vec<_>>());
+    }
     if command == "r2-stage" {
         return r2::stage(&args.collect::<Vec<_>>());
     }
@@ -59,7 +63,7 @@ fn run() -> Result<()> {
     }
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         println!(
-            "cargo xtask <prepare|type-check|native-test|server-test|client-test|updater-test|package|verify|check>\n\nOptions: --tool-root <absolute-cache> --work-root <absolute-output>\nPackage: --target <Rust target> --binary <executable> --output <archive>\nSource: --source-mode commit|checkout (package/verify default: commit)\nVerify/update tests: --archive <archive> [--legacy-archive <old-JS-package>] [--previous-archive <old-native-package>]"
+            "cargo xtask <prepare|type-check|native-test|server-test|client-test|updater-test|bootstrap-test|package|verify|check>\n\nOptions: --tool-root <absolute-cache> --work-root <absolute-output>\nPackage: --target <Rust target> --binary <executable> --output <archive>\nBootstrap release: bootstrap-release --source-commit <SHA> --work-root <absolute-output> [--apply]\nSource: --source-mode commit|checkout (package/verify default: commit)\nVerify/update tests: --archive <archive> [--legacy-archive <old-JS-package>] [--previous-archive <old-native-package>]"
         );
         return Ok(());
     }
@@ -70,6 +74,7 @@ fn run() -> Result<()> {
         "server-test",
         "client-test",
         "updater-test",
+        "bootstrap-test",
         "package",
         "verify",
         "check",
@@ -132,15 +137,26 @@ fn run() -> Result<()> {
     }
     package::safe_path(&root)?;
     package::safe_path(&work)?;
-    if matches!(command.as_str(), "check" | "updater-test") {
+    if matches!(
+        command.as_str(),
+        "check" | "updater-test" | "bootstrap-test"
+    ) {
         updater_e2e::validate_work_root(&repo, &work)?;
     }
     fs::create_dir_all(&work)?;
-    let configured = tools::prepare(&root)?;
     let binary = options
         .get("--binary")
         .map(PathBuf::from)
         .unwrap_or_else(|| binary_path(&repo, false, None));
+    if command == "bootstrap-test" {
+        return updater_e2e::bootstrap_tests(
+            &repo,
+            &work,
+            &binary,
+            &required_path(&options, "--archive")?,
+        );
+    }
+    let configured = tools::prepare(&root)?;
     match command.as_str() {
         "prepare" => {
             println!("esbuild: {}", configured.esbuild.display());

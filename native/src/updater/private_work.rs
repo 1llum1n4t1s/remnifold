@@ -1,11 +1,31 @@
 //! 更新領域だけを保護し、祖先の差し替えを更新完了まで防ぐ。
-use super::*;
+use anyhow::{Result, bail, ensure};
+use std::{fs, path::Path};
+#[path = "path_safety.rs"]
+#[allow(dead_code)]
+mod path_safety;
+use path_safety::no_links;
+#[cfg(target_os = "macos")]
+#[path = "process.rs"]
+mod acl_process;
+#[cfg(test)]
+#[path = "../test_links.rs"]
+mod test_links;
+#[cfg(all(test, windows))]
+fn absolute(value: &str) -> Result<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(value);
+    ensure!(path.is_absolute(), "INVALID_WORK_ROOT");
+    Ok(path)
+}
 
 #[cfg(not(windows))]
-pub(super) struct PrivateWorkGuard;
+pub(crate) struct PrivateWorkGuard;
 #[cfg(not(windows))]
 impl PrivateWorkGuard {
-    pub(super) fn open(work: &Path) -> Result<Self> {
+    pub(super) fn open_delivery(_work: &Path, _profile: &Path) -> Result<Self> {
+        bail!("WINDOWS_BOOTSTRAP_REQUIRED")
+    }
+    pub(crate) fn open(work: &Path) -> Result<Self> {
         ensure!(work.is_absolute(), "INVALID_WORK_ROOT");
         #[cfg(unix)]
         {
@@ -45,20 +65,16 @@ impl PrivateWorkGuard {
 
 #[cfg(target_os = "macos")]
 fn validate_macos_acl(path: &Path) -> Result<()> {
-    let output = execute_with_limits(
-        &strings(&["/bin/ls"]),
-        &strings(&["-lde", &path.to_string_lossy()]),
-        path.parent().unwrap_or(path),
-        Duration::from_secs(120),
-        1024 * 1024,
-    )
-    .map_err(|_| anyhow::anyhow!("PRIVATE_WORK_ACL_UNSAFE"))?;
+    let mut command = std::process::Command::new("/bin/ls");
+    command.arg("-lde").arg(path);
+    let output = acl_process::run(command, std::time::Duration::from_secs(120), 1024 * 1024)
+        .map_err(|_| anyhow::anyhow!("PRIVATE_WORK_ACL_UNSAFE"))?;
     ensure!(macos_acl_safe(&output), "PRIVATE_WORK_ACL_UNSAFE");
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub(super) fn validate_receipt(path: &Path) -> Result<()> {
+pub(crate) fn validate_receipt(path: &Path) -> Result<()> {
     let info = match fs::symlink_metadata(path) {
         Ok(info) => info,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -325,8 +341,25 @@ mod windows {
         fn sid(&self) -> PSID {
             unsafe { (*self.token.as_ptr().cast::<TOKEN_USER>()).User.Sid }
         }
+        #[cfg(test)]
         fn trusted_sid(&self, sid: PSID) -> Result<bool> {
+            self.trusted_sid_policy(sid, false)
+        }
+        fn trusted_sid_policy(&self, sid: PSID, ancestor: bool) -> Result<bool> {
             if unsafe { EqualSid(sid, self.sid()) } != 0 {
+                return Ok(true);
+            }
+            let text: Vec<u16> = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut installer = std::ptr::null_mut();
+            ensure!(
+                unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut installer) } != 0,
+                "PRIVATE_WORK_IDENTITY_FAILED"
+            );
+            let _installer = LocalMemory(installer);
+            if ancestor && unsafe { EqualSid(sid, installer) } != 0 {
                 return Ok(true);
             }
             for kind in [WinLocalSystemSid, WinBuiltinAdministratorsSid] {
@@ -350,6 +383,9 @@ mod windows {
             Ok(false)
         }
         fn validate(&self, root: &fs::File) -> Result<()> {
+            self.validate_policy(root, false)
+        }
+        fn validate_policy(&self, root: &fs::File, ancestor: bool) -> Result<()> {
             unsafe {
                 let mut owner = std::ptr::null_mut();
                 let mut descriptor = std::ptr::null_mut();
@@ -365,7 +401,7 @@ mod windows {
                 );
                 let _descriptor = LocalMemory(descriptor);
                 ensure!(
-                    result == 0 && !owner.is_null() && self.trusted_sid(owner)?,
+                    result == 0 && !owner.is_null() && self.trusted_sid_policy(owner, ancestor)?,
                     "PRIVATE_WORK_OWNER_MISMATCH"
                 );
                 let mut present = 0;
@@ -406,9 +442,20 @@ mod windows {
                         | SYNCHRONIZE
                         | GENERIC_READ
                         | GENERIC_EXECUTE;
-                    if allowed.Mask & !read_only != 0 {
+                    if header.AceFlags & 8 != 0 {
+                        continue;
+                    }
+                    let unsafe_mask = if ancestor {
+                        allowed.Mask & 0x500D0040
+                    } else {
+                        allowed.Mask & !read_only
+                    };
+                    if unsafe_mask != 0 {
                         let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast();
-                        ensure!(self.trusted_sid(sid)?, "PRIVATE_WORK_ACL_UNSAFE");
+                        ensure!(
+                            self.trusted_sid_policy(sid, ancestor)?,
+                            "PRIVATE_WORK_ACL_UNSAFE"
+                        );
                     }
                 }
                 Ok(())
@@ -432,10 +479,10 @@ mod windows {
         }
     }
 
-    pub(in crate::updater) struct PrivateWorkGuard {
+    pub(crate) struct PrivateWorkGuard {
         _locks: Vec<fs::File>,
     }
-    pub(in crate::updater) fn validate_receipt(path: &Path) -> Result<()> {
+    pub(crate) fn validate_receipt(path: &Path) -> Result<()> {
         match fs::symlink_metadata(path) {
             Ok(info) => ensure!(
                 info.is_file() && !info.file_type().is_symlink(),
@@ -466,7 +513,14 @@ mod windows {
             .map_err(|_| anyhow::anyhow!("NATIVE_RECEIPT_UNSAFE"))
     }
     impl PrivateWorkGuard {
-        pub(in crate::updater) fn open(work: &Path) -> Result<Self> {
+        pub(crate) fn open(work: &Path) -> Result<Self> {
+            Self::open_policy(work, None)
+        }
+        pub(crate) fn open_delivery(work: &Path, profile: &Path) -> Result<Self> {
+            ensure!(work.starts_with(profile), "INVALID_DELIVERY_ROOT");
+            Self::open_policy(work, Some(profile))
+        }
+        fn open_policy(work: &Path, delivery: Option<&Path>) -> Result<Self> {
             ensure!(work.is_absolute(), "INVALID_WORK_ROOT");
             let identity = Identity::current()?;
             let mut locks = Vec::new();
@@ -480,7 +534,12 @@ mod windows {
                     Err(_) => bail!("PRIVATE_WORK_OPEN_FAILED"),
                 }
                 // LIST_DIRECTORY がある handle を DELETE 共有なしで保持する。
-                let access = FILE_LIST_DIRECTORY | if path == work { READ_CONTROL } else { 0 };
+                let access = FILE_LIST_DIRECTORY
+                    | if path == work || delivery.is_some() {
+                        READ_CONTROL
+                    } else {
+                        0
+                    };
                 let handle = fs::OpenOptions::new()
                     .access_mode(access)
                     .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -493,8 +552,10 @@ mod windows {
                     "LINK_PATH_REJECTED"
                 );
                 no_links(path, false)?;
-                if path == work {
+                if path == work || delivery.is_some_and(|profile| path.starts_with(profile)) {
                     identity.validate(&handle)?;
+                } else if delivery.is_some() {
+                    identity.validate_policy(&handle, true)?;
                 }
                 locks.push(handle);
             }
@@ -788,7 +849,7 @@ mod windows {
             let _guard = PrivateWorkGuard::open(&new_work).unwrap();
             assert!(new_work.is_dir());
             let alias = root.join("reparse-work");
-            crate::updater::test_links::directory_link(&source, &alias).unwrap();
+            super::super::test_links::directory_link(&source, &alias).unwrap();
             assert!(
                 matches!(PrivateWorkGuard::open(&alias),Err(error) if error.to_string() == "LINK_PATH_REJECTED")
             );
@@ -798,6 +859,6 @@ mod windows {
     }
 }
 #[cfg(windows)]
-pub(super) use windows::PrivateWorkGuard;
+pub(crate) use windows::PrivateWorkGuard;
 #[cfg(windows)]
-pub(super) use windows::validate_receipt;
+pub(crate) use windows::validate_receipt;

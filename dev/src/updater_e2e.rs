@@ -226,6 +226,80 @@ impl Fixture {
     fn run(&self, mode: &str, work: Option<&Path>, from_source: bool) -> Result<Value> {
         self.run_hook_environment(mode, work, from_source, None)
     }
+    fn bootstrap(&self, modes: &[&str], config: Option<&Path>) -> Result<Value> {
+        let mut command = Command::new(&self.binary);
+        for (name, _) in std::env::vars_os() {
+            let key = name.to_string_lossy().to_ascii_uppercase();
+            if (key.starts_with("REMNIFOLD_") && key != "REMNIFOLD_KEEP_TEST_STATE")
+                || key.starts_with("KAGAYOI_MEMORY_")
+                || key.starts_with("SUPERMEMORY_")
+                || key == "CLOUDFLARE_MEMORY_API_KEY"
+                || ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"].contains(&key.as_str())
+            {
+                command.env_remove(name);
+            }
+        }
+        command
+            .args([
+                "plugin-bootstrap",
+                "--version",
+                &self.version,
+                "--work-root",
+            ])
+            .arg(&self.work)
+            .arg("--config")
+            .arg(config.unwrap_or(&self.config))
+            .args(modes)
+            .env("CODEX_HOME", &self.home)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("GH_TOKEN", "isolated-updater-token-canary")
+            .env("GH_HOST", "hostile.example")
+            .env("NO_PROXY", "*")
+            .env("TEMP", self.root.join("temp"))
+            .env("TMP", self.root.join("temp"))
+            .env("TMPDIR", self.root.join("temp"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        command.env(
+            "PATH",
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()) + "\\System32",
+        );
+        #[cfg(not(windows))]
+        command.env("PATH", "");
+        let output = crate::client_e2e::process_output(command, b"")?;
+        ensure!(
+            output.stderr.is_empty()
+                || String::from_utf8_lossy(&output.stderr).trim() == "PLUGIN_BOOTSTRAP_FAILED",
+            "bootstrap emitted unstructured diagnostics"
+        );
+        ensure!(
+            !output
+                .stdout
+                .windows(b"isolated-updater-token-canary".len())
+                .any(|w| w == b"isolated-updater-token-canary")
+                && !output
+                    .stderr
+                    .windows(b"isolated-updater-token-canary".len())
+                    .any(|w| w == b"isolated-updater-token-canary"),
+            "bootstrap diagnostics exposed token"
+        );
+        let mut result: Value = serde_json::from_slice(&output.stdout)
+            .context("bootstrap must return structured JSON")?;
+        result["exitCode"] = json!(output.status.code().unwrap_or(-1));
+        for call in self.calls()? {
+            for key in ["temp", "tmp", "tmpdir"] {
+                ensure!(
+                    Path::new(call[key].as_str().context("bootstrap child TEMP missing")?)
+                        .starts_with(&self.root),
+                    "bootstrap child {key} escaped invocation root"
+                );
+            }
+        }
+        Ok(result)
+    }
     fn run_hook_environment(
         &self,
         mode: &str,
@@ -486,6 +560,114 @@ impl Drop for R2Fixture {
         self.shutdown();
     }
 }
+fn bootstrap_case(f: &Fixture, fault: &str, scenarios: &mut Vec<&'static str>) -> Result<()> {
+    let before = f.snapshot()?;
+    if fault == "success" || fault == "recovery" {
+        let config = f.root.join("first-use-config.json");
+        let mut settings: Value = serde_json::from_slice(&fs::read(&f.config)?)?;
+        settings["commands"]
+            .as_object_mut()
+            .context("fixture commands")?
+            .remove("codex");
+        let missing_source = f.root.join("not-installed-plugin");
+        settings["localPlugin"]["sourcePath"] = json!(missing_source);
+        fs::write(&config, serde_json::to_vec(&settings)?)?;
+        let checked = f.bootstrap(&[], Some(&config))?;
+        ensure!(
+            checked["exitCode"] == 0 && before == f.snapshot()? && f.adds()? == 0,
+            "bootstrap default must be read-only: {checked}"
+        );
+        ensure!(
+            !missing_source.exists() && f.calls()?.iter().all(|call| call["kind"] != "codex"),
+            "first-use bootstrap default created plugin state or consulted Codex"
+        );
+        ensure!(
+            !files(&f.work)?
+                .keys()
+                .any(|path| path.starts_with("verified-") || path.contains("/verified-")),
+            "bootstrap default created an apply receipt"
+        );
+        if fault == "recovery" {
+            f.edit_state("failAdd", json!(true))?;
+            let failed = f.bootstrap(&["--apply"], None)?;
+            ensure!(
+                failed["exitCode"] == 1 && failed["code"].is_string(),
+                "bootstrap ignored official CLI failure: {failed}"
+            );
+            f.edit_state("failAdd", json!(false))?;
+        }
+        let applied = f.bootstrap(&["--apply"], None)?;
+        ensure!(
+            applied["exitCode"] == 0,
+            "bootstrap apply failed: {applied}"
+        );
+        f.installed()?;
+        let count = f.adds()?;
+        ensure!(
+            count == if fault == "recovery" { 2 } else { 1 },
+            "bootstrap install retry count changed"
+        );
+        let snapshot = f.snapshot()?;
+        if fault == "success" {
+            let verified = f.bootstrap(&["--verify-only"], None)?;
+            ensure!(
+                verified["exitCode"] == 0
+                    && verified["status"] == "verified"
+                    && f.adds()? == count
+                    && snapshot == f.snapshot()?,
+                "bootstrap receipt verification mutated installation: {verified}"
+            );
+        }
+        let repeated = f.bootstrap(&["--apply"], None)?;
+        ensure!(
+            repeated["exitCode"] == 0 && f.adds()? == count && snapshot == f.snapshot()?,
+            "bootstrap retry reinstalled or changed current plugin: {repeated}"
+        );
+        let invalid = f.bootstrap(&["--apply", "--download-only"], None)?;
+        ensure!(
+            invalid["exitCode"] == 1 && f.adds()? == count && snapshot == f.snapshot()?,
+            "bootstrap accepted conflicting modes"
+        );
+    } else {
+        // Invalid publication fails before download delivery, so all fixture output remains on D:.
+        // No Codex command is configured or available through PATH for this first-download path.
+        let config = f.root.join("download-only-config.json");
+        let mut settings: Value = serde_json::from_slice(&fs::read(&f.config)?)?;
+        settings["commands"]
+            .as_object_mut()
+            .context("fixture commands")?
+            .remove("codex");
+        fs::write(&config, serde_json::to_vec(&settings)?)?;
+        let result = f.bootstrap(&["--download-only"], Some(&config))?;
+        let expected = match fault {
+            "archive-tamper" => "R2_ARCHIVE_DIGEST_MISMATCH",
+            "manifest-tamper" => "R2_MANIFEST_DIGEST_MISMATCH",
+            "witness-missing" => "R2_WITNESS_MISMATCH",
+            "redirect" => "R2_DOWNLOAD_FAILED",
+            _ => anyhow::bail!("unknown bootstrap scenario"),
+        };
+        ensure!(
+            result["exitCode"] == 1
+                && result["code"] == expected
+                && before == f.snapshot()?
+                && f.adds()? == 0,
+            "bootstrap invalid-publication contract ({fault}): {result}"
+        );
+        ensure!(
+            f.calls()?.iter().all(|call| call["kind"] != "codex"),
+            "download-only resolved or called Codex"
+        );
+    }
+    ensure!(
+        !f.calls()?
+            .iter()
+            .any(|call| call["args"].to_string().contains("artifacts")),
+        "bootstrap downgraded from R2 to legacy artifacts"
+    );
+    scenarios.push(Box::leak(format!("bootstrap-{fault}").into_boxed_str()));
+    Ok(())
+}
+
 fn r2_cases(
     make: &impl Fn(&str, &Path, bool, &str, &str) -> Result<Fixture>,
     package: &Path,
@@ -494,6 +676,7 @@ fn r2_cases(
     previous: Option<&Path>,
     endpoint: Option<&str>,
     scenarios: &mut Vec<&'static str>,
+    bootstrap: bool,
 ) -> Result<()> {
     const REPO: &str = "1llum1n4t1s/remnifold";
     let archive_bytes = fs::read(archive)?;
@@ -550,6 +733,19 @@ fn r2_cases(
         "witness-legacy-gh",
         "witness-gh-unknownflag",
     ] {
+        if bootstrap
+            && ![
+                "success",
+                "recovery",
+                "archive-tamper",
+                "manifest-tamper",
+                "witness-missing",
+                "redirect",
+            ]
+            .contains(&fault)
+        {
+            continue;
+        }
         if focus.as_deref().is_some_and(|wanted| wanted != fault) {
             continue;
         }
@@ -559,7 +755,7 @@ fn r2_cases(
             package
         };
         let f = make(
-            &format!("r2-{fault}"),
+            &format!("{}-{fault}", if bootstrap { "bootstrap" } else { "r2" }),
             initial,
             initial != package || fault == "same-version",
             "source",
@@ -788,6 +984,11 @@ fn r2_cases(
         let mut settings: Value = serde_json::from_slice(&fs::read(&f.config)?)?;
         settings["localPlugin"]["repository"] = json!(REPO);
         fs::write(&f.config, serde_json::to_vec(&settings)?)?;
+        if bootstrap {
+            bootstrap_case(&f, fault, scenarios)?;
+            server.secure_requests()?;
+            continue;
+        }
         let before = f.snapshot()?;
         if fault == "success" || fault == "recovery" || fault == "witness-legacy-gh" {
             f.success("--check-published", "published")?;
@@ -1232,6 +1433,30 @@ pub fn run(
     legacy_archive: Option<&Path>,
     previous_archive: Option<&Path>,
 ) -> Result<()> {
+    run_suite(
+        repo,
+        Some(tools),
+        work,
+        binary,
+        archive,
+        legacy_archive,
+        previous_archive,
+        false,
+    )
+}
+pub fn bootstrap_tests(repo: &Path, work: &Path, binary: &Path, archive: &Path) -> Result<()> {
+    run_suite(repo, None, work, binary, archive, None, None, true)
+}
+fn run_suite(
+    repo: &Path,
+    tools: Option<&Toolchain>,
+    work: &Path,
+    binary: &Path,
+    archive: &Path,
+    legacy_archive: Option<&Path>,
+    previous_archive: Option<&Path>,
+    bootstrap_only: bool,
+) -> Result<()> {
     validate_work_root(repo, work)?;
     safe_path(binary)?;
     ensure!(!work.starts_with(repo), "updater fixtures must be external");
@@ -1418,6 +1643,20 @@ pub fn run(
         })
     };
     let mut scenarios = Vec::new();
+    if bootstrap_only {
+        r2_cases(
+            &fixture,
+            &package,
+            archive,
+            target,
+            None,
+            None,
+            &mut scenarios,
+            true,
+        )?;
+        println!("Native bootstrap contracts: {} passed", scenarios.len());
+        return Ok(());
+    }
     if std::env::var_os("REMNIFOLD_UPDATER_R2_FOCUS").is_some() {
         r2_cases(
             &fixture,
@@ -1427,6 +1666,7 @@ pub fn run(
             None,
             None,
             &mut scenarios,
+            false,
         )?;
         ensure!(!scenarios.is_empty(), "unknown focused R2 scenario");
         println!(
@@ -1621,7 +1861,11 @@ pub fn run(
     );
     scenarios.push("linked-work-root-rejected-before-mutation");
     let mut worker = if legacy_archive.is_some() || previous_archive.is_some() {
-        Some(start_fixture(repo, tools, &root.join("worker"))?)
+        Some(start_fixture(
+            repo,
+            tools.context("updater migration tools missing")?,
+            &root.join("worker"),
+        )?)
     } else {
         None
     };
@@ -1725,6 +1969,17 @@ pub fn run(
         previous.is_dir().then_some(previous.as_path()),
         worker.as_ref().map(|w| w.base_url.as_str()),
         &mut scenarios,
+        false,
+    )?;
+    r2_cases(
+        &fixture,
+        &package,
+        archive,
+        target,
+        None,
+        None,
+        &mut scenarios,
+        true,
     )?;
     fs::write(
         root.join("local-plugin-update-validation.json"),

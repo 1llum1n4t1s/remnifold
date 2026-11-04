@@ -352,7 +352,7 @@ fn expected(
         .iter()
         .map(|(name, bytes)| (name, hash(bytes)))
         .collect();
-    files.insert("native-build.json".into(), json_bytes(&json!({"schema":1,"target":target,"sourceCommit":commit,"version":version,"files":digests}))?);
+    files.insert("native-build.json".into(), json_bytes(&json!({"schema":1,"target":target,"sourceCommit":commit,"version":version,"capabilities":["bootstrap-v1"],"files":digests}))?);
     Ok(files)
 }
 /// 既存出力を拒否して新規アーカイブを作る。中間ディレクトリや削除は使わない。

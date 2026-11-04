@@ -807,6 +807,165 @@ fn publication_log(http: &GitHub, id: &Identity, success: bool) -> Result<Vec<u8
             .context("Missing publisher job identity")?,
     )
 }
+/// 公開済み Windows archive を GitHub 生ログと commit の両方で検証する。
+/// 全体が成功した release CI と publisher job の証拠だけを認める。
+pub(crate) fn bootstrap_binary(
+    version: &str,
+    commit: &str,
+    root: &Path,
+    token: &str,
+) -> Result<Vec<u8>> {
+    let mut http = GitHub {
+        http: client()?,
+        origin: "https://api.github.com".into(),
+        token: token.into(),
+        repository_id: 0,
+        public_origin: manifest::PUBLIC_BASE_URL.into(),
+    };
+    let response = http
+        .request(Method::GET, "")
+        .send()
+        .map_err(|_| anyhow::anyhow!("GitHub repository request failed"))?;
+    ensure!(
+        response.status().is_success(),
+        "GitHub repository unavailable"
+    );
+    let repository: serde_json::Value = manifest::parse_strict(&body(response, 1024 * 1024)?)?;
+    ensure!(
+        repository["full_name"] == manifest::REPOSITORY,
+        "GitHub repository mismatch"
+    );
+    http.repository_id = repository["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .context("Missing GitHub repository ID")?;
+    bootstrap_binary_verified(&http, version, commit, root)
+}
+fn bootstrap_binary_verified(
+    http: &GitHub,
+    version: &str,
+    commit: &str,
+    root: &Path,
+) -> Result<Vec<u8>> {
+    let public = |key: &str, max| -> Result<Vec<u8>> {
+        let response = http
+            .http
+            .get(format!("{}/{key}", http.public_origin))
+            .send()
+            .map_err(|_| anyhow::anyhow!("Public bootstrap archive request failed"))?;
+        ensure!(
+            response.status().is_success(),
+            "Public bootstrap archive unavailable"
+        );
+        body(response, max)
+    };
+    let index = manifest::parse_index(&public(
+        &manifest::index_key(version),
+        manifest::MAX_JSON as u64,
+    )?)?;
+    ensure!(
+        index.version == version && index.source_commit == commit,
+        "Bootstrap publication identity mismatch"
+    );
+    verify_existing_anchor(http, &index)?;
+    let identity = Identity {
+        version: version.into(),
+        commit: commit.into(),
+        run: index.run_id,
+        attempt: index.run_attempt,
+    };
+    ensure!(
+        validate_run(http, &identity, true)? == RunState::Accepted,
+        "Bootstrap publication CI not successful"
+    );
+    let bytes = public(&index.manifest_key, manifest::MAX_JSON as u64)?;
+    ensure!(
+        hash(&bytes) == index.manifest_sha256,
+        "Bootstrap manifest digest mismatch"
+    );
+    let release = manifest::parse_manifest(&bytes)?;
+    ensure!(
+        release.source_commit == commit
+            && release.version == version
+            && release.run_id == index.run_id
+            && release.run_attempt == index.run_attempt,
+        "Bootstrap manifest identity mismatch"
+    );
+    let workflow = github(http, "actions/workflows/ci.yml")?;
+    let runs = github(
+        http,
+        &format!("actions/runs?head_sha={commit}&event=push&per_page=100"),
+    )?;
+    let runs = runs["workflow_runs"]
+        .as_array()
+        .context("Missing bootstrap workflow runs")?;
+    ensure!(runs.len() < 100, "Bootstrap CI discovery limit");
+    let latest = runs
+        .iter()
+        .filter(|run| {
+            run["head_sha"] == commit
+                && run["head_branch"] == format!("release/{version}")
+                && run["event"] == "push"
+                && run["workflow_id"] == workflow["id"]
+                && run["path"] == ".github/workflows/ci.yml"
+                && run["repository"]["id"].as_u64() == Some(http.repository_id)
+                && run["repository"]["full_name"] == manifest::REPOSITORY
+                && run["head_repository"]["full_name"] == manifest::REPOSITORY
+        })
+        .max_by_key(|run| {
+            (
+                run["id"].as_u64().unwrap_or(0),
+                run["run_attempt"].as_u64().unwrap_or(0),
+            )
+        })
+        .context("Latest release CI unavailable")?;
+    ensure!(
+        latest["status"] == "completed" && latest["conclusion"] == "success",
+        "Latest release CI not successful"
+    );
+    let latest_identity = Identity {
+        version: version.into(),
+        commit: commit.into(),
+        run: latest["id"]
+            .as_u64()
+            .filter(|v| *v > 0)
+            .context("Missing latest CI ID")?,
+        attempt: latest["run_attempt"]
+            .as_u64()
+            .filter(|v| *v > 0)
+            .context("Missing latest CI attempt")?,
+    };
+    ensure!(
+        validate_run(http, &latest_identity, true)? == RunState::Accepted,
+        "Latest release CI not accepted"
+    );
+    manifest::verify_witness(
+        &publication_log(http, &latest_identity, true)?,
+        &release,
+        &index.manifest_sha256,
+    )?;
+    let target = "x86_64-pc-windows-msvc";
+    let asset = &release.targets[target];
+    let archive = public(&asset.key, asset.size)?;
+    ensure!(
+        archive.len() as u64 == asset.size && hash(&archive) == asset.sha256,
+        "Bootstrap archive digest mismatch"
+    );
+    LocalVerifier {
+        repo: repo(),
+        root: root.into(),
+    }
+    .verify(target, &archive, &asset.native_manifest_sha256, commit)?;
+    let (binary, native) = native_parts(&archive, target)?;
+    let native: serde_json::Value = manifest::parse_strict(&native)?;
+    ensure!(
+        native["capabilities"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|v| v == "bootstrap-v1")),
+        "Published native executable does not support bootstrap-v1; publish a capable release first"
+    );
+    Ok(binary)
+}
 fn verify_existing_anchor(http: &GitHub, index: &VersionIndex) -> Result<()> {
     let wanted = manifest::status_url(index.run_id, index.run_attempt);
     for page in 1..=10 {

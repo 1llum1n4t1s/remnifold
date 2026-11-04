@@ -22,7 +22,7 @@ fn run() -> Result<()> {
     match args.first().map(String::as_str).unwrap_or("mcp") {
         "--version" | "-V" => println!("remnifold {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" | "help" => println!(
-            "Remnifold {}\n\nUsage: remnifold <command>\n  mcp                 Run the stdio MCP server (default)\n  hook <event>        Run a Codex lifecycle hook\n  capture             Capture completed turns from stdin JSON\n  import [options]    Import Codex history (dry run unless --apply)\n  setup [options]     Connect an existing self-hosted server\n  server-setup ...    Provision and deploy a Cloudflare server\n  topics-setup ...    Plan or queue finite unclassified enrichment\n  server-live-test    Explicitly verify configured remote server\n  status              Check connection and recall settings\n  plugin-update ...   Verify or update the local plugin\n\nNormal client use requires no Node.js runtime.",
+            "Remnifold {}\n\nUsage: remnifold <command>\n  mcp                 Run the stdio MCP server (default)\n  hook <event>        Run a Codex lifecycle hook\n  capture             Capture completed turns from stdin JSON\n  import [options]    Import Codex history (dry run unless --apply)\n  setup [options]     Connect an existing self-hosted server\n  server-setup ...    Provision and deploy a Cloudflare server\n  topics-setup ...    Plan or queue finite unclassified enrichment\n  server-live-test    Explicitly verify configured remote server\n  status              Check connection and recall settings\n  plugin-update ...   Verify or update the local plugin\n  plugin-bootstrap ... Verify or download the first R2 package on Windows\n\nNormal client use requires no Node.js runtime.",
             env!("CARGO_PKG_VERSION")
         ),
         "mcp" => mcp::start()?,
@@ -76,6 +76,7 @@ fn run() -> Result<()> {
         "server-live-test" => live_test::run(&args[1..])?,
         "status" => local::status()?,
         "plugin-update" => updater::run(&args[1..])?,
+        "plugin-bootstrap" => updater::run_bootstrap(&args[1..])?,
         _ => bail!("Unknown command. Use remnifold --help."),
     }
     Ok(())

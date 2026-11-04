@@ -310,6 +310,7 @@ fn download(base: &str, key: &str, limit: u64) -> Result<Vec<u8>> {
 }
 
 pub(super) struct Published {
+    pub archive: Vec<u8>,
     pub receipt: Value,
     pub evidence: Value,
     pub files: Files,
@@ -362,8 +363,8 @@ pub(super) fn published(
         .ok_or_else(|| anyhow::anyhow!("R2_TARGET_MISSING"))?;
     let receipt = json!({"schema":2,"transport":"r2","repository":context.repository,"version":version,"sourceCommit":commit,"target":target,"runId":index.run_id,"runAttempt":index.run_attempt,"witnessRunId":latest["id"],"witnessRunAttempt":latest["run_attempt"],"witnessJobId":witness_job,"manifestSha256":index.manifest_sha256,"archiveSha256":asset.sha256,"nativeManifestSha256":asset.native_manifest_sha256,"manifestKey":index.manifest_key,"archiveKey":asset.key,"archiveSize":asset.size});
     let evidence = json!({"version":version,"sha":commit,"transport":"r2","runId":index.run_id,"runAttempt":index.run_attempt,"manifestSha256":index.manifest_sha256,"workRoot":context.work});
+    let bytes = download(&config.public_base_url, &asset.key, asset.size.min(LIMIT))?;
     let files = {
-        let bytes = download(&config.public_base_url, &asset.key, asset.size.min(LIMIT))?;
         ensure!(
             bytes.len() as u64 == asset.size && sha(&bytes) == asset.sha256,
             "R2_ARCHIVE_DIGEST_MISMATCH"
@@ -379,6 +380,7 @@ pub(super) fn published(
         files
     };
     Ok(Published {
+        archive: bytes,
         receipt,
         evidence,
         files,
