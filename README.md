@@ -67,7 +67,7 @@ gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
 
 The release and local asset must both pass GitHub's signature verification before execution. Do not substitute an unverified R2 helper or bypass a failed verification. The bootstrap then independently checks the exact GitHub CI publisher-log witness, R2 manifest, release commit, archive size and digest. It does not require an installed plugin for publication checking or download-only mode. The default checks publication; add `--apply` only to migrate an existing registered installation, followed by receipt verification. For an unregistered installation, use `--download-only` and the official registration procedure below. Legacy `-Version`, `-WorkRoot`, `-Apply`, and `-DownloadOnly` argument names remain readable by the native command.
 
-On macOS and Linux, the trusted-source Bash bootstrap remains available:
+On macOS and Linux, obtain and review the trusted-source [Bash bootstrap](scripts/bootstrap-plugin.sh), saving it outside the work directory. It requires native GitHub CLI, curl, tar, and `sha256sum` or `shasum`:
 
 ```sh
 bash ./bootstrap-plugin.sh --version '<published-version>' --work-root /absolute/external/remnifold-bootstrap
@@ -87,7 +87,7 @@ After installing or updating the plugin, review any hook trust requested by Code
 
 To import existing Codex sessions, preview a bounded batch with `./bin/remnifold.exe import --limit 10` (macOS/Linux: `./bin/remnifold import --limit 10`). Add `--apply` when you want to upload the sanitized records. The preview does not write remote memories; repeat imports reuse deterministic capture identities.
 
-Maintainers publish the Windows bootstrap asset after the R2 release CI has completed successfully. Enable GitHub Release immutability in the repository settings before the first publication. Using the repository owner's existing native GitHub CLI authentication, run `cargo xtask bootstrap-release --source-commit <release-sha> --work-root <absolute-external-directory>` to inspect the plan, then add `--apply` to create the immutable release. This command never enables repository settings itself. It verifies the R2 publication and exact Windows executable, refuses conflicting tags or assets, and verifies the published GitHub release and asset signatures. It requires no additional CI administrator credential. A release without this successfully verified asset cannot serve as the initial native bootstrap trust root.
+Bootstrap release publication is a maintainer procedure documented in [AGENTS.md](AGENTS.md#bootstrap-release-publication).
 
 ## Create or update a server
 
