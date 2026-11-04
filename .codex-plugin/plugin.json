@@ -1,6 +1,6 @@
 {
   "name": "remnifold",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "description": "Self-hosted, topic-based memory for AI clients on Cloudflare",
   "author": {
     "name": "Kagayoi",
