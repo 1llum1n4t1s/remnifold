@@ -1,4 +1,8 @@
 mod ci;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "ci_runner.rs"]
+mod ci_runner_contract;
 mod client_e2e;
 mod fake_cli;
 mod package;
@@ -46,6 +50,12 @@ fn run() -> Result<()> {
     }
     if command == "dependabot" {
         return ci::dependabot(&args.collect::<Vec<_>>());
+    }
+    if command == "ci-release-branch" {
+        if args.next().is_some() {
+            bail!("ci-release-branch does not accept arguments");
+        }
+        return ci::release_branch(&repo);
     }
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         println!(

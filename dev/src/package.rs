@@ -8,6 +8,8 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
+#[path = "../../native/src/hook_command.rs"]
+pub(crate) mod hook_command;
 
 pub const TARGETS: [&str; 5] = [
     "x86_64-pc-windows-msvc",
@@ -82,7 +84,6 @@ fn allowed(name: &str) -> bool {
             | "CHANGELOG.md"
             | "LICENSE"
             | "LICENSE.md"
-            | "scripts/setup-server.ps1"
             | "server/package.json"
             | "server/tsconfig.json"
             | "server/wrangler.example.jsonc"
@@ -262,7 +263,6 @@ fn expected(
         "CHANGELOG.md",
         "LICENSE",
         "LICENSE.md",
-        "scripts/setup-server.ps1",
         "server/package.json",
         "server/tsconfig.json",
         "server/wrangler.example.jsonc",
@@ -342,6 +342,10 @@ fn expected(
             "invalid hook contract"
         );
         commands[0]["command"] = json!(format!("\"${{PLUGIN_ROOT}}/{exe}\" hook {event}"));
+        if target.ends_with("windows-msvc") {
+            commands[0]["commandWindows"] =
+                json!(hook_command::windows_hook_command(event).context("unsupported hook event")?);
+        }
     }
     files.insert("hooks/hooks.json".into(), json_bytes(&hooks)?);
     let digests: BTreeMap<_, _> = files
@@ -549,12 +553,13 @@ mod tests {
             "server/src/shared/memory-index.ts",
             "server/src/index.ts",
             "skills/setup-remnifold/SKILL.md",
-            "scripts/setup-server.ps1",
             "LICENSE.md",
         ] {
             assert!(allowed(name), "{name}");
         }
         for name in [
+            "scripts/setup-server.ps1",
+            "scripts/setup-client.ps1",
             "client/memory-index.mjs",
             "server/pnpm-lock.yaml",
             "server/src/.env.ts",

@@ -13,7 +13,7 @@ use std::{
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_CONTENT: u64 = 512 * 1024 * 1024;
 
-// 既存配布済みnative updaterのnative_source契約を維持する。
+// 現版の配布ソース。旧版の読み取り契約はnative updater側に残す。
 fn native_source(name: &str) -> bool {
     if name.contains(".test.")
         || name
@@ -30,7 +30,6 @@ fn native_source(name: &str) -> bool {
             | "LICENSE"
             | "LICENSE.md"
             | "scripts/setup-server.mjs"
-            | "scripts/setup-server.ps1"
             | "client/unicode-text.mjs"
             | "server/package.json"
             | "server/pnpm-lock.yaml"

@@ -271,6 +271,101 @@ fn hook(
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
+
+#[cfg(windows)]
+fn packaged_windows_command(
+    home: &Path,
+    project: &Path,
+    endpoint: &str,
+    plugin: &Path,
+    event: &str,
+) -> Result<Command> {
+    let mut cmd = command(
+        Path::new(crate::package::hook_command::WINDOWS_SH),
+        home,
+        project,
+        endpoint,
+    );
+    cmd.env("PLUGIN_ROOT", plugin).args([
+        "-p",
+        "-c",
+        &crate::package::hook_command::windows_script(event).context("unsupported fixture hook")?,
+    ]);
+    Ok(cmd)
+}
+
+#[cfg(windows)]
+fn packaged_windows_hook(
+    home: &Path,
+    project: &Path,
+    endpoint: &str,
+    plugin: &Path,
+    event: &str,
+    payload: Value,
+) -> Result<Value> {
+    let output = process_output(
+        packaged_windows_command(home, project, endpoint, plugin, event)?,
+        &serde_json::to_vec(&payload)?,
+    )?;
+    ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "packaged Git Bash hook {event}: {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(if output.stdout.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&output.stdout)?
+    })
+}
+
+#[cfg(windows)]
+fn packaged_windows_fixture(binary: &Path, work: &Path) -> Result<std::path::PathBuf> {
+    let plugin = work.join("native hook 日本語 ! & %PATH% $(unused) ' ;");
+    fs::create_dir_all(plugin.join("bin"))?;
+    fs::copy(binary, plugin.join("bin/remnifold.exe"))?;
+    // 固定の Git installation を使い、cwd の同名 exe を起動しない。
+    fs::copy(binary, work.join("sh.exe"))?;
+    let input =
+        json!({"tool_name":"mcp__remnifold__getDocument","tool_input":{"id":"日本語 😀 ! & %"}});
+    let expected = hook(
+        binary,
+        work,
+        work,
+        "http://127.0.0.1:9",
+        "PreToolUse",
+        input.clone(),
+    )?;
+    let output = packaged_windows_hook(
+        work,
+        work,
+        "http://127.0.0.1:9",
+        &plugin,
+        "PreToolUse",
+        input,
+    )?;
+    ensure!(
+        output == expected,
+        "Git Bash changed hook stdin/Unicode output"
+    );
+    ensure!(
+        packaged_windows_hook(
+            work,
+            work,
+            "http://127.0.0.1:9",
+            &plugin,
+            "SessionStart",
+            json!({})
+        )? == json!({}),
+        "Git Bash changed SessionStart"
+    );
+    let mut failed = packaged_windows_command(work, work, "http://127.0.0.1:9", &plugin, "Stop")?;
+    failed.env_remove("REMNIFOLD_API_KEY");
+    let output = process_output(failed, b"{}")?;
+    ensure!(output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr == b"Remnifold capture failed; unacknowledged records will be retried. [stage=configuration; cause=invalid; action=repair-required]\n", "Git Bash changed the redacted Stop failure/exit contract: {}",String::from_utf8_lossy(&output.stderr));
+    Ok(plugin)
+}
 pub(crate) fn process_output(command: Command, input: &[u8]) -> Result<std::process::Output> {
     process_output_with_timeout(command, input, Duration::from_secs(30))
 }
@@ -621,6 +716,8 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
     let work = invocation.as_path();
     println!("Native client validation directory: {}", work.display());
     subprocess_canaries(work)?;
+    #[cfg(windows)]
+    let packaged_plugin = packaged_windows_fixture(binary, work)?;
     let mut fixture = start_fixture(repo, tools, &work.join("worker"))?;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -724,6 +821,16 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
             .join("\n"),
     )?;
     let payload = json!({"session_id":session,"transcript_path":transcript,"cwd":project});
+    #[cfg(windows)]
+    let captured = packaged_windows_hook(
+        &home,
+        &project,
+        endpoint,
+        &packaged_plugin,
+        "Stop",
+        payload.clone(),
+    )?;
+    #[cfg(not(windows))]
     let captured = hook(binary, &home, &project, endpoint, "Stop", payload.clone())?;
     ensure!(
         captured["systemMessage"]
@@ -776,6 +883,16 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
         "capture disclosed secrets/commentary"
     );
     checks.push("native Stop captures final-only Unicode/NUL content, sanitizes keys, suppresses acknowledged retries");
+    #[cfg(windows)]
+    let recall = packaged_windows_hook(
+        &home,
+        &project,
+        endpoint,
+        &packaged_plugin,
+        "UserPromptSubmit",
+        json!({"session_id":"native-other-session","cwd":project,"prompt":"OrionNative capture request worker bridge"}),
+    )?;
+    #[cfg(not(windows))]
     let recall = hook(
         binary,
         &home,

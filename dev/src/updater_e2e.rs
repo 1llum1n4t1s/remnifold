@@ -95,7 +95,6 @@ fn checkout_sources(repo: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
         "LICENSE",
         "LICENSE.md",
         "scripts/setup-server.mjs",
-        "scripts/setup-server.ps1",
         "client/unicode-text.mjs",
         "server/package.json",
         "server/pnpm-lock.yaml",
@@ -182,108 +181,11 @@ fn fixture_archive(root: &Path, output: &Path) -> Result<()> {
     archive.into_inner()?.finish()?;
     Ok(())
 }
-#[cfg(unix)]
-fn directory_link(target: &Path, link: &Path) -> Result<()> {
-    safe_path(target)?;
-    safe_path(link)?;
-    std::os::unix::fs::symlink(target, link)?;
-    Ok(())
-}
-#[cfg(windows)]
-fn directory_link(target: &Path, link: &Path) -> Result<()> {
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt};
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateFileW(
-            name: *const u16,
-            access: u32,
-            sharing: u32,
-            security: *mut c_void,
-            creation: u32,
-            flags: u32,
-            template: *mut c_void,
-        ) -> *mut c_void;
-        fn DeviceIoControl(
-            handle: *mut c_void,
-            code: u32,
-            input: *mut c_void,
-            input_size: u32,
-            output: *mut c_void,
-            output_size: u32,
-            returned: *mut u32,
-            overlapped: *mut c_void,
-        ) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-    safe_path(target)?;
-    safe_path(link)?;
-    ensure!(target.is_dir(), "junction target must be a directory");
-    fs::create_dir(link)?;
-    let name = link
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let substitute = format!("\\??\\{}", target.display())
-        .encode_utf16()
-        .collect::<Vec<_>>();
-    let print = target.as_os_str().encode_wide().collect::<Vec<_>>();
-    let mut paths = substitute.clone();
-    paths.push(0);
-    let print_offset = paths.len() * 2;
-    paths.extend_from_slice(&print);
-    paths.push(0);
-    let mut buffer = Vec::<u8>::new();
-    buffer.extend_from_slice(&0xa0000003u32.to_le_bytes());
-    buffer.extend_from_slice(&((8 + paths.len() * 2) as u16).to_le_bytes());
-    buffer.extend_from_slice(&0u16.to_le_bytes());
-    for field in [
-        0u16,
-        (substitute.len() * 2) as u16,
-        print_offset as u16,
-        (print.len() * 2) as u16,
-    ] {
-        buffer.extend_from_slice(&field.to_le_bytes());
-    }
-    for value in paths {
-        buffer.extend_from_slice(&value.to_le_bytes());
-    }
-    // ハンドルの対象は新規作成し検証したfixtureディレクトリだけ。
-    let handle = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            0x40000000,
-            7,
-            std::ptr::null_mut(),
-            3,
-            0x02000000 | 0x00200000,
-            std::ptr::null_mut(),
-        )
-    };
-    ensure!(
-        handle as isize != -1,
-        "junction handle: {}",
-        std::io::Error::last_os_error()
-    );
-    let mut returned = 0;
-    let result = unsafe {
-        DeviceIoControl(
-            handle,
-            0x000900a4,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    let error = std::io::Error::last_os_error();
-    unsafe {
-        CloseHandle(handle);
-    }
-    ensure!(result != 0, "create fixture junction: {error}");
-    Ok(())
+#[path = "../../native/src/test_links.rs"]
+mod test_links;
+
+pub(crate) fn directory_link(target: &Path, link: &Path) -> Result<()> {
+    test_links::directory_link(target, link)
 }
 struct Fixture {
     legacy_temp: bool,
@@ -322,6 +224,15 @@ impl Fixture {
         Ok(())
     }
     fn run(&self, mode: &str, work: Option<&Path>, from_source: bool) -> Result<Value> {
+        self.run_hook_environment(mode, work, from_source, None)
+    }
+    fn run_hook_environment(
+        &self,
+        mode: &str,
+        work: Option<&Path>,
+        from_source: bool,
+        pathext: Option<Option<&str>>,
+    ) -> Result<Value> {
         let work = work.unwrap_or(&self.work);
         let mut command = Command::new(if from_source {
             self.source.join(if cfg!(windows) {
@@ -375,6 +286,13 @@ impl Fixture {
         );
         #[cfg(not(windows))]
         command.env("PATH", "");
+        if let Some(pathext) = pathext {
+            if let Some(value) = pathext {
+                command.env("PATHEXT", value);
+            } else {
+                command.env_remove("PATHEXT");
+            }
+        }
         let mut child = command.spawn()?;
         let mut out = child.stdout.take().unwrap();
         let mut err = child.stderr.take().unwrap();
@@ -1588,6 +1506,40 @@ pub fn run(
     retry.success("--verify-only", "verified")?;
     ensure!(retry.adds()? == 2, "failed install retry count");
     scenarios.push("official-failure-resume");
+    #[cfg(windows)]
+    for (label, pathext) in [
+        ("missing", None),
+        ("empty", Some("")),
+        ("no-exe", Some(".BAT;.CMD")),
+    ] {
+        let isolated = fixture(
+            &format!("reject-pathext-{label}"),
+            &package,
+            false,
+            "source",
+            "",
+        )?;
+        let before = isolated.snapshot()?;
+        let result = isolated.run_hook_environment("--apply", None, false, Some(pathext))?;
+        ensure!(
+            result["exitCode"] == 1
+                && result["code"] == "WINDOWS_PATHEXT_EXE_REQUIRED"
+                && isolated.snapshot()? == before
+                && isolated.adds()? == 0,
+            "PATHEXT {label} changed installation or did not fail closed: {result}"
+        );
+        let publication =
+            isolated.run_hook_environment("--check-published", None, false, Some(pathext))?;
+        ensure!(
+            publication["status"] == "published" && publication["exitCode"] == 0,
+            "publication check incorrectly required hook runtime: {publication}"
+        );
+        scenarios.push(match label {
+            "missing" => "missing-pathext-rejected-before-install",
+            "empty" => "empty-pathext-rejected-before-install",
+            _ => "non-exe-pathext-rejected-before-install",
+        });
+    }
     for (fault, code) in [
         ("ref", "RELEASE_REF_MISMATCH"),
         ("version", "RELEASE_VERSION_MISMATCH"),

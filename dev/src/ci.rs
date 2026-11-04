@@ -7,6 +7,24 @@ use std::{fs, time::Duration};
 const BOT: u64 = 49_699_333;
 const REQUIRED: [&str; 1] = [".github/workflows/ci.yml"];
 
+fn release_identity(version: &Value, reference: &str) -> Result<()> {
+    let version = version
+        .as_str()
+        .filter(|version| !version.is_empty() && !version.contains(['\r', '\n', '\0']))
+        .context("Invalid package version")?;
+    ensure!(
+        reference == format!("refs/heads/release/{version}"),
+        "Release branch does not match package version"
+    );
+    Ok(())
+}
+
+pub fn release_branch(repo: &std::path::Path) -> Result<()> {
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(repo.join(".codex-plugin/plugin.json"))?)?;
+    release_identity(&manifest["version"], &std::env::var("GITHUB_REF")?)
+}
+
 trait Api {
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value>;
     fn pages(&self, path: &str, field: Option<&str>) -> Result<Vec<Value>> {
@@ -500,7 +518,7 @@ mod tests {
         assert!(publisher.contains("actions: read"));
         assert!(publisher.contains("contents: read"));
         assert!(publisher.contains("startsWith(github.ref, 'refs/heads/release/')"));
-        assert!(publisher.contains("Release branch does not match package version"));
+        assert!(publisher.contains("cargo xtask ci-release-branch"));
         assert!(!workflow.contains("ref_protected"));
         assert!(matrix.contains("&& 'r2-staging' || 'validation'"));
         assert!(stage.contains("CI_R2_ENVIRONMENT: r2-staging"));
@@ -520,6 +538,44 @@ mod tests {
         );
         assert!(stage.contains("cargo xtask r2-stage") && stage.contains("--apply"));
         assert!(publisher.contains("cargo xtask r2-publish --apply"));
+    }
+
+    #[test]
+    fn release_branch_must_match_manifest_version_exactly() {
+        assert!(release_identity(&json!("1.0.16"), "refs/heads/release/1.0.16").is_ok());
+        for reference in [
+            "refs/heads/main",
+            "refs/heads/release/1.0.15",
+            "refs/tags/1.0.16",
+            "refs/heads/release/1.0.16/suffix",
+        ] {
+            assert!(release_identity(&json!("1.0.16"), reference).is_err());
+        }
+        for version in [Value::Null, json!(16), json!(""), json!("1.0.16\n")] {
+            assert!(release_identity(&version, "refs/heads/release/1.0.16").is_err());
+        }
+    }
+
+    #[test]
+    fn ci_replaces_only_powershell_with_native_operations() {
+        let workflow = include_str!("../../.github/workflows/ci.yml");
+        assert!(!workflow.contains("pwsh") && !workflow.contains("powershell"));
+        assert!(workflow.contains("shell: bash"));
+        assert!(workflow.contains("remnifold-ci-paths.exe\" ensure-directory \"$root\""));
+        assert!(workflow.contains("remnifold-ci-paths.exe\" reports \"$CI_ROOT/validation\""));
+        assert!(workflow.contains("cargo xtask ci-release-branch"));
+        assert!(!workflow.contains("shell: 'remnifold_ci.exe"));
+        let install = workflow.find("rustup toolchain install 1.99.1").unwrap();
+        let helper = workflow
+            .find("rustup run 1.99.1 rustc --edition 2024 dev/src/ci_runner.rs")
+            .unwrap();
+        let configure = workflow
+            .find("remnifold-ci-paths.exe\" ensure-directory")
+            .unwrap();
+        assert!(
+            install < helper && helper < configure,
+            "CI helper must use the installed pinned toolchain before isolated directory creation"
+        );
     }
 
     #[test]

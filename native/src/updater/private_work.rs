@@ -788,17 +788,7 @@ mod windows {
             let _guard = PrivateWorkGuard::open(&new_work).unwrap();
             assert!(new_work.is_dir());
             let alias = root.join("reparse-work");
-            assert!(
-                Command::new("cmd.exe")
-                    .args(["/D", "/C", "mklink", "/J"])
-                    .arg(&alias)
-                    .arg(&source)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            crate::updater::test_links::directory_link(&source, &alias).unwrap();
             assert!(
                 matches!(PrivateWorkGuard::open(&alias),Err(error) if error.to_string() == "LINK_PATH_REJECTED")
             );

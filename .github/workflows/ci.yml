@@ -64,6 +64,9 @@ jobs:
           unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install locked Rust toolchain
+        # Bootstrap uses the hosted runner's managed TEMP until isolation is configured.
+        run: rustup toolchain install 1.99.1 --profile minimal --target "$CI_TARGET" && rustup default 1.99.1
       - name: Configure isolated output directories
         run: |
           set -euo pipefail
@@ -75,15 +78,8 @@ jobs:
             executable=
           fi
           export CI_ROOT="$root"
-          pwsh -NoLogo -NoProfile -NonInteractive -Command '
-            $path = [System.IO.Path]::GetFullPath($env:CI_ROOT)
-            $ancestor = [System.IO.DirectoryInfo]$path
-            while ($null -ne $ancestor) {
-              if ($ancestor.Exists -and ($ancestor.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { throw "CI root has a linked ancestor" }
-              $ancestor = $ancestor.Parent
-            }
-            [System.IO.Directory]::CreateDirectory($path) | Out-Null
-          '
+          rustup run 1.99.1 rustc --edition 2024 dev/src/ci_runner.rs -o "$RUNNER_TEMP/remnifold-ci-paths.exe"
+          "$RUNNER_TEMP/remnifold-ci-paths.exe" ensure-directory "$root"
           mkdir -p "$root/tmp" "$root/tools" "$root/validation" "$root/guard"
           {
             printf 'CI_ROOT=%s\n' "$root"
@@ -93,8 +89,6 @@ jobs:
             printf 'REMNIFOLD_PACKAGE_BINARY=%s/build/%s/release/remnifold%s\n' "$root" "$CI_TARGET" "$executable"
             printf 'REMNIFOLD_NODE_GUARD_LOG=%s/validation/node-invocations.log\n' "$root"
           } >> "$GITHUB_ENV"
-      - name: Install locked Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal --target "$CI_TARGET" && rustup default 1.99.1
       - name: Reject Node and JavaScript package-manager subprocesses
         run: |
           set -euo pipefail
@@ -158,14 +152,7 @@ jobs:
             {
               printf '### Native validation: %s\n\n' "$CI_TARGET"
               printf 'Validation reports retained during this job (PRs receive no distribution credentials):\n\n'
-              pwsh -NoLogo -NoProfile -NonInteractive -Command '
-                $ErrorActionPreference = "Stop"
-                $options = [System.IO.EnumerationOptions]::new()
-                $options.RecurseSubdirectories = $true
-                $options.AttributesToSkip = [System.IO.FileAttributes]::ReparsePoint
-                $options.IgnoreInaccessible = $false
-                [System.IO.Directory]::EnumerateFiles((Join-Path $env:CI_ROOT "validation"), "*validation.json", $options)
-              '
+              "$RUNNER_TEMP/remnifold-ci-paths.exe" reports "$CI_ROOT/validation"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Stage verified native archive in private R2
@@ -221,12 +208,6 @@ jobs:
           unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-      - name: Require the release branch to match package version
-        run: |
-          pwsh -NoLogo -NoProfile -NonInteractive -Command '
-            $version = (Get-Content -LiteralPath .codex-plugin/plugin.json -Raw | ConvertFrom-Json).version
-            if ($env:GITHUB_REF -ne "refs/heads/release/$version") { throw "Release branch does not match package version" }
-          '
       - name: Configure isolated publication output
         run: |
           set -euo pipefail
@@ -240,6 +221,8 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Install locked Rust toolchain
         run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
+      - name: Require the release branch to match package version
+        run: cargo xtask ci-release-branch
       - name: Verify all staged targets and publish immutable R2 release
         env:
           CI_R2_ENVIRONMENT: r2-release

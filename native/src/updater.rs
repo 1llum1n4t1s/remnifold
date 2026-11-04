@@ -14,8 +14,13 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[path = "hook_command.rs"]
+mod hook_command;
 mod private_work;
 mod r2;
+#[cfg(test)]
+#[path = "test_links.rs"]
+pub(crate) mod test_links;
 
 type Files = BTreeMap<String, Vec<u8>>;
 const LIMIT: u64 = crate::release_manifest::MAX_ARCHIVE;
@@ -149,6 +154,184 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn native_hook_overrides_accept_legacy_or_exact_git_bash_only() {
+        let events = ["PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"];
+        let legacy = |target: &str| {
+            let mut hooks = json!({"hooks":{}});
+            for event in events {
+                hooks["hooks"][event] = json!([{"hooks":[{"type":"command","timeout":12,"command":format!("\"${{PLUGIN_ROOT}}/{}\" hook {event}",executable(target))}]}]);
+            }
+            hooks
+        };
+        let verify = |hooks: &Value, target: &str| -> Result<Value> {
+            let commit = "a".repeat(40);
+            let version = "1.0.0";
+            let mut files = Files::from([
+                (
+                    ".codex-plugin/plugin.json".into(),
+                    serde_json::to_vec(&json!({"name":"remnifold","version":version}))?,
+                ),
+                (
+                    ".mcp.json".into(),
+                    serde_json::to_vec(
+                        &json!({"mcpServers":{"remnifold":{"command":format!("./{}",executable(target)),"args":["mcp"],"cwd":"."}}}),
+                    )?,
+                ),
+                ("hooks/hooks.json".into(), serde_json::to_vec(hooks)?),
+                (
+                    executable(target).into(),
+                    b"fixture executable bytes".to_vec(),
+                ),
+            ]);
+            let tree = json!({"truncated":false,"tree":[{"path":".codex-plugin/plugin.json","type":"blob","mode":"100644","sha":blob(&files[".codex-plugin/plugin.json"])}]});
+            let hashes: BTreeMap<_, _> = files
+                .iter()
+                .map(|(name, bytes)| (name, sha(bytes)))
+                .collect();
+            let manifest = serde_json::to_vec(
+                &json!({"schema":1,"target":target,"sourceCommit":commit,"version":version,"files":hashes}),
+            )?;
+            files.insert("native-build.json".into(), manifest);
+            verify_native(&files, &commit, version, target, &tree)
+        };
+        let windows = "x86_64-pc-windows-msvc";
+        let old = legacy(windows);
+        assert!(verify(&old, windows).is_ok());
+        let mut current = old.clone();
+        for event in events {
+            current["hooks"][event][0]["hooks"][0]["commandWindows"] =
+                json!(hook_command::windows_hook_command(event).unwrap());
+        }
+        assert!(verify(&current, windows).is_ok());
+        // 全旧形式か全新形式だけを許可し、Stop 以外からの前提検査迂回も防ぐ。
+        for selected in 1u8..15 {
+            let mut mixed = old.clone();
+            for (index, event) in events.iter().enumerate() {
+                if selected & (1 << index) != 0 {
+                    mixed["hooks"][*event][0]["hooks"][0]["commandWindows"] =
+                        json!(hook_command::windows_hook_command(event).unwrap());
+                }
+            }
+            assert_eq!(
+                verify(&mixed, windows).unwrap_err().to_string(),
+                "PLUGIN_VALIDATION_FAILED"
+            );
+        }
+        for event in events {
+            for value in [
+                Value::Null,
+                json!(1),
+                json!("untrusted override"),
+                json!(
+                    hook_command::windows_hook_command(event)
+                        .unwrap()
+                        .replace(" -p -c ", " -c ")
+                ),
+                json!(hook_command::windows_hook_command("PreToolUse").unwrap() + " "),
+            ] {
+                let mut invalid = current.clone();
+                invalid["hooks"][event][0]["hooks"][0]["commandWindows"] = value;
+                assert_eq!(
+                    verify(&invalid, windows).unwrap_err().to_string(),
+                    "PLUGIN_VALIDATION_FAILED"
+                );
+            }
+            for base in [&old, &current] {
+                let mut alias = base.clone();
+                alias["hooks"][event][0]["hooks"][0]["command_windows"] =
+                    json!(hook_command::windows_hook_command(event).unwrap());
+                assert_eq!(
+                    verify(&alias, windows).unwrap_err().to_string(),
+                    "PLUGIN_VALIDATION_FAILED"
+                );
+            }
+        }
+        for target in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+            let mut hooks = legacy(target);
+            assert!(verify(&hooks, target).is_ok());
+            hooks["hooks"]["Stop"][0]["hooks"][0]["commandWindows"] =
+                json!(hook_command::windows_hook_command("Stop").unwrap());
+            assert_eq!(
+                verify(&hooks, target).unwrap_err().to_string(),
+                "PLUGIN_VALIDATION_FAILED"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hook_prerequisites_reject_missing_git_or_non_executable_pathext() {
+        let executable = std::env::current_exe().unwrap();
+        for value in [None, Some(""), Some(".BAT;.CMD"), Some(".EXE ")] {
+            assert_eq!(
+                windows_hook_prerequisites(&executable, value)
+                    .unwrap_err()
+                    .to_string(),
+                "WINDOWS_PATHEXT_EXE_REQUIRED"
+            );
+        }
+        for value in [".EXE", ".COM;.exe;.BAT;.CMD", ";.COM;.exe;;.BAT;.CMD;"] {
+            windows_hook_prerequisites(&executable, Some(value)).unwrap();
+        }
+        let missing =
+            executable.with_file_name(format!("missing-git-{}.exe", uuid::Uuid::new_v4()));
+        assert_eq!(
+            windows_hook_prerequisites(&missing, Some(".EXE"))
+                .unwrap_err()
+                .to_string(),
+            "WINDOWS_GIT_BASH_REQUIRED"
+        );
+        assert_eq!(
+            windows_hook_prerequisites(executable.parent().unwrap(), Some(".EXE"))
+                .unwrap_err()
+                .to_string(),
+            "WINDOWS_GIT_BASH_REQUIRED"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hook_resolution_rejects_script_and_alternate_extension_candidates() {
+        windows_hook_resolution(Some(".COM;.EXE;.BAT;.CMD"), |extension| {
+            Ok(extension.eq_ignore_ascii_case(".EXE"))
+        })
+        .unwrap();
+        windows_hook_resolution(Some(";.EXE;;"), |extension| Ok(extension == ".EXE")).unwrap();
+        assert_eq!(
+            windows_hook_resolution(Some(";.EXE;;"), |extension| Ok(
+                extension.is_empty() || extension == ".EXE"
+            ))
+            .unwrap_err()
+            .to_string(),
+            "WINDOWS_GIT_BASH_UNSAFE_RESOLUTION"
+        );
+        for hostile in ["", ".ps1", ".COM", ".BAT", ".CMD"] {
+            assert_eq!(
+                windows_hook_resolution(Some(".EXE;.COM;.BAT;.CMD"), |extension| Ok(extension
+                    .eq_ignore_ascii_case(".EXE")
+                    || extension.eq_ignore_ascii_case(hostile)))
+                .unwrap_err()
+                .to_string(),
+                "WINDOWS_GIT_BASH_UNSAFE_RESOLUTION"
+            );
+        }
+        assert_eq!(
+            windows_hook_resolution(Some(".EXE;../bad"), |extension| Ok(extension == ".EXE"))
+                .unwrap_err()
+                .to_string(),
+            "WINDOWS_GIT_BASH_UNSAFE_RESOLUTION"
+        );
+        assert!(
+            windows_hook_resolution(Some(".EXE"), |_| bail!("fixture metadata unavailable"))
+                .is_err()
+        );
+        assert!(path_equal(
+            &windows_program_files().unwrap(),
+            Path::new(r"C:\Program Files")
+        ));
+    }
+
     // 独立プロセスでのみ起動する、標準出力継承の再現用 fixture。
     #[test]
     #[ignore]
@@ -225,20 +408,7 @@ mod tests {
         #[cfg(any(unix, windows))]
         {
             fn alias(alias: &Path, target: &Path) {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(target, alias).unwrap();
-                #[cfg(windows)]
-                {
-                    let result = Command::new("cmd.exe")
-                        .args(["/D", "/C", "mklink", "/J"])
-                        .arg(alias)
-                        .arg(target)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .unwrap();
-                    assert!(result.success());
-                }
+                test_links::directory_link(target, alias).unwrap();
             }
             for name in ["work", "source", "external"] {
                 alias(&root.join(format!("alias-{name}")), &root.join(name));
@@ -1038,6 +1208,18 @@ fn verify_native(
             .is_some_and(|object| object.len() == events.len()),
         "PLUGIN_VALIDATION_FAILED"
     );
+    let overrides = events
+        .iter()
+        .filter(|event| {
+            hooks["hooks"][**event][0]["hooks"][0]
+                .get("commandWindows")
+                .is_some()
+        })
+        .count();
+    ensure!(
+        overrides == 0 || (target.ends_with("windows-msvc") && overrides == events.len()),
+        "PLUGIN_VALIDATION_FAILED"
+    );
     for event in events {
         let registration = &hooks["hooks"][event];
         let command = &registration[0]["hooks"][0];
@@ -1054,6 +1236,11 @@ fn verify_native(
             command["type"] == "command"
                 && command["command"]
                     == format!("\"${{PLUGIN_ROOT}}/{}\" hook {event}", executable(target))
+                && (command.get("commandWindows").is_none()
+                    || (target.ends_with("windows-msvc")
+                        && command["commandWindows"].as_str()
+                            == hook_command::windows_hook_command(event).as_deref()))
+                && command.get("command_windows").is_none()
                 && command["timeout"]
                     .as_u64()
                     .is_some_and(|timeout| timeout > 0),
@@ -1111,6 +1298,118 @@ fn verify_sources(files: &Files, tree: &Value, native: bool) -> Result<()> {
             "PACKAGE_HASH_MISMATCH"
         );
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_hook_resolution(
+    pathext: Option<&str>,
+    mut exists: impl FnMut(&str) -> Result<bool>,
+) -> Result<()> {
+    let extensions = pathext
+        .map(|value| value.split(';').collect::<Vec<_>>())
+        .unwrap_or_default();
+    ensure!(
+        extensions
+            .iter()
+            .any(|extension| extension.eq_ignore_ascii_case(".EXE")),
+        "WINDOWS_PATHEXT_EXE_REQUIRED"
+    );
+    // PowerShell は PATHEXT より先に .ps1 も解決する。前提を保守的に固定する。
+    ensure!(
+        !exists("")? && !exists(".ps1")?,
+        "WINDOWS_GIT_BASH_UNSAFE_RESOLUTION"
+    );
+    let mut executable = false;
+    for extension in extensions
+        .into_iter()
+        .filter(|extension| !extension.is_empty())
+    {
+        ensure!(
+            extension.starts_with('.')
+                && extension.len() <= 32
+                && extension[1..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()),
+            "WINDOWS_GIT_BASH_UNSAFE_RESOLUTION"
+        );
+        if exists(extension)? {
+            ensure!(
+                extension.eq_ignore_ascii_case(".EXE"),
+                "WINDOWS_GIT_BASH_UNSAFE_RESOLUTION"
+            );
+            executable = true;
+        }
+    }
+    ensure!(executable, "WINDOWS_GIT_BASH_REQUIRED");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_program_files() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath},
+    };
+    let mut raw = std::ptr::null_mut();
+    let status =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut raw) };
+    ensure!(
+        status >= 0 && !raw.is_null(),
+        "WINDOWS_GIT_BASH_UNSUPPORTED_LOCATION"
+    );
+    struct Folder(*mut u16);
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            unsafe {
+                CoTaskMemFree(self.0.cast());
+            }
+        }
+    }
+    let folder = Folder(raw);
+    let length = (0..32768)
+        .find(|&index| unsafe { *folder.0.add(index) == 0 })
+        .ok_or_else(|| anyhow::anyhow!("WINDOWS_GIT_BASH_UNSUPPORTED_LOCATION"))?;
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(folder.0, length)
+    })))
+}
+
+#[cfg(windows)]
+fn windows_hook_prerequisites(shell: &Path, pathext: Option<&str>) -> Result<()> {
+    let program_files = windows_program_files()?;
+    let local_c = matches!(program_files.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::Disk(b'C' | b'c') | std::path::Prefix::VerbatimDisk(b'C' | b'c')));
+    ensure!(
+        local_c
+            && no_links(&program_files, false).is_ok()
+            && no_links(Path::new(r"C:\Program Files"), false).is_ok()
+            && path_equal(&program_files, Path::new(r"C:\Program Files")),
+        "WINDOWS_GIT_BASH_UNSUPPORTED_LOCATION"
+    );
+    ensure!(
+        no_links(shell, false).is_ok()
+            && fs::metadata(shell).is_ok_and(|metadata| metadata.is_file()),
+        "WINDOWS_GIT_BASH_REQUIRED"
+    );
+    let mut signature = [0; 2];
+    ensure!(
+        fs::File::open(shell)
+            .and_then(|mut file| file.read_exact(&mut signature))
+            .is_ok()
+            && signature == *b"MZ",
+        "WINDOWS_GIT_BASH_REQUIRED"
+    );
+    let base = shell.with_extension("");
+    windows_hook_resolution(pathext, |extension| {
+        let mut candidate = base.as_os_str().to_owned();
+        candidate.push(extension);
+        match fs::symlink_metadata(Path::new(&candidate)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => bail!("WINDOWS_GIT_BASH_UNSAFE_RESOLUTION"),
+        }
+    })?;
     Ok(())
 }
 
@@ -1445,6 +1744,19 @@ fn update(argv: &[String]) -> Result<Value> {
         };
         (incoming, evidence, receipt)
     };
+    #[cfg(windows)]
+    if native && args.contains_key("--apply") {
+        let hooks: Value = serde_json::from_slice(&incoming["hooks/hooks.json"])?;
+        if hooks["hooks"]["Stop"][0]["hooks"][0]
+            .get("commandWindows")
+            .is_some()
+        {
+            windows_hook_prerequisites(
+                Path::new(hook_command::WINDOWS_SH),
+                env::var("PATHEXT").ok().as_deref(),
+            )?;
+        }
+    }
     let wanted = hashes(&incoming);
     let local = hashes_at(&source)?;
     let cached = hashes_at(&cache_path(&installed)?)?;
