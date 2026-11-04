@@ -586,11 +586,14 @@ impl GitHub {
         })
     }
     fn request(&self, method: Method, path: &str) -> reqwest::blocking::RequestBuilder {
+        let repository = format!("{}/repos/{}", self.origin, manifest::REPOSITORY);
+        let url = if path.is_empty() {
+            repository
+        } else {
+            format!("{repository}/{path}")
+        };
         self.http
-            .request(
-                method,
-                format!("{}/repos/{}/{path}", self.origin, manifest::REPOSITORY),
-            )
+            .request(method, url)
             .bearer_auth(&self.token)
             .header("User-Agent", "remnifold-native-publisher")
     }
@@ -1306,6 +1309,29 @@ fn publish_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn github_repository_endpoint_has_no_trailing_slash() {
+        let github = GitHub {
+            http: client().unwrap(),
+            origin: "https://api.github.com".into(),
+            token: "fixture-token".into(),
+            repository_id: 1,
+            public_origin: manifest::PUBLIC_BASE_URL.into(),
+        };
+        for path in ["", "actions/runs/1"] {
+            let request = github.request(Method::GET, path).build().unwrap();
+            let expected = format!(
+                "https://api.github.com/repos/{}{}",
+                manifest::REPOSITORY,
+                if path.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{path}")
+                }
+            );
+            assert_eq!(request.url().as_str(), expected);
+        }
+    }
     struct FixtureVerifier;
     impl ArchiveVerifier for FixtureVerifier {
         fn verify(
