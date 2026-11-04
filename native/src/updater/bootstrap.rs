@@ -431,23 +431,150 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn bootstrap_delivery_rejects_unsafe_persistent_ancestors() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{Authorization::*, *},
+            Storage::FileSystem::*,
+        };
+
+        struct LocalMemory(*mut std::ffi::c_void);
+        impl Drop for LocalMemory {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        LocalFree(self.0);
+                    }
+                }
+            }
+        }
+        fn security(path: &Path, add_delete_child: bool) -> Vec<u16> {
+            let file = fs::OpenOptions::new()
+                .access_mode(READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .unwrap();
+            unsafe {
+                let mut descriptor = std::ptr::null_mut();
+                let mut dacl = std::ptr::null_mut();
+                assert_eq!(
+                    GetSecurityInfo(
+                        file.as_raw_handle(),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut dacl,
+                        std::ptr::null_mut(),
+                        &mut descriptor
+                    ),
+                    0
+                );
+                let _descriptor = LocalMemory(descriptor);
+                if add_delete_child {
+                    let sid_text: Vec<u16> = "S-1-5-11".encode_utf16().chain(Some(0)).collect();
+                    let mut sid = std::ptr::null_mut();
+                    assert_ne!(ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid), 0);
+                    let _sid = LocalMemory(sid);
+                    let access = EXPLICIT_ACCESS_W {
+                        grfAccessPermissions: FILE_DELETE_CHILD,
+                        grfAccessMode: GRANT_ACCESS,
+                        grfInheritance: NO_INHERITANCE,
+                        Trustee: TRUSTEE_W {
+                            pMultipleTrustee: std::ptr::null_mut(),
+                            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                            TrusteeForm: TRUSTEE_IS_SID,
+                            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                            ptstrName: sid.cast(),
+                        },
+                    };
+                    let mut changed = std::ptr::null_mut();
+                    assert_eq!(SetEntriesInAclW(1, &access, dacl, &mut changed), 0);
+                    let _changed = LocalMemory(changed.cast());
+                    assert_eq!(
+                        SetSecurityInfo(
+                            file.as_raw_handle(),
+                            SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            changed,
+                            std::ptr::null()
+                        ),
+                        0
+                    );
+                    return security(path, false);
+                }
+                let mut text = std::ptr::null_mut();
+                let mut length = 0;
+                assert_ne!(
+                    ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        descriptor,
+                        SDDL_REVISION_1,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        &mut text,
+                        &mut length
+                    ),
+                    0
+                );
+                let _text = LocalMemory(text.cast());
+                std::slice::from_raw_parts(text, length as usize).to_vec()
+            }
+        }
+
         let root = env::temp_dir().join(format!("bootstrap-delivery-{}", uuid::Uuid::new_v4()));
         let _root = private_work::PrivateWorkGuard::open(&root).unwrap();
         let delivery = root.join("Remnifold/Downloads/bootstrap-fixture");
         let bytes = b"formal authenticated archive fixture";
-        // 共有 D: の祖先は一時ロックだけでは永続的な正式配送先にできない。
+        let input = root.join("input.tar.gz");
+        fs::write(&input, bytes).unwrap();
+        // 外側ドライブの owner/ACL に依存せず、fixture 自身を子の置換が可能な祖先にする。
+        let unsafe_security = security(&root, true);
+        let input_security = security(&input, false);
         assert_eq!(
-            deliver(
-                &delivery,
-                &root,
-                bytes,
-                &sha(bytes),
-                &root.join("processing")
-            )
-            .unwrap_err()
-            .to_string(),
+            private_work::PrivateWorkGuard::open(&root)
+                .err()
+                .unwrap()
+                .to_string(),
             "PRIVATE_WORK_ACL_UNSAFE"
         );
+        assert!(
+            security(&root, false) == unsafe_security,
+            "fixture ancestor security changed"
+        );
+        assert_eq!(fs::read(&input).unwrap(), bytes);
+        assert!(
+            security(&input, false) == input_security,
+            "fixture input security changed"
+        );
+        // 全祖先の検証は、さらに外側の未信頼 owner を先に検出する環境もある。
+        let error = deliver(
+            &delivery,
+            &root,
+            bytes,
+            &sha(bytes),
+            &root.join("processing"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            matches!(
+                error.as_str(),
+                "PRIVATE_WORK_OWNER_MISMATCH" | "PRIVATE_WORK_ACL_UNSAFE"
+            ),
+            "unexpected delivery error: {error}"
+        );
+        assert!(
+            security(&root, false) == unsafe_security,
+            "fixture ancestor security changed"
+        );
+        assert_eq!(fs::read(&input).unwrap(), bytes);
+        assert!(
+            security(&input, false) == input_security,
+            "fixture input security changed"
+        );
+        assert!(!delivery.exists());
         assert!(!delivery.join("remnifold.tar.gz").exists());
         assert!(
             deliver(
