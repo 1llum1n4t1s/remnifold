@@ -200,7 +200,6 @@ fn run() -> Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| repo.join("dist").join(format!("remnifold-{target}.tar.gz")));
             let archive = package::build(&repo, target, &binary, &output, &commit)?;
-            package::verify(&repo, target, &binary, &archive, &commit)?;
             verify_source(&repo, &archive, &commit, source_mode)?;
             println!("{}", archive.display());
         }
@@ -225,7 +224,6 @@ fn run() -> Result<()> {
                 .join(format!("remnifold-{target}.tar.gz"));
             let commit = source_commit(&repo, &options)?;
             let archive = package::build(&repo, target, &native, &output, &commit)?;
-            package::verify(&repo, target, &native, &archive, &commit)?;
             let legacy = options.get("--legacy-archive").map(PathBuf::from);
             let previous = options.get("--previous-archive").map(PathBuf::from);
             updater_e2e::run(

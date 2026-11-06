@@ -1,13 +1,9 @@
 //! 更新領域だけを保護し、祖先の差し替えを更新完了まで防ぐ。
+use super::path_safety::no_links;
+#[cfg(target_os = "macos")]
+use super::process as acl_process;
 use anyhow::{Result, bail, ensure};
 use std::{fs, path::Path};
-#[path = "path_safety.rs"]
-#[allow(dead_code)]
-mod path_safety;
-use path_safety::no_links;
-#[cfg(target_os = "macos")]
-#[path = "process.rs"]
-mod acl_process;
 #[cfg(test)]
 #[path = "../test_links.rs"]
 mod test_links;

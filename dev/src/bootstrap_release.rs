@@ -26,12 +26,10 @@ trait Remote {
         body: Option<Value>,
         bytes: Option<&[u8]>,
     ) -> Result<Option<Value>>;
-    fn attest(&self, tag: &str, asset: &Path) -> Result<()>;
 }
 struct GitHub {
     http: Client,
     token: String,
-    temporary: std::path::PathBuf,
 }
 impl Remote for GitHub {
     fn request(
@@ -86,20 +84,6 @@ impl Remote for GitHub {
         );
         Ok(Some(manifest::parse_strict(&bytes)?))
     }
-    fn attest(&self, tag: &str, asset: &Path) -> Result<()> {
-        checked_attestation(tag, asset, |args, capture| {
-            gh(
-                args,
-                if args == ["--version"] {
-                    None
-                } else {
-                    Some(&self.token)
-                },
-                &self.temporary,
-                capture,
-            )
-        })
-    }
 }
 fn require_safe_gh(bytes: &[u8]) -> Result<()> {
     let valid = (|| -> Option<bool> {
@@ -147,29 +131,6 @@ fn require_safe_gh(bytes: &[u8]) -> Result<()> {
     })()
     .unwrap_or(false);
     ensure!(valid, "GH_VERSION_UNSAFE");
-    Ok(())
-}
-fn checked_attestation(
-    tag: &str,
-    asset: &Path,
-    mut execute: impl FnMut(&[&str], bool) -> Result<Vec<u8>>,
-) -> Result<()> {
-    let version =
-        execute(&["--version"], true).map_err(|_| anyhow::anyhow!("GH_VERSION_UNSAFE"))?;
-    require_safe_gh(&version)?;
-    for args in [
-        vec!["release", "verify", tag, "--repo", manifest::REPOSITORY],
-        vec![
-            "release",
-            "verify-asset",
-            tag,
-            asset.to_str().context("Invalid bootstrap path")?,
-            "--repo",
-            manifest::REPOSITORY,
-        ],
-    ] {
-        execute(&args, false).context("GitHub release attestation verification failed; retain this invocation and retry without replacing assets")?;
-    }
     Ok(())
 }
 fn gh_environment(
@@ -299,8 +260,9 @@ fn publish(
                 value["immutable"] == true && matches,
                 "Existing bootstrap release is mutable or incomplete"
             );
-            verify_published(remote, &tag, path)?;
-            println!("Verified existing immutable bootstrap release {tag}");
+            state(path, &tag, "existing-publication-accepted")
+                .context("Existing remote publication was accepted; local receipt save failed. Do not republish or replace assets")?;
+            println!("Reused existing immutable bootstrap release {tag}");
             return Ok(());
         }
         ensure!(value["draft"] == true, "Invalid release draft state");
@@ -338,9 +300,10 @@ fn publish(
         "Bootstrap draft changed before publication"
     );
     // GitHub は draft に付く tag を publish 時に作る場合がある。
+    let current_tag_exists = tag_identity(remote, &tag, commit)?;
     ensure!(
-        tag_identity(remote, &tag, commit)?
-            || (!tag_exists && current["target_commitish"] == commit),
+        current_tag_exists
+            || (current["draft"] == true && !tag_exists && current["target_commitish"] == commit),
         "Bootstrap tag disappeared or draft target changed"
     );
     if current["draft"] == true {
@@ -350,27 +313,24 @@ fn publish(
             settings["enabled"] == true,
             "Release immutability changed before publication"
         );
-        state(path, &tag, "publication-attempted-verification-pending")?;
-        remote.request(
-            Method::PATCH,
-            &format!("releases/{id}"),
-            Some(json!({"draft":false,"make_latest":"false"})),
-            None,
-        )?;
+        state(path, &tag, "publication-attempted-outcome-unknown")?;
+        remote
+            .request(
+                Method::PATCH,
+                &format!("releases/{id}"),
+                Some(json!({"draft":false,"make_latest":"false"})),
+                None,
+            )
+            .map_err(|error| anyhow::anyhow!("Bootstrap publication request failed or outcome is unknown: {error}. Before retrying, inspect the release and this invocation receipt; do not replace the release or assets"))?;
+    } else {
+        ensure!(
+            current["draft"] == false && current["immutable"] == true,
+            "Concurrent bootstrap release lacks immutable identity evidence"
+        );
     }
-    state(path, &tag, "published-verification-pending")?;
-    let final_release = get(remote, &format!("releases/{id}"))?
-        .context("Published bootstrap release unavailable")?;
-    ensure!(
-        release_identity(&final_release, &tag)? == id
-            && final_release["draft"] == false
-            && final_release["immutable"] == true
-            && asset_matches(&final_release, &digest, binary.len() as u64)?
-            && tag_identity(remote, &tag, commit)?,
-        "Published bootstrap release lacks immutable identity evidence"
-    );
-    verify_published(remote, &tag, path)?;
-    println!("Verified immutable bootstrap release {tag}");
+    state(path, &tag, "publication-accepted")
+        .context("Remote publication was accepted; local receipt save failed. Do not republish or replace assets")?;
+    println!("GitHub accepted bootstrap publication {tag}");
     Ok(())
 }
 fn state(path: &Path, tag: &str, status: &str) -> Result<()> {
@@ -402,11 +362,6 @@ fn state(path: &Path, tag: &str, status: &str) -> Result<()> {
     fs::rename(&temporary, &destination)?;
     private_work::validate_receipt(&destination)?;
     Ok(())
-}
-fn verify_published(remote: &impl Remote, tag: &str, path: &Path) -> Result<()> {
-    state(path, tag, "published-verification-pending")?;
-    remote.attest(tag, path).context("Release is already published; verification is incomplete. Retry the same command; do not replace the release or assets")?;
-    state(path, tag, "verified")
 }
 pub fn run(repo: &Path, args: &[String]) -> Result<()> {
     let mut apply = false;
@@ -493,7 +448,6 @@ pub fn run(repo: &Path, args: &[String]) -> Result<()> {
             .timeout(Duration::from_secs(180))
             .build()?,
         token: token.into(),
-        temporary,
     };
     publish(&remote, &version, commit, &binary, &path, apply)
 }
@@ -547,8 +501,8 @@ mod tests {
     struct Fixture {
         replies: RefCell<VecDeque<(Method, String, Option<Value>)>>,
         writes: Cell<usize>,
-        attestations: Cell<usize>,
-        attest_ok: bool,
+        fail_patch: bool,
+        after_patch_link: Option<(std::path::PathBuf, std::path::PathBuf)>,
     }
     impl Fixture {
         fn new(replies: Vec<(Method, &str, Option<Value>)>) -> Self {
@@ -560,8 +514,8 @@ mod tests {
                         .collect(),
                 ),
                 writes: Cell::new(0),
-                attestations: Cell::new(0),
-                attest_ok: true,
+                fail_patch: false,
+                after_patch_link: None,
             }
         }
     }
@@ -585,12 +539,16 @@ mod tests {
                 method == expected_method && path == expected_path,
                 "Fixture request mismatch: {method} {path}"
             );
+            ensure!(
+                !(self.fail_patch && method == Method::PATCH),
+                "Fixture PATCH outcome unknown (HTTP 503)"
+            );
+            if method == Method::PATCH {
+                if let Some((receipt, linked)) = &self.after_patch_link {
+                    fs::hard_link(receipt, linked)?;
+                }
+            }
             Ok(result)
-        }
-        fn attest(&self, _: &str, _: &Path) -> Result<()> {
-            self.attestations.set(self.attestations.get() + 1);
-            ensure!(self.attest_ok, "Fixture signature rejection");
-            Ok(())
         }
     }
     fn tag() -> Value {
@@ -663,7 +621,7 @@ mod tests {
             ]);
             assert_eq!(run_fixture(&f, true).is_ok(), immutable && asset);
             assert_eq!(f.writes.get(), 0);
-            assert_eq!(f.attestations.get(), usize::from(immutable && asset));
+            assert!(f.replies.borrow().is_empty());
         }
     }
     #[test]
@@ -696,50 +654,35 @@ mod tests {
     }
     #[test]
     fn draft_retry_and_concurrent_publication_verify_without_overwrite() {
-        let f = Fixture::new(vec![
-            (
-                Method::GET,
-                "immutable-releases",
-                Some(json!({"enabled":true})),
-            ),
-            (Method::GET, "git/ref/tags/v1.0.17", Some(tag())),
-            (
-                Method::GET,
-                "releases/tags/v1.0.17",
-                Some(release(true, false, true)),
-            ),
-            (Method::GET, "releases/7", Some(release(false, true, true))),
-            (Method::GET, "git/ref/tags/v1.0.17", Some(tag())),
-            (Method::GET, "releases/7", Some(release(false, true, true))),
-            (Method::GET, "git/ref/tags/v1.0.17", Some(tag())),
-        ]);
-        run_fixture(&f, true).unwrap();
-        assert_eq!(f.writes.get(), 0);
-        assert_eq!(f.attestations.get(), 1);
+        for (immutable, tag_exists) in [(true, true), (false, true), (true, false)] {
+            let f = Fixture::new(vec![
+                (
+                    Method::GET,
+                    "immutable-releases",
+                    Some(json!({"enabled":true})),
+                ),
+                (Method::GET, "git/ref/tags/v1.0.17", None),
+                (
+                    Method::GET,
+                    "releases/tags/v1.0.17",
+                    Some(release(true, false, true)),
+                ),
+                (
+                    Method::GET,
+                    "releases/7",
+                    Some(release(false, immutable, true)),
+                ),
+                (Method::GET, "git/ref/tags/v1.0.17", tag_exists.then(tag)),
+            ]);
+            assert_eq!(run_fixture(&f, true).is_ok(), immutable && tag_exists);
+            assert_eq!(f.writes.get(), 0);
+            assert!(f.replies.borrow().is_empty());
+        }
     }
     #[test]
-    fn missing_immutable_or_signature_evidence_is_not_success() {
-        let mut f = Fixture::new(vec![
-            (
-                Method::GET,
-                "immutable-releases",
-                Some(json!({"enabled":true})),
-            ),
-            (Method::GET, "git/ref/tags/v1.0.17", Some(tag())),
-            (
-                Method::GET,
-                "releases/tags/v1.0.17",
-                Some(release(false, true, true)),
-            ),
-        ]);
-        f.attest_ok = false;
-        assert!(run_fixture(&f, true).is_err());
-        assert_eq!(f.writes.get(), 0);
-    }
-    #[test]
-    fn first_publication_uploads_once_and_requires_postpublication_evidence() {
-        for immutable in [true, false] {
-            let mut replies = vec![
+    fn first_publication_stops_after_one_accepted_patch() {
+        for (fail_patch, fail_receipt) in [(false, false), (true, false), (false, true)] {
+            let mut f = Fixture::new(vec![
                 (
                     Method::GET,
                     "immutable-releases",
@@ -763,21 +706,48 @@ mod tests {
                 (
                     Method::PATCH,
                     "releases/7",
-                    Some(release(false, immutable, true)),
+                    Some(release(false, true, true)),
                 ),
-                (
-                    Method::GET,
-                    "releases/7",
-                    Some(release(false, immutable, true)),
-                ),
-            ];
-            if immutable {
-                replies.push((Method::GET, "git/ref/tags/v1.0.17", Some(tag())));
+            ]);
+            f.fail_patch = fail_patch;
+            let root = fixture_root("bootstrap-release-patch-fixture").unwrap();
+            let _guard = private_work::PrivateWorkGuard::open(&root).unwrap();
+            let asset = root.join(ASSET);
+            if fail_receipt {
+                f.after_patch_link = Some((
+                    asset.with_extension("release-state.json"),
+                    root.join("receipt-link"),
+                ));
             }
-            let f = Fixture::new(replies);
-            assert_eq!(run_fixture(&f, true).is_ok(), immutable);
+            let result = publish(&f, "1.0.17", &"a".repeat(40), b"exe", &asset, true);
+            assert_eq!(result.is_ok(), !fail_patch && !fail_receipt);
+            if fail_patch {
+                let error = result.as_ref().unwrap_err().to_string();
+                assert!(error.contains("publication request failed or outcome is unknown"));
+                assert!(error.contains("HTTP 503"));
+                assert!(error.contains("inspect the release and this invocation receipt"));
+                assert!(error.contains("do not replace the release or assets"));
+            }
+            if fail_receipt {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("Remote publication was accepted; local receipt save failed")
+                );
+                assert!(error.contains("Do not republish or replace assets"));
+            }
+            let saved: Value = serde_json::from_slice(
+                &fs::read(asset.with_extension("release-state.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                saved["status"],
+                if fail_patch || fail_receipt {
+                    "publication-attempted-outcome-unknown"
+                } else {
+                    "publication-accepted"
+                }
+            );
             assert_eq!(f.writes.get(), 3);
-            assert_eq!(f.attestations.get(), usize::from(immutable));
             assert!(f.replies.borrow().is_empty());
         }
     }
@@ -805,18 +775,17 @@ mod tests {
         ]);
         assert!(run_fixture(&f, true).is_err());
         assert_eq!(f.writes.get(), 0);
-        assert_eq!(f.attestations.get(), 0);
     }
     #[test]
     fn state_replacement_is_atomic_and_rejects_linked_targets() -> Result<()> {
         let root = fixture_root("bootstrap-release-state-test")?;
         let _guard = private_work::PrivateWorkGuard::open(&root)?;
         let asset = root.join(ASSET);
-        state(&asset, "v1.0.17", "published-verification-pending")?;
-        state(&asset, "v1.0.17", "verified")?;
+        state(&asset, "v1.0.17", "publication-attempted-outcome-unknown")?;
+        state(&asset, "v1.0.17", "publication-accepted")?;
         let saved: Value =
             serde_json::from_slice(&fs::read(asset.with_extension("release-state.json"))?)?;
-        assert_eq!(saved["status"], "verified");
+        assert_eq!(saved["status"], "publication-accepted");
         assert!(fs::read_dir(&root)?.all(|entry| {
             entry
                 .unwrap()
@@ -828,11 +797,11 @@ mod tests {
         fs::write(&sentinel, b"unchanged")?;
         let linked = root.join("linked.exe");
         fs::hard_link(&sentinel, linked.with_extension("release-state.json"))?;
-        assert!(state(&linked, "v1.0.17", "verified").is_err());
+        assert!(state(&linked, "v1.0.17", "publication-accepted").is_err());
         assert_eq!(fs::read(&sentinel)?, b"unchanged");
         let directory = root.join("directory.exe");
         fs::create_dir(directory.with_extension("release-state.json"))?;
-        assert!(state(&directory, "v1.0.17", "verified").is_err());
+        assert!(state(&directory, "v1.0.17", "publication-accepted").is_err());
         Ok(())
     }
     #[test]
@@ -875,7 +844,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn unsafe_gh_versions_never_execute_attestation_commands() {
+    fn unsafe_gh_versions_are_rejected_before_token_lookup() {
         for version in [
             "gh version 2.92.0 (2026-05-01)\n",
             "gh version 2.93.0-rc1 (2026-05-01)\n",
@@ -887,40 +856,16 @@ mod tests {
             "gh version 9999999999999999999999.0.0 (2026-05-01)\n",
             "unknown\n",
         ] {
-            let mut calls = Vec::new();
-            let result = checked_attestation("v1.0.17", Path::new(ASSET), |args, capture| {
-                calls.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
-                assert!(capture);
-                Ok(version.as_bytes().to_vec())
-            });
-            assert_eq!(result.unwrap_err().to_string(), "GH_VERSION_UNSAFE");
-            assert_eq!(calls, vec![vec!["--version".to_string()]]);
+            assert_eq!(
+                require_safe_gh(version.as_bytes()).unwrap_err().to_string(),
+                "GH_VERSION_UNSAFE"
+            );
         }
-        let result = checked_attestation("v1.0.17", Path::new(ASSET), |args, _| {
-            assert_eq!(args, ["--version"]);
-            bail!("fixture unknown version command failure")
-        });
-        assert_eq!(result.unwrap_err().to_string(), "GH_VERSION_UNSAFE");
     }
     #[test]
-    fn patched_stable_gh_versions_verify_both_release_and_asset() {
+    fn patched_stable_gh_versions_are_accepted() {
         for version in ["2.93.0", "2.100.1", "3.0.0"] {
-            let mut calls = Vec::new();
-            checked_attestation("v1.0.17", Path::new(ASSET), |args, capture| {
-                calls.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
-                if args == ["--version"] {
-                    assert!(capture);
-                    return Ok(format!("gh version {version} (2026-05-28)\nhttps://github.com/cli/cli/releases/tag/v{version}\n").into_bytes());
-                }
-                assert!(!capture);
-                Ok(Vec::new())
-            }).unwrap();
-            assert_eq!(calls.len(), 3);
-            assert_eq!(&calls[1][..3], ["release", "verify", "v1.0.17"]);
-            assert_eq!(
-                &calls[2][..4],
-                ["release", "verify-asset", "v1.0.17", ASSET]
-            );
+            require_safe_gh(format!("gh version {version} (2026-05-28)\nhttps://github.com/cli/cli/releases/tag/v{version}\n").as_bytes()).unwrap();
         }
     }
     #[test]

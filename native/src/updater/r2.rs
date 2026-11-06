@@ -260,7 +260,12 @@ fn publication(context: &Context, index: &protocol::VersionIndex) -> Result<()> 
     bail!("R2_ANCHOR_DISCOVERY_LIMIT")
 }
 
-fn download(base: &str, key: &str, limit: u64) -> Result<Vec<u8>> {
+fn download(
+    client: &mut Option<reqwest::blocking::Client>,
+    base: &str,
+    key: &str,
+    limit: u64,
+) -> Result<Vec<u8>> {
     ensure!(safe_name(key), "INVALID_DISTRIBUTION_URL");
     let root = url::Url::parse(base).map_err(|_| anyhow::anyhow!("INVALID_DISTRIBUTION_URL"))?;
     let fixture =
@@ -285,13 +290,19 @@ fn download(base: &str, key: &str, limit: u64) -> Result<Vec<u8>> {
         "INVALID_DISTRIBUTION_URL"
     );
     // GitHub の認証ヘッダー・Cookie・資格情報を渡さず、転送も追従しない。
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|_| anyhow::anyhow!("R2_DOWNLOAD_FAILED"))?;
+    if client.is_none() {
+        *client = Some(
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
+                .build()
+                .map_err(|_| anyhow::anyhow!("R2_DOWNLOAD_FAILED"))?,
+        );
+    }
     let response = client
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("R2_DOWNLOAD_FAILED"))?
         .get(url)
         .send()
         .map_err(|_| anyhow::anyhow!("R2_DOWNLOAD_FAILED"))?;
@@ -324,7 +335,9 @@ pub(super) fn published(
     tree: &Value,
 ) -> Result<Published> {
     let latest = latest_ci(context, commit, version)?;
+    let mut public_client = None;
     let bytes = download(
+        &mut public_client,
         &config.public_base_url,
         &protocol::index_key(version),
         protocol::MAX_JSON as u64,
@@ -338,6 +351,7 @@ pub(super) fn published(
     );
     publication(context, &index)?;
     let bytes = download(
+        &mut public_client,
         &config.public_base_url,
         &index.manifest_key,
         protocol::MAX_JSON as u64,
@@ -363,7 +377,12 @@ pub(super) fn published(
         .ok_or_else(|| anyhow::anyhow!("R2_TARGET_MISSING"))?;
     let receipt = json!({"schema":2,"transport":"r2","repository":context.repository,"version":version,"sourceCommit":commit,"target":target,"runId":index.run_id,"runAttempt":index.run_attempt,"witnessRunId":latest["id"],"witnessRunAttempt":latest["run_attempt"],"witnessJobId":witness_job,"manifestSha256":index.manifest_sha256,"archiveSha256":asset.sha256,"nativeManifestSha256":asset.native_manifest_sha256,"manifestKey":index.manifest_key,"archiveKey":asset.key,"archiveSize":asset.size});
     let evidence = json!({"version":version,"sha":commit,"transport":"r2","runId":index.run_id,"runAttempt":index.run_attempt,"manifestSha256":index.manifest_sha256,"workRoot":context.work});
-    let bytes = download(&config.public_base_url, &asset.key, asset.size.min(LIMIT))?;
+    let bytes = download(
+        &mut public_client,
+        &config.public_base_url,
+        &asset.key,
+        asset.size.min(LIMIT),
+    )?;
     let files = {
         ensure!(
             bytes.len() as u64 == asset.size && sha(&bytes) == asset.sha256,
@@ -537,12 +556,12 @@ mod tests {
             "https://remnifold-updates.kagayoi.com:444",
         ] {
             assert_eq!(
-                download(base, "releases/1.0.15/index.json", 100)
+                download(&mut None, base, "releases/1.0.15/index.json", 100)
                     .unwrap_err()
                     .to_string(),
                 "INVALID_DISTRIBUTION_URL"
             );
         }
-        assert!(download(protocol::PUBLIC_BASE_URL, "../secret", 100).is_err());
+        assert!(download(&mut None, protocol::PUBLIC_BASE_URL, "../secret", 100).is_err());
     }
 }
