@@ -15,15 +15,15 @@
         "entry": "package/lib/tsc"
       },
       "workerd": {
-        "version": "1.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-arm64/-/workerd-darwin-arm64-1.20261102.1.tgz",
-        "integrity": "sha512-VanKNl3pLP2k8j9nEvETp/l3+dvfGvdWKI6bNJByKVz5szVVIMnGvDvrr+JmotreUZHWTDqfLh2RzPGRq1cZzg==",
+        "version": "1.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-arm64/-/workerd-darwin-arm64-1.20261106.1.tgz",
+        "integrity": "sha512-JV2/mFzpABuFtV6cHLS5q/SgNke84Zc5tVoXg/6mgVdIDZyaS0ReJxFmwhT855t4kJKGw9iviuwpllmsywQ/zA==",
         "entry": "package/bin/workerd"
       },
       "cloudflare_types": {
-        "version": "5.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
-        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "version": "5.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261106.1.tgz",
+        "integrity": "sha512-uQtZyYehF0hwImaFi0/z/BWeTC/DMKpEo+nCySs5WZwoMhnIqLnN3sVjS7GCBc222EWf+F6khsHPWIvPEaP6JA==",
         "entry": "package/index.d.ts"
       }
     },
@@ -41,15 +41,15 @@
         "entry": "package/lib/tsc"
       },
       "workerd": {
-        "version": "1.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-1.20261102.1.tgz",
-        "integrity": "sha512-cqMnRpvDT6v6K80YClFs7XnZMq2RC5H6aHawlrVsIHrmVdSEXUm7OEVMQ9lY5nx3EI4JftiTeFpkLHFZqTSNVg==",
+        "version": "1.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-1.20261106.1.tgz",
+        "integrity": "sha512-QkXgRV35gihA75nRlLPzcSGPHt86wTJS9jPIZbTGGgG/V1Qh4psc8zLztnzZMLEBPPnr7aAb6S7gseH9c/i4kw==",
         "entry": "package/bin/workerd"
       },
       "cloudflare_types": {
-        "version": "5.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
-        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "version": "5.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261106.1.tgz",
+        "integrity": "sha512-uQtZyYehF0hwImaFi0/z/BWeTC/DMKpEo+nCySs5WZwoMhnIqLnN3sVjS7GCBc222EWf+F6khsHPWIvPEaP6JA==",
         "entry": "package/index.d.ts"
       }
     },
@@ -67,15 +67,15 @@
         "entry": "package/lib/tsc"
       },
       "workerd": {
-        "version": "1.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-64/-/workerd-darwin-64-1.20261102.1.tgz",
-        "integrity": "sha512-5vxE27qqftDMv9H0mCZt0B1cr+EvszT/lhpoFmdKqtS2Uu+Jo2PMIUYGepLe6yxbdV1hPKkgLBD2scnW3lXe/Q==",
+        "version": "1.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-64/-/workerd-darwin-64-1.20261106.1.tgz",
+        "integrity": "sha512-6ntH6uUcK35s0ASAq7EK9RqdAKUfqBKQAGBWNfWEVaEpq9U/72Ej/mQbTzIG0dOfpXGJEkx6657fG3RbJ2697A==",
         "entry": "package/bin/workerd"
       },
       "cloudflare_types": {
-        "version": "5.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
-        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "version": "5.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261106.1.tgz",
+        "integrity": "sha512-uQtZyYehF0hwImaFi0/z/BWeTC/DMKpEo+nCySs5WZwoMhnIqLnN3sVjS7GCBc222EWf+F6khsHPWIvPEaP6JA==",
         "entry": "package/index.d.ts"
       }
     },
@@ -93,15 +93,15 @@
         "entry": "package/lib/tsc.exe"
       },
       "workerd": {
-        "version": "1.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workerd-windows-64/-/workerd-windows-64-1.20261102.1.tgz",
-        "integrity": "sha512-s9iKBbAdNIdVjpMUHh48zbCfCHw5wbLl8I2aIW74H3OtxpWZP/cHeEwZZMq3xAz5kt4MmvwwO4hDbNYoAD4yhw==",
+        "version": "1.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-windows-64/-/workerd-windows-64-1.20261106.1.tgz",
+        "integrity": "sha512-bRl5t/5a0ovliA+ksjAPspk2s4RX0RafsO5NN1NHS5lnrFxGqr5c+NtxlTnRodJxTUsQ7yZPeBgVCuthlPNrLA==",
         "entry": "package/bin/workerd.exe"
       },
       "cloudflare_types": {
-        "version": "5.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
-        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "version": "5.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261106.1.tgz",
+        "integrity": "sha512-uQtZyYehF0hwImaFi0/z/BWeTC/DMKpEo+nCySs5WZwoMhnIqLnN3sVjS7GCBc222EWf+F6khsHPWIvPEaP6JA==",
         "entry": "package/index.d.ts"
       }
     },
@@ -119,15 +119,15 @@
         "entry": "package/lib/tsc"
       },
       "workerd": {
-        "version": "1.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20261102.1.tgz",
-        "integrity": "sha512-hQdSdaHLS4UFGZRoue9TFVOO9UPnOAGWw3ZTZnUtXoUGWf4THwatq0l55F7IbOQYcOJfeKpHoFcMoGEH/88GCA==",
+        "version": "1.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20261106.1.tgz",
+        "integrity": "sha512-yRAKuderf90qBO/K8r6uIwVdNo5Akh2Fv9a6KPbiSABMCXdBR7zkF+fCG/dbaHqs9YXMbIhroJmcqRZUiMpHSQ==",
         "entry": "package/bin/workerd"
       },
       "cloudflare_types": {
-        "version": "5.20261102.1",
-        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261102.1.tgz",
-        "integrity": "sha512-rRNznLGla+8vRdToTN/5M+AzlopILSLLZ3qo2L5Ku/dY792iOlX/K9ZLkLnLYji1jycv7+FB12hiE+fFjVgMrw==",
+        "version": "5.20261106.1",
+        "url": "https://registry.npmjs.org/@cloudflare/workers-types/-/workers-types-5.20261106.1.tgz",
+        "integrity": "sha512-uQtZyYehF0hwImaFi0/z/BWeTC/DMKpEo+nCySs5WZwoMhnIqLnN3sVjS7GCBc222EWf+F6khsHPWIvPEaP6JA==",
         "entry": "package/index.d.ts"
       }
     }
