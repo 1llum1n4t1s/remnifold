@@ -4,33 +4,6 @@ A self-hosted Cloudflare memory server with remote MCP access and a Codex plugin
 
 The plugin saves completed work in a shared collection and keeps its project folder as provenance. Browse records by content topics, or ask about a topic such as “Chrome extension”: recall searches across memory spaces in one server request, injects concise indexes, and lets Codex open an applicable source record through MCP before reusing the implementation.
 
-## Codex memory organization
-
-After installing a compatible plugin and server, use [setup-remnifold](skills/setup-remnifold/SKILL.md) to enable, pause or change scheduled organization. Choose daily (standard) or another frequency such as weekly, and at most one batch per run (standard) or two. Registration uses Codex's official local automation controls and requires an explicit choice; the Codex app and PC must be running. Tasks follow the current Codex home/environment connection. Incompatible or unverified installations remain paused until readiness is established.
-
-Each run uses the [organize-memory skill](skills/organize-memory/SKILL.md), which resolves the currently installed executable and owns the finite prepare/commit procedure. Two batches allow up to forty processing-target source records and 96,000 UTF-16 source units, including partial or deferred work; they do not guarantee forty completed records. Existing candidate summaries (up to eight/24,000 units per prepare) and targeted lookup/source/getDocument evidence reads are additional, so these are not total reading or token guarantees. Lookup is limited to two calls per run; unresolved work is deferred rather than expanding into bulk original-record exploration. Existing paused tasks are not silently replaced or activated, and an older chat may need a new chat after plugin delivery to discover this skill.
-
-With a server containing migration `0009_memory_organization.sql`, a trusted native build can prepare small organization batches for Codex without replacing the installed plugin:
-
-```text
-remnifold memory-organize prepare
-remnifold memory-organize lookup
-remnifold memory-organize commit
-remnifold memory-organize sources <summary-document-id> [cursor]
-```
-
-`prepare` uses the existing owner connection and emits JSON with a thirty-minute batch lease, source IDs/revisions/chunks, private continuation notes and candidate summaries. `lookup` reads `{"query":"a concise topic"}` from stdin. `commit` reads one JSON object from stdin containing `batchId`, `summaries`, and `coverage`. Each summary has a unique local `ref`, `title`, `topic`, `content`, and `sources` (prepared IDs); to replace a candidate also supply its `id` and `revision`. Each coverage entry has `id`, `revision`, `status` (`complete`, `partial`, or `deferred`), and `summaries` (local references). Partial entries also require a continuation `memo` and publish no summary yet. Use `complete` only after all source chunks and important topics are represented, preserving conclusions, reasons and uncertainty. Codex is responsible for this judgment.
-
-Multipart captures return a `group` while discovering and reading their complete version. During these phases commit `groupProgress: {"status":"partial","memo":"bounded conclusions, reasons and open questions"}` with empty `summaries` and `coverage`; use `deferred` for an incomplete or ambiguous group. Only the `ready` phase permits the returned final anchor to be summarized and completely covered. No part is hidden while another part or chunk remains unread. Retain evidence IDs and a known decision date, or explicitly state that its date is unknown. Import, edit and summary-generation dates do not prove when a conclusion was reached; an older record arriving later must not automatically replace a newer decision.
-
-Conflicting records for the same logical capture stay visible and deferred, including identical-content copies stored under different document IDs. Official retries reusing the same document ID retain their existing behavior. Unsafe integer turn/part values also defer without changing the original; ordinary documents with fractional values are not held merely for being fractional. Organization does not combine all capture revisions into a new merged history.
-
-Each batch processes at most twenty target source records and 48,000 UTF-16 source units; each source chunk is capped at 8,000. Candidate-summary and auxiliary evidence reads are separate from this source budget. A commit publishes at most eight summaries and 24,000 UTF-16 units across their titles, topics and content, with additional per-field limits documented in the execution skill. Sources must share the same returned `partition`: physical space, scope, project identity/display name and recall eligibility are preserved. Completely represented originals leave normal search and topic recall only while their summaries remain valid. Recent-task awareness cues retain their existing session grouping and eligibility. With AI enabled, an original already supporting semantic search stays visible until its summaries have verified embeddings/vectors. With AI disabled, lexical coverage is sufficient; original vectors are retained until semantic replacements are ready, so enabling AI can temporarily reveal those originals until semantic readiness catches up. Completed coverage is not selected for organization again while vectors are pending. Previously deleted original vectors are restored in bounded reconciliation pages after invalidation; lexical/direct retrieval recovers first, and the fifteen-minute cron interval does not guarantee vector completion. Changes or forgetting invalidate dependent summaries and make surviving originals searchable again. Older project checkpoints may still expose old information until they are processed as whole records. No original is deleted.
-
-`sources` is read-only and returns up to fifty recorded source IDs, physical spaces and dates plus a continuation cursor. A `sourceKind: "checkpoint"` entry is an intermediate record: use its getDocument preview and cursor to reach its recorded members. Multipart members and direct sources may repeat through separate provenance paths. Missing historical membership is not invented. Retrieve bodies through the existing getDocument tool. A cursor stops with conflict if its parent record changes. Current remote MCP clients also receive a small source preview in getDocument and can page with `sourceCursor`; cursor requests return only the source page. Older installed native plugins may omit these added fields, so use the new CLI to discover IDs without replacing the plugin.
-
-These commands neither schedule Codex nor deploy/migrate a server. A periodic Codex task can call them using its subscription execution environment. Summary embeddings use the existing Workers AI service and can incur its normal usage; no automatic fact generation runs for organization summaries. Concurrent retries share a fenced attempt; recovering an expired attempt can still overlap an already-running external AI call. Unsupported servers stop explicitly. JSON input has a thirty-second stdin deadline and a 128,000-byte limit; HTTP waits are bounded. `commit --line` and `lookup --line` accept one compact JSON line terminated by a newline without requiring EOF. Use a non-echoing input channel and keep generated text out of shell arguments and command logs.
-
 ## Requirements
 
 Remote MCP clients connect to the deployed server without installing Node.js or Codex locally. The optional Codex integration requires Codex with plugin and hook support and the package matching your operating system and CPU. Its MCP server, hooks, connection setup, history import, and local plugin updater run as a native executable without Node.js. Local plugin updates also require authenticated GitHub CLI and native Codex CLI.
@@ -61,9 +34,10 @@ Starting with 1.0.16, published native packages are served from [Remnifold updat
 | --- | --- |
 | Windows x64 | `x86_64-pc-windows-msvc` |
 | Mac Apple Silicon | `aarch64-apple-darwin` |
-| Mac Intel | `x86_64-apple-darwin` |
 | Linux x64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
+
+Mac Intel is not supported.
 
 For an existing `remnifold@personal` installation, use the native executable's `plugin-update` command with authenticated native GitHub CLI and Codex CLI. The updater verifies the release commit, successful CI publisher logs, R2 manifest, archive hashes, and package source before using Codex's official plugin CLI. Publication does not update your installation automatically.
 
@@ -171,6 +145,29 @@ Update the server and apply its migrations before installing a client that uses 
 On macOS and Linux use `./bin/remnifold topics-setup --limit 10`. The default batch is 10; `--limit` accepts 1–50. Add `--apply` to queue that finite batch when remote enrichment is intended. This uses existing Workers AI billing, refreshes derived AI/vector/fact enrichment, and invalidates affected project checkpoints while preserving opt-outs and revision guards. The result reports accepted jobs, not completed classification. Wait for processing to finish before selecting the next batch; inspect `getDocument` and `listTopics` to verify the result.
 
 The API key grants access to the records in one server installation. Use separate installations for separate trust boundaries. Redaction reduces accidental secret capture; review what you choose to store in your own backend.
+
+## Codex memory organization
+
+After installing a compatible plugin and updating the server through migration `0009_memory_organization.sql`, use [setup-remnifold](skills/setup-remnifold/SKILL.md) to enable, pause or change scheduled organization. Choose daily (standard) or another frequency such as weekly, and at most one batch per run (standard) or two. Registration uses Codex's official local automation controls and requires an explicit choice; the Codex app and PC must be running. Tasks follow the current Codex home/environment connection. Incompatible or unverified installations remain paused until readiness is established. Existing paused tasks are not silently replaced or activated; start a new chat after plugin delivery if the organization skill is unavailable.
+
+Each run follows the [organize-memory skill](skills/organize-memory/SKILL.md) using the currently installed executable. One batch processes at most twenty target records and 48,000 UTF-16 source units; two allow at most forty and 96,000, including partial or deferred work. These are not completed-record counts or total reading/token guarantees: candidate summaries and targeted evidence reads are additional. Lookup is limited to two calls per run. Unresolved work is deferred rather than expanding into bulk exploration.
+
+For direct CLI use, run the platform executable from the extracted plugin folder (`./bin/remnifold` on macOS/Linux):
+
+```text
+./bin/remnifold.exe memory-organize prepare
+./bin/remnifold.exe memory-organize lookup --line
+./bin/remnifold.exe memory-organize commit --line
+./bin/remnifold.exe memory-organize sources <summary-document-id> [cursor]
+```
+
+These commands use the existing owner API-key connection; remote MCP OAuth credentials cannot authorize organization. They neither schedule Codex nor deploy/migrate a server. `prepare` creates a thirty-minute lease and returns source IDs/revisions/chunks, continuation notes and candidate summaries; it is not a read-only connectivity check. `lookup` reads `{"query":"a concise topic"}` from stdin. `commit` reads a JSON object containing `batchId`, `summaries`, and `coverage`. Follow the execution skill's exact field limits, partition rules and multipart `groupProgress` procedure. Declare `complete` only when every chunk and important topic is represented, preserving conclusions, reasons, evidence and uncertainty; use partial continuation or deferral when that cannot be done. Codex makes this judgment. Check the commit receipt and distinguish published summaries from unfinished progress.
+
+JSON stdin has a thirty-second deadline and a 128,000-byte UTF-8 limit including escaping. `--line` requires one compact JSON line and its terminating newline; without it, close stdin after the object. Use a non-echoing input channel and keep generated text out of shell arguments and command logs. Unsupported servers stop explicitly without a save/forget fallback.
+
+No original is deleted. Fully represented originals leave normal search and topic recall only while their summaries remain valid; original IDs/bodies stay directly retrievable, and recent-task awareness retains its existing eligibility. Conflicting captures remain visible and deferred. Changes or forgetting invalidate dependent summaries and expose surviving originals again. Older project checkpoints can still expose information until they are processed as whole records. With AI enabled, originals already supporting semantic search wait for verified summary embeddings/vectors before disappearing. With AI disabled, lexical coverage is sufficient; enabling AI can reveal originals again until semantic replacements are ready. Vector recovery is asynchronous, and the fifteen-minute cron is not a completion deadline. Summary embeddings use existing Workers AI billing; Codex generates the prose.
+
+`sources` is read-only and pages up to fifty recorded source IDs, spaces and dates. Retrieve bodies with getDocument; follow a checkpoint's own source preview/cursor to its recorded members. Separate provenance paths may repeat an ID. Current native and remote MCP getDocument responses also include a source preview and optional `sourceCursor` paging; older native plugins can use the CLI when they omit these fields. Cursors stop with conflict if their parent changes. The [organization design](DESIGN.md#codex-organization) describes coverage, invalidation and vector recovery in detail.
 
 ## Upgrading from 1.x names
 
