@@ -358,7 +358,7 @@ fn migration_sql_table(t: &dyn Transport, prefix: &str, id: &str, table: &str) -
             sql.push_str(&format!("CREATE TABLE IF NOT EXISTS {quoted} (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL);\n"));
         }
         sql.push_str(body);
-        sql.push_str(&format!("\n;\nINSERT INTO {quoted}(name) VALUES ('"));
+        sql.push_str(&format!("\nINSERT INTO {quoted}(name) VALUES ('"));
         sql.push_str(&name.replace('\'', "''"));
         sql.push_str("');\n");
     }
