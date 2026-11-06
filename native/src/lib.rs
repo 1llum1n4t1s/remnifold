@@ -5,6 +5,7 @@ pub mod hooks;
 pub mod live_test;
 pub mod local;
 pub mod mcp;
+pub mod organization;
 pub mod provision;
 pub mod release_manifest;
 pub mod search;

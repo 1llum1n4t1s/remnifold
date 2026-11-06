@@ -45,7 +45,6 @@ function adapter(db) {
 
 test("display, ranking, checkpoint and Unicode contracts", async () => {
 const db = new DatabaseSync(":memory:");
-const checks = [];
 const fixtureRecords=new Map();
 
 let artifact;
@@ -97,7 +96,7 @@ try {
         if(typeof value==='number'){assert.ok(typeof actual==='number'&&Math.abs(actual-value)<=1e-12,`${name}: ${key}`);normalized.results[i][key]=value;}
       }
       assert.deepEqual(normalized,expected,`${name}: complete public JSON`);
-    }    checks.push({name,passed:true});return {current};
+    }    return {current};
   }  async function seed(customId, containerTag, content, metadata = {}, topics = []) {
     metadata={...metadata,...(topics.length?{topics:[...topics]}:{})};
     const saved = await request(after, "/v3/documents", { customId, containerTag, content, metadata });
@@ -115,7 +114,6 @@ try {
   for (let i = 0; i < 50; i++) displayIds.push(await seed(`display-${i}`, "display", `Stored display evidence ${i}`,
     { title: `Evidence ${i}`, filepath: `fixture/${i}.md`, sm_project_id: "display-project", sm_scope: "private", memoryIndex: index(`Evidence ${i}`) }, ["Evidence"]));
   assert.equal((await request(after, `/v3/documents/${displayIds[0]}`, undefined, "GET", false)).status, 401);
-  checks.push({ name: "unauthenticated display read rejected", passed: true });
 
   const readOne = await compare("GET retains all public fields", `/v3/documents/${displayIds[0]}`, undefined, "GET");
   const listFull = await compare("full list retains all public fields", "/v3/documents/list", { containerTag: "display", projection: "full", limit: 50 });
@@ -213,7 +211,6 @@ try {
   assert.match(unicodeExcerpt, /targetneedle/u);
   assert.ok(unicodeContent.includes(unicodeExcerpt.replace(/^…|…$/gu, "")));
 
-  checks.push({ name: "authenticated excerpt maps expanded lowercase offsets back to original source", passed: true });
 
   const longUnicodeContent = "İ".repeat(4_000) + " targetneedle answer";
   const fullUnicodeId = await seed("unicode-full-excerpt-offset", "unicode-full-excerpt", longUnicodeContent,
@@ -226,7 +223,6 @@ try {
   assert.equal(fullUnicodeRow.memory, fullUnicodeRow.content);
   assert.ok(longUnicodeContent.includes(fullUnicodeRow.content.replace(/^…|…$/gu, "")));
 
-  checks.push({ name: "authenticated manual full-search excerpt maps locale lowercase offsets", passed: true });
 
   // Static reference comparator checks stable ties without running a historical Worker or timings.
   const candidates=Array.from({length:200},(_,i)=>({id:`sort-${i%197}`,content:'',container_tag:'synthetic',created_at:timestamp,updated_at:timestamp,metadata_json:JSON.stringify({memoryIndex:index(i%6?'Orion':'Orion transport'),sm_consolidation:i%11===0}),...(i%4?{}:{searchExcerpt:'transport AbortSignal.timeout'})}));
@@ -266,7 +262,6 @@ try {
   assert.match(after.searchExcerpt("İ".repeat(100) + " ΟΣ.", ["ος"]), /ΟΣ/u);
   assert.match(after.searchExcerpt("x".repeat(100) + "İ", ["i\u0307"]), /İ/u);
   assert.match(after.searchExcerpt("İ".repeat(100) + "😀", ["😀"]), /😀/u);
-  checks.push({ name: "expanded lowercase offsets retain contextual sigma, surrogate positions and original text", passed: true });
   const originalLocaleLower = String.prototype.toLocaleLowerCase;
   try {
     for (const locale of ["en", "tr", "lt"]) {
@@ -280,7 +275,6 @@ try {
     }
   } finally { String.prototype.toLocaleLowerCase = originalLocaleLower; }
   assert.equal(String.prototype.toLocaleLowerCase, originalLocaleLower);
-  checks.push({ name: "locale source excerpts preserve Turkish contractions and Lithuanian context", passed: true });
 
 } finally { db.close(); }
 });

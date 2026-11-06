@@ -26,7 +26,7 @@ const tools = [
   tool("consolidate_memory", "Consolidate a project's memories while retaining originals.", { projectId: project }, ["projectId"], false),
   tool("listMemories", "List memories across physical spaces.", { ...paging, containerTag: tag, topic: text("Exact topic or __unclassified__", 80) }),
   tool("listDocuments", "List memory documents across physical spaces.", { ...paging, containerTag: tag, topic: text("Exact topic or __unclassified__", 80) }),
-  tool("getDocument", "Read a complete document using its original ID.", { documentId: text("Document ID", 64) }, ["documentId"]),
+  tool("getDocument", "Read a complete document using its original ID. Organization summaries include source IDs; pass nextCursor as sourceCursor to continue. Cursor pages contain source identities only, without document content. Continue while hasMore is true, including empty pages.", { documentId: text("Document ID", 64), sourceCursor: text("Organization source page cursor; returns source identities without document content", 2048) }, ["documentId"]),
   tool("listTopics", "List memory topics.", paging),
   tool("listSpaces", "List physical memory spaces.", {}),
   tool("whoAmI", "Show the connected memory account.", {}),
@@ -63,8 +63,8 @@ async function callTool(name: string, args: Json, request: Request, options: Mcp
     if (!response.ok) throw new Error(`Memory API request failed (${response.status})`);
     return await response.json();
   };
-  if (name === "search_memory") return api("/v4/search", "POST", { q: args.query, indexOnly: true, limit: args.limit ?? 8, ...(args.containerTag ? { containerTag: args.containerTag } : { allContainers: true }) });
-  if (name === "getDocument") return api(`/v3/documents/${encodeURIComponent(args.documentId as string)}`);
+  if (name === "search_memory") return api("/v4/search", "POST", { q: args.query, indexOnly: true, manualContext: true, limit: args.limit ?? 8, ...(args.containerTag ? { containerTag: args.containerTag } : { allContainers: true }) });
+  if (name === "getDocument") return api(`/v3/documents/${encodeURIComponent(args.documentId as string)}${args.sourceCursor ? `?sourceCursor=${encodeURIComponent(args.sourceCursor as string)}` : ""}`);
   if (name === "listSpaces") return api("/v3/container-tags");
   if (name === "whoAmI") return api("/v3/session");
   if (name === "listTopics") return api(`/v4/topics?page=${args.page ?? 1}&limit=${args.limit ?? 50}`);

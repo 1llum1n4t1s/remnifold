@@ -1,5 +1,5 @@
 // 認証済みWorkerと移行済みSQLiteを使う検証の共通fixture。シナリオは呼び出し元に置く。
-import { assert } from "./support/test.mjs";
+import test, { assert } from "./support/test.mjs";
 import { migrations, applyMigrations } from "./support/migrations.mjs";
 
 import { DatabaseSync } from "./support/sqlite.mjs";
@@ -10,6 +10,12 @@ export { migrations };
 export const checkpoint = { title: "Checkpoint", overview: "Verified restart state.", verified: ["Sources stored."], unverified: [], unresolved: [], nextActions: [] };
 export const output = (value, finish_reason = "stop") => ({ choices: [{ finish_reason, message: { content: typeof value === "string" ? value : JSON.stringify(value) } }] });
 export const embedding = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
+
+export function scenarioWithLogs(name, run) { test(name, async () => {
+ const f=fixture(); const logs=[]; const original={log:console.log,error:console.error,warn:console.warn};
+ const capture=(...values)=>{for(const value of values){try{logs.push(JSON.parse(value))}catch{}}};Object.keys(original).forEach(k=>console[k]=capture);
+ try { await run(f, logs); } catch(error) { original.error(JSON.stringify({test:name,events:logs})); throw error; } finally { await f.drain(); Object.assign(console,original); f.db.close(); }
+}); }
 
 export function fixture() {
   const db = new DatabaseSync(":memory:");

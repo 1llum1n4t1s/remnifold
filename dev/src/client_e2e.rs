@@ -977,7 +977,422 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
     let diagnostics = diagnostic_contracts(binary, &project, endpoint, &client, work);
     recall?;
     diagnostics?;
+    organization_contracts(binary, &home, &project, endpoint, &client)?;
     fixture.cleanup_state()?;
+    Ok(())
+}
+fn organization_contracts(
+    binary: &Path,
+    home: &Path,
+    project: &Path,
+    endpoint: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<()> {
+    client
+        .get(format!("{endpoint}/__reset"))
+        .send()?
+        .error_for_status()?;
+    client
+        .post(format!("{endpoint}/__configure"))
+        .json(&json!({"AI_ENRICHMENT_MODE":"off"}))
+        .send()?
+        .error_for_status()?;
+    let source: Value = client.post(format!("{endpoint}/v3/documents"))
+        .bearer_auth(API_KEY).json(&json!({"containerTag":"memories","content":"OrganizationNative original evidence 😀","metadata":{"type":"conversation","sessionId":"organized-task"}}))
+        .send()?.error_for_status()?.json()?;
+    for n in 1..7 {
+        client.post(format!("{endpoint}/v3/documents"))
+            .bearer_auth(API_KEY).json(&json!({"containerTag":"memories","content":format!("OrganizationNative original evidence {n} 😀"),"metadata":{"type":"conversation","sessionId":"organized-task"}}))
+            .send()?.error_for_status()?;
+    }
+    let invoke = |action: &str, body: Value| -> Result<Value> {
+        let mut cmd = command(binary, home, project, endpoint);
+        cmd.args(["memory-organize", action]);
+        let output = process_output(cmd, &serde_json::to_vec(&body)?)?;
+        ensure!(
+            output.status.success(),
+            "organization CLI failed (redacted)"
+        );
+        serde_json::from_slice(&output.stdout).context("organization JSON output")
+    };
+    let batch = invoke("prepare", json!({}))?;
+    ensure!(
+        batch["sources"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 7),
+        "organization bounded prepare"
+    );
+    let selected = batch["sources"]
+        .as_array()
+        .context("organization sources")?;
+    let commit = json!({"batchId":batch["batchId"],"summaries":[{"ref":"final","title":"OrganizationNative final conclusion","topic":"OrganizationNative","content":"OrganizationNative selected the validated approach because the original evidence supports it. 😀","sources":selected.iter().map(|s| s["id"].clone()).collect::<Vec<_>>()}],
+        "coverage":selected.iter().map(|s| json!({"id":s["id"],"revision":s["revision"],"status":"complete","summaries":["final"]})).collect::<Vec<_>>()});
+    let published = invoke("commit", commit.clone())?;
+    ensure!(
+        invoke("commit", commit)? == published,
+        "organization idempotent CLI replay"
+    );
+    ensure!(
+        invoke("lookup", json!({"query":"OrganizationNative"}))?["summaries"]
+            .as_array()
+            .is_some_and(|s| s.len() == 1),
+        "organization lookup"
+    );
+    let mut mcp = Mcp::start(binary, home, project, endpoint)?;
+    mcp.exchange(
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{}}),
+    )?;
+    let found = mcp.tool("search_memory", json!({"query":"OrganizationNative"}))?;
+    ensure!(
+        found["results"]
+            .as_array()
+            .is_some_and(|r| !r.iter().any(|d| d["id"] == source["id"])
+                && r.iter()
+                    .any(|d| d["id"] == published["summaries"][0]["memoryId"])),
+        "organization hides original through real MCP search"
+    );
+    let summary_id = found["results"]
+        .as_array()
+        .context("organization search results")?
+        .iter()
+        .find(|row| row["id"] == published["summaries"][0]["memoryId"])
+        .and_then(|row| row["id"].as_str())
+        .context("discovered summary ID")?;
+    let preview = mcp.exchange(
+        "tools/call",
+        json!({"name":"getDocument","arguments":{"documentId":summary_id}}),
+    )?;
+    ensure!(preview["isError"] != true, "organization summary retrieval");
+    let first = &preview["structuredContent"]["document"]["organizationSources"];
+    ensure!(
+        first["sources"].as_array().is_some_and(|s| s.len() == 5) && first["hasMore"] == true,
+        "organization native MCP source preview"
+    );
+    let preview_text = preview["content"][0]["text"]
+        .as_str()
+        .context("organization source text")?;
+    ensure!(
+        preview_text.contains(first["sources"][0]["id"].as_str().context("source ID")?)
+            && preview_text.contains("nextCursor"),
+        "organization native MCP source text"
+    );
+    let second = mcp.tool(
+        "getDocument",
+        json!({"documentId":summary_id,"sourceCursor":first["nextCursor"]}),
+    )?;
+    let second = &second["document"]["organizationSources"];
+    ensure!(
+        second["sources"].as_array().is_some_and(|s| s.len() == 2) && second["hasMore"] == false,
+        "organization native MCP source next page"
+    );
+    let mut source_ids = std::collections::HashSet::new();
+    for row in first["sources"]
+        .as_array()
+        .context("preview source list")?
+        .iter()
+        .chain(second["sources"].as_array().context("second source list")?)
+    {
+        let id = row["id"].as_str().context("organization original ID")?;
+        ensure!(
+            source_ids.insert(id.to_owned()),
+            "organization duplicate source ID"
+        );
+        let original = mcp.tool("getDocument", json!({"documentId":id}))?;
+        ensure!(
+            original["document"]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("original evidence")),
+            "organization native MCP source hydration"
+        );
+    }
+    ensure!(
+        source_ids.len() == 7,
+        "organization complete source membership"
+    );
+    ensure!(
+        mcp.tool("getDocument", json!({"documentId":source["id"]}))?
+            .to_string()
+            .contains("original evidence"),
+        "organization source retrieval"
+    );
+    let mut sources = command(binary, home, project, endpoint);
+    sources.args([
+        "memory-organize",
+        "sources",
+        published["summaries"][0]["memoryId"]
+            .as_str()
+            .context("summary ID")?,
+    ]);
+    let output = process_output(sources, b"")?;
+    ensure!(
+        output.status.success(),
+        "organization sources CLI failed (redacted)"
+    );
+    let page: Value = serde_json::from_slice(&output.stdout)?;
+    ensure!(
+        page["sources"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 7 && rows.iter().any(|row| row["id"] == source["id"]))
+            && page["hasMore"] == false,
+        "organization sources CLI preserves original identity"
+    );
+    organization_checkpoint_journey(&mut mcp, endpoint, client)?;
+    organization_numeric_conflict_journey(binary, home, project, endpoint, client, &mut mcp)?;
+    mcp.close()?;
+    let mut bad = command(binary, home, project, endpoint);
+    bad.args(["memory-organize", "commit"]);
+    let failed = process_output(bad, b"{private invalid JSON secret}")?;
+    ensure!(
+        !failed.status.success()
+            && !String::from_utf8_lossy(&failed.stderr).contains("private invalid JSON secret"),
+        "organization redacted invalid input"
+    );
+    println!("Organization CLI/workerd contracts passed");
+    Ok(())
+}
+
+fn organization_numeric_conflict_journey(
+    binary: &Path,
+    home: &Path,
+    project: &Path,
+    endpoint: &str,
+    client: &reqwest::blocking::Client,
+    mcp: &mut Mcp,
+) -> Result<()> {
+    client
+        .get(format!("{endpoint}/__reset"))
+        .send()?
+        .error_for_status()?;
+    let sql = |statement: &str, params: Value| -> Result<Value> {
+        Ok(client
+            .post(format!("{endpoint}/__sql"))
+            .json(&json!({"sql":statement,"params":params}))
+            .send()?
+            .error_for_status()?
+            .json()?)
+    };
+    sql(
+        "INSERT OR IGNORE INTO container_tags(tag,name,created_at,updated_at) VALUES ('memories','Memories','now','now')",
+        json!([]),
+    )?;
+    for (id, turn, part, date) in [
+        ("numeric-native-old", "1.0", "1e0", "2020-01-01T00:00:00Z"),
+        (
+            "numeric-native-latest",
+            "1e0",
+            "1.0",
+            "2026-01-01T00:00:00Z",
+        ),
+    ] {
+        let metadata = format!(
+            r#"{{"type":"conversation","sessionId":"numeric-native-session","turn":{turn},"part":{part},"parts":1,"sm_project_id":"numeric-native-project","memoryIndex":{{"version":1,"title":"NumericNativeConflict evidence","description":"NumericNativeConflict reviewed decision","recallable":true,"sourceUpdatedAt":"{date}"}}}}"#
+        );
+        sql(
+            "INSERT INTO memories(id,custom_id,container_tag,content,metadata_json,created_at,updated_at) VALUES (?,?,'memories',?,?,?,?)",
+            json!([
+                id,
+                id,
+                format!("NumericNativeConflict original evidence {id}"),
+                metadata,
+                date,
+                date
+            ]),
+        )?;
+        let stored = sql("SELECT metadata_json FROM memories WHERE id=?", json!([id]))?;
+        ensure!(
+            stored["results"][0]["metadata_json"] == metadata,
+            "raw numeric capture metadata changed"
+        );
+        let document: Value = client
+            .get(format!("{endpoint}/v3/documents/{id}"))
+            .bearer_auth(API_KEY)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        ensure!(
+            document["metadata"]["turn"].as_i64() == Some(1)
+                && document["metadata"]["part"].as_i64() == Some(1),
+            "Worker JSON must normalize raw integer-equivalent numeric spellings"
+        );
+    }
+    let invoke = |action: &str, payload: Value| -> Result<Value> {
+        let mut cmd = command(binary, home, project, endpoint);
+        cmd.args(["memory-organize", action]);
+        let output = process_output(cmd, &serde_json::to_vec(&payload)?)?;
+        ensure!(
+            output.status.success(),
+            "numeric conflict organization CLI failed (redacted)"
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let batch = invoke("prepare", json!({}))?;
+    let sources = batch["sources"]
+        .as_array()
+        .context("numeric conflict sources")?;
+    ensure!(
+        sources.len() == 2
+            && sources
+                .iter()
+                .all(|source| source["deferReason"] == "Duplicate or conflicting capture identity"),
+        "ambiguous numeric capture must be deferred"
+    );
+    invoke(
+        "commit",
+        json!({"batchId":batch["batchId"],"summaries":[],"coverage":sources.iter()
+        .map(|source| json!({"id":source["id"],"revision":source["revision"],"status":"deferred","summaries":[]})).collect::<Vec<_>>()}),
+    )?;
+    let manual = mcp.tool("search_memory", json!({"query":"NumericNativeConflict"}))?;
+    let rows = manual["results"]
+        .as_array()
+        .context("numeric conflict manual results")?;
+    ensure!(
+        ["numeric-native-old", "numeric-native-latest"]
+            .iter()
+            .all(|id| rows.iter().any(|row| row["id"] == *id)),
+        "manual search must preserve both conflicting source IDs"
+    );
+    let recall_home = home.join("organization-numeric-recall");
+    fs::create_dir_all(&recall_home)?;
+    fs::write(
+        recall_home.join("remnifold.json"),
+        serde_json::to_vec(
+            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"maxMemories":5,"minimumSimilarity":0.7}),
+        )?,
+    )?;
+    let result = hook(
+        binary,
+        &recall_home,
+        project,
+        endpoint,
+        "UserPromptSubmit",
+        json!({"session_id":"numeric-native-new-task","cwd":project,"prompt":"NumericNativeConflict"}),
+    )?;
+    let context = result["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    ensure!(
+        context.contains("numeric-native-latest") && !context.contains("numeric-native-old"),
+        "automatic recall must choose exactly the latest numeric-equivalent capture revision"
+    );
+    Ok(())
+}
+
+fn organization_checkpoint_journey(
+    mcp: &mut Mcp,
+    endpoint: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<()> {
+    // Only fixture setup uses SQL; the entire read journey uses the real native MCP.
+    let mut ids = Vec::new();
+    for n in 0..9 {
+        let content = if n < 7 {
+            format!("CheckpointJourney original evidence {n}")
+        } else if n == 7 {
+            "CheckpointJourney historical checkpoint".to_owned()
+        } else {
+            "CheckpointJourney final conclusion".to_owned()
+        };
+        let document: Value = client
+            .post(format!("{endpoint}/v3/documents"))
+            .bearer_auth(API_KEY)
+            .json(&json!({"containerTag":"memories","content":content}))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        ids.push(
+            document["id"]
+                .as_str()
+                .context("checkpoint journey document ID")?
+                .to_owned(),
+        );
+    }
+    let sql = |statement: &str, params: Value| -> Result<()> {
+        client
+            .post(format!("{endpoint}/__sql"))
+            .json(&json!({"sql":statement,"params":params}))
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    };
+    sql(
+        "INSERT INTO memory_consolidation_projects(project_key,source_container_tag,created_at,updated_at) VALUES ('native-journey','memories','now','now')",
+        json!([]),
+    )?;
+    sql(
+        "INSERT INTO memory_consolidations(id,project_key,memory_id,revision,status,created_at,updated_at) VALUES ('native-journey','native-journey',?,1,'active','now','now')",
+        json!([ids[7]]),
+    )?;
+    sql(
+        "INSERT INTO memory_consolidation_sources(consolidation_id,memory_id,source_revision) SELECT 'native-journey',id,COALESCE(topic_revision,updated_at) FROM memories WHERE id IN(SELECT value FROM json_each(?))",
+        json!([serde_json::to_string(&ids[..7])?]),
+    )?;
+    sql(
+        "INSERT INTO memory_organization_summaries(id,memory_id,revision,status,updated_at) VALUES ('native-journey',?,'journey-r1','active','now')",
+        json!([ids[8]]),
+    )?;
+    sql(
+        "INSERT INTO memory_organization_versions(memory_id,summary_id) VALUES (?,'native-journey')",
+        json!([ids[8]]),
+    )?;
+    sql(
+        "INSERT INTO memory_organization_dependencies(summary_id,memory_id,source_revision) SELECT 'native-journey',id,COALESCE(topic_revision,updated_at) FROM memories WHERE id=?",
+        json!([ids[7]]),
+    )?;
+    let discovered = mcp.tool(
+        "search_memory",
+        json!({"query":"CheckpointJourney final conclusion"}),
+    )?;
+    let summary = discovered["results"]
+        .as_array()
+        .context("checkpoint summary search")?
+        .iter()
+        .find(|row| row["id"] == ids[8])
+        .and_then(|row| row["id"].as_str())
+        .context("checkpoint summary discovery")?;
+    let document = mcp.tool("getDocument", json!({"documentId":summary}))?;
+    let checkpoint_source = &document["document"]["organizationSources"]["sources"][0];
+    ensure!(
+        checkpoint_source["sourceKind"] == "checkpoint" && checkpoint_source["id"] == ids[7],
+        "native MCP checkpoint source"
+    );
+    let checkpoint = mcp.tool("getDocument", json!({"documentId":checkpoint_source["id"]}))?;
+    let first = &checkpoint["document"]["organizationSources"];
+    ensure!(
+        first["sources"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 5)
+            && first["hasMore"] == true,
+        "native MCP checkpoint preview"
+    );
+    let continuation = mcp.tool(
+        "getDocument",
+        json!({"documentId":checkpoint_source["id"],"sourceCursor":first["nextCursor"]}),
+    )?;
+    ensure!(
+        continuation["document"].get("content").is_none(),
+        "native MCP checkpoint continuation omits body"
+    );
+    let second = &continuation["document"]["organizationSources"];
+    ensure!(
+        second["sources"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2)
+            && second["hasMore"] == false,
+        "native MCP checkpoint member continuation"
+    );
+    let member = &second["sources"][0];
+    ensure!(
+        member["sourceKind"] == "document",
+        "native MCP checkpoint member identity"
+    );
+    let original = mcp.tool("getDocument", json!({"documentId":member["id"]}))?;
+    ensure!(
+        original["document"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("CheckpointJourney original evidence")),
+        "native MCP checkpoint original hydration"
+    );
     Ok(())
 }
 

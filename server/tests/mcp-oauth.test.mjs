@@ -113,6 +113,43 @@ test("database failures emit fixed diagnostics without exposing credentials", as
   } finally { console.error = original; f.db.close(); }
 });
 
+test('OAuth MCP follows a discovered summary through checkpoint pages to the original document', async () => {
+  const f = fixture();
+  try {
+    const client = await register(f);
+    const { consent, verifier } = await authorization(f, client);
+    const code = (await completionTarget(consent)).searchParams.get('code');
+    const tokens = await (await exchange(f, client, code, verifier)).json();
+    const call = async (name, args) => {
+      const response = await f.request('/mcp', { method: 'POST', headers: { Authorization: `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) });
+      assert.equal(response.status, 200);
+      const { result } = await response.json(); assert.equal(result.isError, undefined, JSON.stringify(result)); return result.structuredContent;
+    };
+    const ids = [];
+    for (let n = 0; n < 9; n++) ids.push((await call('add_memory', { content: n < 7 ? `OAuthJourney original evidence ${n}` : n === 7 ? 'OAuthJourney historical checkpoint' : 'OAuthJourney final conclusion' })).id);
+    f.db.prepare("INSERT INTO memory_consolidation_projects(project_key,source_container_tag,created_at,updated_at) VALUES ('oauth-journey','memories','now','now')").run();
+    f.db.prepare("INSERT INTO memory_consolidations VALUES ('oauth-journey','oauth-journey',?,1,'active','now','now')").run(ids[7]);
+    f.db.prepare("INSERT INTO memory_consolidation_sources SELECT 'oauth-journey',id,COALESCE(topic_revision,updated_at) FROM memories WHERE id IN(SELECT value FROM json_each(?))").run(JSON.stringify(ids.slice(0,7)));
+    f.db.prepare("INSERT INTO memory_organization_summaries VALUES ('oauth-journey',?,'r1','active','now')").run(ids[8]);
+    f.db.prepare("INSERT INTO memory_organization_versions VALUES (?,'oauth-journey')").run(ids[8]);
+    f.db.prepare("INSERT INTO memory_organization_dependencies SELECT 'oauth-journey',id,COALESCE(topic_revision,updated_at) FROM memories WHERE id=?").run(ids[7]);
+    const summary = (await call('search_memory', { query: 'OAuthJourney final conclusion' })).results.find(row => row.id === ids[8]);
+    assert.ok(summary);
+    const source = (await call('getDocument', { documentId: summary.id })).organizationSources.sources[0];
+    assert.equal(source.id, ids[7]); assert.equal(source.sourceKind, 'checkpoint');
+    const first = (await call('getDocument', { documentId: source.id })).organizationSources;
+    assert.equal(first.sources.length, 5); assert.equal(first.hasMore, true);
+    const continuation = await call('getDocument', { documentId: source.id, sourceCursor: first.nextCursor });
+    assert.deepEqual(Object.keys(continuation), ['organizationSources']);
+    const second = continuation.organizationSources;
+    assert.equal(second.sources.length, 2); assert.equal(second.hasMore, false);
+    assert.equal(second.sources[0].sourceKind, 'document');
+    assert.match((await call('getDocument', { documentId: second.sources[0].id })).content, /OAuthJourney original evidence/);
+    const denied = await f.request('/v4/organize/sources', { method: 'POST', headers: { Authorization: `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: source.id }) });
+    assert.equal(denied.status, 401);
+  } finally { f.db.close(); }
+});
+
 test("discovery, consent, PKCE, rotation, replay, revocation, and owner key rotation", async () => {
   const f = fixture(), client = await register(f);
   assert.equal((await (await f.request("/.well-known/oauth-protected-resource/mcp")).json()).resource, "https://memory.example/mcp");
@@ -139,6 +176,7 @@ test("discovery, consent, PKCE, rotation, replay, revocation, and owner key rota
   assert.equal(stored.content, "Durable OAuth decision [REDACTED]");
   assert.equal(stored.metadata.sm_project_id, "cloud-project");
   assert.equal((await f.request("/v3/session", { headers: { Authorization: `Bearer ${issued.access_token}` } })).status, 401);
+  assert.equal((await f.request("/v4/organize/sources", { method: "POST", headers: { Authorization: `Bearer ${issued.access_token}`, "Content-Type": "application/json" }, body: JSON.stringify({ documentId: saved.id }) })).status, 401);
   assert.equal(await authorizeMcp(new Request("https://memory.example/v3/session", { headers: { authorization: `Bearer ${issued.access_token}` } }), f.env), false);
   assert.equal(await authorizeMcp(new Request("https://other.example/mcp", { headers: { authorization: `Bearer ${issued.access_token}` } }), f.env), false);
   const refresh = value => f.post("/oauth/token", { grant_type: "refresh_token", client_id: client.client_id, refresh_token: value });

@@ -1,17 +1,33 @@
 ---
 name: setup-remnifold
-description: Configure, verify, or troubleshoot the Remnifold Codex plugin against a user-owned compatible server. Use for connecting another PC, preparing a self-hosted Cloudflare deployment, or checking memory connectivity. Do not use for hosted Supermemory accounts.
+description: Configure, verify, or troubleshoot Remnifold against a user-owned server, and enable, change, or pause its scheduled memory organization. Use for connecting another PC, preparing self-hosting, checking connectivity, or choosing organization frequency and batch size. Do not use for hosted Supermemory accounts.
 ---
 
 # Setup Remnifold
 
-Paths below are relative to the installed plugin root, two directories above this file. Resolve them to absolute paths before running commands; the current task folder does not necessarily contain the plugin's executable.
+Paths below are relative to the installed plugin root: start from this skill's containing directory and ascend two levels. Resolve them to absolute paths before running commands; the current task folder does not necessarily contain the plugin's executable.
+
+For schedule-only enable/change/pause requests, preserve the existing connection and go directly to Scheduled organization below. Do not ask existing-server versus new-server setup questions or rerun connection setup. For an organization execution request, use organize-memory directly; it does not require another setup pass.
 
 Determine whether the user is connecting to an existing server or creating resources in their own Cloudflare account.
 
 Use the platform package matching the user's OS and CPU. Its local executable is `bin/remnifold.exe` on Windows and `bin/remnifold` on macOS and Linux; resolve that path from the plugin root. MCP, hooks, connection and server setup, topic maintenance, status, history import, and local plugin updates use that executable without Node.js, Cargo, Wrangler, or a package manager. The plugin manifest discovers this skill through `./skills/`.
 
 For an existing server, obtain the HTTPS base URL without secrets in chat. Run the executable with `setup --base-url <HTTPS endpoint>`; accept the API key through its hidden prompt or process-scoped `REMNIFOLD_API_KEY`. `--api-key-stdin` supports noninteractive input without placing the key in arguments. `REMNIFOLD_API_URL` can provide the endpoint. Use `--codex-home` when needed and run Codex with the same home; use `--force` when intentionally updating an existing connection and preserve its other settings. Setup verifies `/v3/session` before writing the connection. Run `status`, then the MCP `whoAmI` tool and report the discovered topic-search scope without printing credentials.
+
+## Scheduled organization
+
+After connection setup and verification, offer optional organization through the plugin's [organize-memory skill](../organize-memory/SKILL.md). For an existing schedule request, inspect the connection without making the user repeat setup. Reuse choices already supplied; otherwise ask whether to enable it, its frequency/time (daily is the standard suggestion; weekly is available), and a maximum of one batch per run (standard) or two. Do not register a task without an explicit choice. One batch's processing-target sources are capped at twenty records and 48,000 UTF-16 units; two allow at most forty and 96,000, including chunks or deferred work, not a guaranteed number of completed originals. Existing candidate summaries (up to eight/24,000 units per prepare) and targeted lookup/source/getDocument evidence reads are additional; these source caps are not total reading or token guarantees. Explain that the local Codex app and PC must be running.
+
+Discover the official Codex app `automation_update` capability and read its current schema. Use a local thread heartbeat unless the user explicitly requests standalone project runs. Inspect the current Codex home's existing automations by name and prompt, then use official view/update operations for a positively identified Remnifold organization task rather than creating a duplicate. A name alone is insufficient: preserve an ambiguous task and ask which one to change. Keep existing notification preferences and unrelated fields. Pause a matching task for a stop request; change only the requested frequency or processing budget. Never write automation TOML, OS cron jobs, or another scheduler. If official tools are unavailable, guide the user to Codex desktop Scheduled controls and report that registration has not been completed.
+
+Use a short replay prompt such as: "Use the Remnifold organize-memory skill to organize memory, with a maximum of 1 batch this run." Substitute the selected count; keep the procedure in that skill. Include neither an endpoint/key nor an installed executable/cache path. Every run uses the current CODEX_HOME and environment connection; changing that connection changes the task's destination. Confirm that this follows the user's intent before activation; do not add endpoint-pinned task configuration. Duplicate detection covers the inspected home only, not every PC/home.
+
+Separate task registration from readiness to run. Verify that organize-memory is available in the executing chat and that there is evidence of a compatible deployed server/migrations. A successful session check does not prove organization support; never use `prepare` as a readiness probe because it acquires a lease. An optional read-only `lookup --line` with a fresh harmless phrase can hint at endpoint compatibility, but success does not prove all migrations or publication behavior. Without adequate readiness evidence, keep any explicitly requested task PAUSED and report what remains. Do not deploy or update the plugin to enable a schedule without authorization.
+
+For an older paused heartbeat whose prompt names a private executable or whose chat lacks this skill, keep it paused until a compatible plugin/server is delivered and a new chat confirms skill availability. Update/retarget it only if the official tool supports that operation. If it cannot be moved, preserve the old paused task and create one in the new chat only on the user's instruction. Do not promise retargeting before it is supported and verified.
+
+## Server and connection maintenance
 
 For a new server, obtain a Cloudflare API token through process-scoped `CLOUDFLARE_API_TOKEN` or `--token-stdin` and run the executable's `server-setup --account-id <account-id>` for authenticated read-only discovery. No Wrangler OAuth credentials are imported. When deployment is authorized, supply the chosen memory key through `REMNIFOLD_API_KEY` and add `--apply`. The executable embeds the Worker bundle and migrations and uses Cloudflare REST to create or reuse D1 and Vectorize, apply migrations, deploy, and verify the endpoint. Consult `--help` for resource names and location. Account read, Workers scripts, D1, and Vectorize permissions are required; domains and routes require corresponding additional permissions. A request to prepare files locally does not authorize provisioning or deployment.
 

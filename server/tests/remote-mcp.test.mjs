@@ -24,6 +24,63 @@ function fixture(withOAuth = true) {
   return { db, pending, request, rpc, call, rest, opts, headers, api, env };
 }
 
+test("MCP summary search discovers paged source identities and preserves original getDocument", async () => {
+  const f = fixture();
+  try {
+    for (let i = 0; i < 7; i++) assert.equal((await f.rest('/v3/documents', 'POST', { containerTag: 'memories', content: `SourceLink original evidence ${i}` })).status, 201);
+    const batch = await (await f.rest('/v4/organize/prepare', 'POST', {})).json();
+    const publishedResponse = await f.rest('/v4/organize/commit', 'POST', { batchId: batch.batchId,
+      summaries: [{ ref: 's', title: 'SourceLink final conclusion', topic: 'SourceLink', content: 'SourceLink selected the verified approach because the original evidence supports it.', sources: batch.sources.map(s => s.id) }],
+      coverage: batch.sources.map(s => ({ id: s.id, revision: s.revision, status: 'complete', summaries: ['s'] })) });
+    assert.equal(publishedResponse.status, 200);
+    const published = await publishedResponse.json();
+    const id = published.summaries[0].memoryId;
+    const search = await f.call('search_memory', { query: 'SourceLink' });
+    assert.ok(search.structuredContent.results.some(row => row.id === id));
+    const first = (await f.call('getDocument', { documentId: id })).structuredContent.organizationSources;
+    assert.equal(first.sources.length, 5); assert.equal(first.hasMore, true);
+    const continuation = (await f.call('getDocument', { documentId: id, sourceCursor: first.nextCursor })).structuredContent;
+    assert.deepEqual(Object.keys(continuation), ['organizationSources']);
+    const second = continuation.organizationSources;
+    assert.equal(second.sources.length, 2); assert.equal(second.hasMore, false);
+    const ids = [...first.sources, ...second.sources].map(row => row.id);
+    assert.equal(new Set(ids).size, 7);
+    for (const documentId of ids) assert.match((await f.call('getDocument', { documentId })).structuredContent.content, /original evidence/);
+    const denied = await f.api(new Request('https://example.test/v4/organize/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: id }) }));
+    assert.equal(denied.status, 401);
+  } finally { await Promise.all(f.pending); f.db.close(); }
+});
+
+test('MCP summary search follows a checkpoint through member continuation to original evidence', async () => {
+  const f = fixture();
+  try {
+    const ids = [];
+    for (let n = 0; n < 9; n++) {
+      const response = await f.rest('/v3/documents', 'POST', { containerTag: 'memories', content: n < 7 ? `RemoteJourney original evidence ${n}` : n === 7 ? 'RemoteJourney historical checkpoint' : 'RemoteJourney final conclusion' });
+      assert.equal(response.status, 201); ids.push((await response.json()).id);
+    }
+    f.db.prepare("INSERT INTO memory_consolidation_projects(project_key,source_container_tag,created_at,updated_at) VALUES ('mcp-journey','memories','now','now')").run();
+    f.db.prepare("INSERT INTO memory_consolidations VALUES ('mcp-journey','mcp-journey',?,1,'active','now','now')").run(ids[7]);
+    f.db.prepare("INSERT INTO memory_consolidation_sources SELECT 'mcp-journey',id,COALESCE(topic_revision,updated_at) FROM memories WHERE id IN(SELECT value FROM json_each(?))").run(JSON.stringify(ids.slice(0,7)));
+    f.db.prepare("INSERT INTO memory_organization_summaries VALUES ('mcp-journey',?,'r1','active','now')").run(ids[8]);
+    f.db.prepare("INSERT INTO memory_organization_versions VALUES (?,'mcp-journey')").run(ids[8]);
+    f.db.prepare("INSERT INTO memory_organization_dependencies SELECT 'mcp-journey',id,COALESCE(topic_revision,updated_at) FROM memories WHERE id=?").run(ids[7]);
+    const call = async (name, args) => { const result = await f.call(name, args); assert.equal(result.isError, undefined); return result.structuredContent; };
+    const discovered = (await call('search_memory', { query: 'RemoteJourney final conclusion' })).results.find(row => row.id === ids[8]);
+    assert.ok(discovered);
+    const source = (await call('getDocument', { documentId: discovered.id })).organizationSources.sources[0];
+    assert.equal(source.sourceKind, 'checkpoint'); assert.equal(source.id, ids[7]);
+    const first = (await call('getDocument', { documentId: source.id })).organizationSources;
+    assert.equal(first.sources.length, 5); assert.equal(first.hasMore, true);
+    const continuation = await call('getDocument', { documentId: source.id, sourceCursor: first.nextCursor });
+    assert.deepEqual(Object.keys(continuation), ['organizationSources']);
+    const second = continuation.organizationSources;
+    assert.equal(second.sources.length, 2); assert.equal(second.hasMore, false);
+    const member = second.sources[0]; assert.equal(member.sourceKind, 'document');
+    assert.match((await call('getDocument', { documentId: member.id })).content, /RemoteJourney original evidence/);
+  } finally { await Promise.all(f.pending); f.db.close(); }
+});
+
 test("stateless MCP accesses existing Worker memories and saves redacted retry-safe data", async () => {
   const f = fixture();
   try {

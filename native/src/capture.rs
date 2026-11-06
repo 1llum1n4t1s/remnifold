@@ -559,7 +559,7 @@ fn parse_transcript_reader(reader: impl BufRead, secrets: &[&str]) -> Result<Tra
         redactions: count,
     })
 }
-fn titles(home: &Path) -> Result<HashMap<String, String>> {
+fn titles(home: &Path, only_id: Option<&str>) -> Result<HashMap<String, String>> {
     let path = home.join("session_index.jsonl");
     let mut out = HashMap::new();
     if path.exists() {
@@ -567,7 +567,10 @@ fn titles(home: &Path) -> Result<HashMap<String, String>> {
             let Ok(row) = serde_json::from_str::<Value>(&line?) else {
                 continue;
             };
-            if row["id"].is_string() && row["thread_name"].is_string() {
+            if row["id"].is_string()
+                && row["thread_name"].is_string()
+                && only_id.is_none_or(|id| text(&row["id"]) == id)
+            {
                 out.insert(
                     text(&row["id"]).to_string(),
                     text(&row["thread_name"]).to_string(),
@@ -805,7 +808,10 @@ pub fn capture(payload: &Value, config: &Config) -> Result<Value> {
         "transcript",
         parse_task_transcript(&candidate.file_path, &[&config.api_key]),
     )?;
-    let titles = stage("transcript", titles(&config.codex_home))?;
+    let titles = stage(
+        "transcript",
+        titles(&config.codex_home, Some(text(&candidate.meta["id"]))),
+    )?;
     let title = sanitize_text(
         titles
             .get(text(&candidate.meta["id"]))
@@ -925,7 +931,7 @@ pub fn run_import(args: &[String]) -> Result<()> {
         })
         .take(if limit == 0 { usize::MAX } else { limit })
         .collect();
-    let titles = titles(&home)?;
+    let titles = titles(&home, None)?;
     let mut planned = vec![];
     let mut turns = 0;
     let mut redactions = 0;
@@ -1073,6 +1079,44 @@ pub fn run_import(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn current_session_title_keeps_last_valid_match_and_reads_remaining_lines() {
+        let home = std::env::temp_dir().join(format!("remnifold-titles-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&home).unwrap();
+        let current = "現在😀";
+        assert!(titles(&home, Some(current)).unwrap().is_empty());
+        let path = home.join("session_index.jsonl");
+        fs::write(
+            &path,
+            [
+                json!({"id":current,"thread_name":"以前のtitle"}).to_string(),
+                json!({"id":"other","thread_name":"別session"}).to_string(),
+                "invalid JSON".to_string(),
+                json!({"id":current,"thread_name":"最後のtitle"}).to_string(),
+                json!({"id":current,"thread_name":false}).to_string(),
+                json!({"id":123,"thread_name":"型が異なるID"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let current_titles = titles(&home, Some(current)).unwrap();
+        assert_eq!(current_titles.len(), 1);
+        assert_eq!(current_titles.get(current).unwrap(), "最後のtitle");
+        let all_titles = titles(&home, None).unwrap();
+        assert_eq!(all_titles.len(), 2);
+        assert_eq!(all_titles.get(current), current_titles.get(current));
+        assert_eq!(all_titles.get("other").unwrap(), "別session");
+        assert!(titles(&home, Some("missing")).unwrap().is_empty());
+        let mut invalid_utf8 =
+            format!("{}\n", json!({"id":current,"thread_name":"一致後も読む"})).into_bytes();
+        invalid_utf8.extend_from_slice(b"\xff\n");
+        fs::write(path, invalid_utf8).unwrap();
+        assert!(titles(&home, Some(current)).is_err());
+        assert!(titles(&home, None).is_err());
+        if std::env::var("REMNIFOLD_KEEP_TEST_STATE").as_deref() != Ok("1") {
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
     #[test]
     fn injection_cleaning() {
         assert_eq!(

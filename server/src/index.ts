@@ -1,6 +1,9 @@
 import { documentIndex } from "./shared/memory-index.ts";
+import { truncateUtf16 } from "./shared/unicode-text.ts";
 import packageMetadata from "../package.json" with { type: "json" };
 import { handleMcpRequest } from "./mcp.ts";
+import { organization, organizationVisible } from "./organization.ts";
+import { organizationSourcePage } from "./organization-sources.ts";
 import { authorizeMcp, oauthChallenge, routeOAuth } from "./mcp-oauth.ts";
 
 // JSON escapingを含む最大長のcontent、entityContext、metadataをまとめて収容する。
@@ -66,6 +69,7 @@ type RankedMemoryRow = Pick<
   lexicalMatch?: boolean;
   semanticScore?: number;
   searchExcerpt?: string;
+  organization_attempt?: string | null;
 };
 
 type DocumentProjection = "full" | "index" | "ids" | "capture";
@@ -110,6 +114,7 @@ type EnrichmentMemory = {
   topicRevision: string;
   projectId?: string;
   skipFacts?: boolean;
+  organizationAttempt?: string;
 };
 
 type ConsolidationTarget = {
@@ -350,13 +355,6 @@ function clampConfidence(value: unknown): number {
     : 0.5;
 }
 
-// UTF-16の上限は維持し、切断位置がサロゲートペアの途中なら一文字手前にする。
-function truncateUtf16(value: string, maxLength: number): string {
-  let end = Math.min(value.length, Math.max(0, Math.floor(maxLength)));
-  if (end > 0 && end < value.length && /[\uD800-\uDBFF]/u.test(value[end - 1]!) && /[\uDC00-\uDFFF]/u.test(value[end]!)) end -= 1;
-  return value.slice(0, end);
-}
-
 function cleanFactPart(value: unknown, maxLength: number): string | null {
   if (typeof value !== "string") return null;
   const clean = value.normalize("NFKC").trim().replace(/\s+/gu, " ");
@@ -431,6 +429,12 @@ function vectorMetadataRevision(value: { metadata?: VectorizeVector["metadata"] 
   return isObject(value.metadata) && typeof value.metadata.topic_revision === "string"
     ? value.metadata.topic_revision
     : null;
+}
+function organizationAttemptSql(alias = "memories"): string {
+  return `(SELECT token FROM memory_organization_embedding_attempts WHERE memory_id=${alias}.id)`;
+}
+function vectorMatchesCurrent(value: {metadata?: VectorizeVector["metadata"]},topicRevision: string | null,attempt?: string | null): boolean {
+  return vectorMetadataRevision(value)===vectorRevision(topicRevision) && (!attempt || value.metadata?.organization_attempt===attempt);
 }
 
 function parseEmbedding(value: string | null): number[] | null {
@@ -555,10 +559,9 @@ function memoryIndexV1(metadata: JsonObject): JsonObject | null {
 
 async function filterIndexLexicalRows(
   rows: RankedMemoryRow[],
-  query: string,
+  terms: string[],
   env: Env,
 ): Promise<RankedMemoryRow[]> {
-  const terms = searchQueryTerms(query);
   const indexedRows = rows.filter((row) => memoryIndexV1(parseMetadata(row.metadata_json)) !== null);
   if (indexedRows.length === 0) return rows;
   const topics = await topicsByMemory(indexedRows, env);
@@ -946,6 +949,7 @@ async function consolidationTargets(env: Env, now: Date, projectKey?: string): P
        FROM memories AS m
        WHERE m.is_forgotten = 0
          AND json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1
+         AND NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id)
          ${projectKey === undefined ? "" : `AND ${CONSOLIDATION_PROJECT_KEY_SQL} = ?`}
      ), unconsolidated AS (
        SELECT raw.* FROM raw
@@ -1043,6 +1047,7 @@ async function newConsolidationSources(projectKey: string, env: Env): Promise<Co
      FROM memories AS m
      WHERE m.is_forgotten = 0
        AND json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1
+       AND NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id)
        AND ${CONSOLIDATION_PROJECT_KEY_SQL} = ?
        AND NOT EXISTS (
          SELECT 1 FROM memory_consolidation_sources AS source
@@ -1774,6 +1779,15 @@ function diagnosticError(error: unknown, env: Env): string {
   return truncateUtf16(secret ? message.replaceAll(secret, "[redacted]") : message, 2_000);
 }
 
+function organizationAttemptFence(memory: EnrichmentMemory): string {
+  // 同じ文書版の再試行でも、古い実行の結果を次のclaimへ書き込ませない。
+  return memory.organizationAttempt ? ` AND is_forgotten=0 AND EXISTS(
+    SELECT 1 FROM memory_organization_embedding_attempts a JOIN memory_organization_summaries s ON s.memory_id=a.memory_id
+    WHERE a.memory_id=memories.id AND a.source_revision=memories.topic_revision AND a.token=? AND s.status='active'
+      AND a.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))` : "";
+}
+function organizationAttemptBindings(memory: EnrichmentMemory): string[] { return memory.organizationAttempt ? [memory.organizationAttempt] : []; }
+
 async function persistMemoryEmbedding(
   memory: EnrichmentMemory,
   env: Env,
@@ -1785,7 +1799,7 @@ async function persistMemoryEmbedding(
     const embeddingUpdate = await env.DB.prepare(
       `UPDATE memories
        SET embedding_status = 'done', embedding_model = ?, embedded_at = ?, embedding_json = ?
-       WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0`,
+       WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0${organizationAttemptFence(memory)}`,
     )
       .bind(
         EMBEDDING_MODEL,
@@ -1794,6 +1808,7 @@ async function persistMemoryEmbedding(
         memory.id,
         memory.updatedAt,
         memory.topicRevision,
+        ...organizationAttemptBindings(memory),
       )
       .run();
     if ((embeddingUpdate.meta.changes ?? 0) > 0) {
@@ -1803,7 +1818,7 @@ async function persistMemoryEmbedding(
             id: memory.id,
             values: embeddingResult.value,
             namespace: await vectorNamespace(memory.containerTag),
-            metadata: { topic_revision: memory.topicRevision },
+            metadata: { topic_revision: memory.topicRevision, ...(memory.organizationAttempt ? {organization_attempt:memory.organizationAttempt} : {}) },
           },
         ]);
         console.log(
@@ -1817,30 +1832,32 @@ async function persistMemoryEmbedding(
         const vectorUpdate = await env.DB.prepare(
           `UPDATE memories
            SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
-           WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0`,
+           WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0
+             AND ${organizationVisible("memories",enrichmentEnabled(env))}${organizationAttemptFence(memory)}`,
         )
-          .bind(vectorMutationId(mutation), attemptedAt, memory.id, memory.updatedAt, memory.topicRevision)
+          .bind(vectorMutationId(mutation), attemptedAt, memory.id, memory.updatedAt, memory.topicRevision,...organizationAttemptBindings(memory))
           .run();
         if ((vectorUpdate.meta.changes ?? 0) === 0) {
           await deleteVectorAfterStaleUpsert(memory.id, env);
         }
       } catch (error) {
         errors.push(`vector index: ${String(error)}`);
-        await env.DB.prepare(
+        const failed = await env.DB.prepare(
           `UPDATE memories SET vector_status = 'failed', vector_attempted_at = ?
-           WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0`,
+           WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0${organizationAttemptFence(memory)}`,
         )
-          .bind(attemptedAt, memory.id, memory.updatedAt, memory.topicRevision)
+          .bind(attemptedAt, memory.id, memory.updatedAt, memory.topicRevision,...organizationAttemptBindings(memory))
           .run();
+        if (memory.organizationAttempt && (failed.meta.changes ?? 0) === 0) await deleteVectorAfterStaleUpsert(memory.id,env);
       }
     }
   } else {
     errors.push(`embedding: ${String(embeddingResult.reason)}`);
     await env.DB.prepare(
       `UPDATE memories SET embedding_status = 'failed', vector_status = 'failed'
-       WHERE id = ? AND updated_at = ? AND topic_revision = ?`,
+       WHERE id = ? AND updated_at = ? AND topic_revision = ?${organizationAttemptFence(memory)}`,
     )
-      .bind(memory.id, memory.updatedAt, memory.topicRevision)
+      .bind(memory.id, memory.updatedAt, memory.topicRevision,...organizationAttemptBindings(memory))
       .run();
   }
 
@@ -1954,8 +1971,9 @@ async function recentMemories(
   limit: number,
   scope?: string,
   indexOnly = false,
+  manualContext = false,
 ): Promise<RankedMemoryRow[]> {
-  const { clause, parameters } = searchConditions(containerTag, scope, indexOnly);
+  const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
   parameters.push(limit);
   const result = await env.DB.prepare(
     `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at, topic_revision
@@ -1968,9 +1986,9 @@ async function recentMemories(
   return result.results;
 }
 
-function searchConditions(containerTag: string | undefined, scope: string | undefined, indexOnly: boolean, alias = "") {
+function searchConditions(containerTag: string | undefined, scope: string | undefined, indexOnly: boolean, alias = "", manualContext = false, semanticEnabled = true) {
   const prefix = alias ? `${alias}.` : "";
-  const conditions = [`${prefix}is_forgotten = 0`];
+  const conditions = [`${prefix}is_forgotten = 0`, organizationVisible(alias || "memories", semanticEnabled)];
   const parameters: (string | number)[] = [];
   if (containerTag !== undefined) {
     conditions.push(`${prefix}container_tag = ?`);
@@ -1981,6 +1999,7 @@ function searchConditions(containerTag: string | undefined, scope: string | unde
     parameters.push(scope);
   }
   if (indexOnly) conditions.push(`json_extract(${prefix}metadata_json, '$.memoryIndex.recallable') IS NOT 0`);
+  if (indexOnly && !manualContext) conditions.push(`NOT (json_extract(${prefix}metadata_json, '$.sm_organization_manual_only') IS 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=${prefix}id))`);
   return { clause: conditions.join(" AND "), parameters };
 }
 
@@ -2013,9 +2032,9 @@ const SEARCH_LOWER_VARIANTS: Record<string, string> = {
   "ᾳ": "ᾼ", "ῃ": "ῌ", "ῳ": "ῼ", "ω": "Ω", "k": "K", "å": "Å",
 };
 
-function indexQueryPatterns(query: string): string {
+function indexQueryPatterns(terms: string[]): string {
   // SQLite lowerはASCIIだけを畳む。非ASCIIの大小文字はUnicode文字クラスで候補に戻す。
-  const patterns = searchQueryTerms(query).map((term) => ({ weight: Math.min(12, term.length), pattern: `*${[...term].map((letter) => {
+  const patterns = terms.map((term) => ({ weight: Math.min(12, term.length), pattern: `*${[...term].map((letter) => {
     if (letter === "*") return "[*]";
     if (letter === "?") return "[?]";
     if (letter === "[") return "[[]";
@@ -2026,9 +2045,9 @@ function indexQueryPatterns(query: string): string {
   return JSON.stringify(patterns);
 }
 
-async function indexedMemories(query: string, containerTag: string | undefined, scope: string | undefined, env: Env, indexOnly: boolean): Promise<RankedMemoryRow[]> {
-  const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m");
-  const patterns = indexQueryPatterns(query);
+async function indexedMemories(getPattern: () => string, containerTag: string | undefined, scope: string | undefined, env: Env, indexOnly: boolean, manualContext = false): Promise<RankedMemoryRow[]> {
+  const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
+  const patterns = getPattern();
   // 分類・索引だけの一致はVectorize topKや本文FTSの順位に依存させない。
   const result = await env.DB.prepare(
     `SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at, m.topic_revision
@@ -2042,17 +2061,19 @@ async function indexedMemories(query: string, containerTag: string | undefined, 
 
 async function lexicalMemories(
   query: string,
+  getPattern: () => string,
   ftsQuery: string | null,
   containerTag: string | undefined,
   limit: number,
   scope: string | undefined,
   env: Env,
   indexOnly = false,
+  manualContext = false,
 ): Promise<RankedMemoryRow[]> {
   const candidateLimit = Math.min(MAX_LIMIT, Math.max(limit * 3, 10));
   let normalizedFtsRows: RankedMemoryRow[] = [];
   if (ftsQuery) {
-    const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m");
+    const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
     try {
       const result = await env.DB.prepare(
           `SELECT m.id, m.container_tag, ${searchContentColumn(indexOnly, "m")}, m.metadata_json, m.created_at, m.updated_at,
@@ -2062,7 +2083,7 @@ async function lexicalMemories(
            WHERE memories_fts MATCH ? AND ${clause}
            ORDER BY ${indexOnly ? `${indexLexicalPriority("m")}, ` : ""}rank LIMIT ?`,
         )
-          .bind(ftsQuery, ...parameters, ...(indexOnly ? [indexQueryPatterns(query)] : []), candidateLimit)
+          .bind(ftsQuery, ...parameters, ...(indexOnly ? [getPattern()] : []), candidateLimit)
           .all<RankedMemoryRow>();
       if (result.results.length > 0) {
         if (!indexOnly || query.normalize("NFKC") === query) return result.results;
@@ -2075,14 +2096,14 @@ async function lexicalMemories(
   }
 
   if (query.length > 0 && query.length <= 1_000) {
-    const { clause, parameters } = searchConditions(containerTag, scope, indexOnly);
+    const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
     const result = await env.DB.prepare(
         `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at, topic_revision
          FROM memories
          WHERE ${clause} AND instr(lower(content), lower(?)) > 0
          ORDER BY ${indexOnly ? `${indexLexicalPriority()}, ` : ""}updated_at DESC LIMIT ?`,
       )
-        .bind(...parameters, query, ...(indexOnly ? [indexQueryPatterns(query)] : []), candidateLimit)
+        .bind(...parameters, query, ...(indexOnly ? [getPattern()] : []), candidateLimit)
         .all<RankedMemoryRow>();
     return result.results.length > 0 ? result.results : normalizedFtsRows;
   }
@@ -2096,15 +2117,16 @@ async function semanticMemories(
   scope: string | undefined,
   env: Env,
   indexOnly = false,
+  manualContext = false,
 ): Promise<RankedMemoryRow[]> {
   const MAX_D1_VECTOR_SCAN = 200;
   if (!enrichmentEnabled(env)) return [];
   try {
     const vector = await embedText(query, env);
     const candidateLimit = Math.min(MAX_LIMIT, Math.max(limit * 3, 10));
-    const { clause, parameters: fallbackParameters } = searchConditions(containerTag, scope, indexOnly);
+    const { clause, parameters: fallbackParameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
     // Vectorizeはsm_scopeで絞れないため、scope検索ではD1のindexed行も候補に戻す。
-    const vectorStatusClause = scope ? "" : " AND vector_status <> 'indexed'";
+    const vectorStatusClause = scope ? "" : " AND (vector_status <> 'indexed' OR EXISTS(SELECT 1 FROM memory_organization_hidden LIMIT 1))";
     fallbackParameters.push(MAX_D1_VECTOR_SCAN);
     let vectorQueryFailed = false;
     const [vectorResult, unindexedFallbackRows] = await Promise.all([
@@ -2120,7 +2142,7 @@ async function semanticMemories(
       }),
       env.DB.prepare(
         `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at,
-                embedding_json, topic_revision
+                embedding_json, topic_revision, ${organizationAttemptSql()} AS organization_attempt
          FROM memories
          WHERE ${clause} AND embedding_json IS NOT NULL
            ${vectorStatusClause}
@@ -2140,7 +2162,7 @@ async function semanticMemories(
       let fullFallbackFailed = false;
       const fullFallbackRows = await env.DB.prepare(
         `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at,
-                embedding_json, topic_revision
+                embedding_json, topic_revision, ${organizationAttemptSql()} AS organization_attempt
          FROM memories
          WHERE ${clause} AND embedding_json IS NOT NULL
          ORDER BY updated_at DESC LIMIT ?`,
@@ -2170,7 +2192,7 @@ async function semanticMemories(
     const vectorRows = new Map<string, RankedMemoryRow>();
     if (missingIds.length > 0) {
       const placeholders = missingIds.map(() => "?").join(", ");
-      const { clause: hitClause, parameters: hitParameters } = searchConditions(containerTag, scope, indexOnly);
+      const { clause: hitClause, parameters: hitParameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
       try {
         const result = await env.DB.prepare(
           `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at,
@@ -2178,13 +2200,14 @@ async function semanticMemories(
                     SELECT 1 FROM json_each(?) AS hit
                     WHERE json_extract(hit.value, '$.id') = memories.id
                       AND json_extract(hit.value, '$.revision') IS NOT COALESCE(memories.topic_revision, '')
-                  ) THEN embedding_json ELSE NULL END AS embedding_json, topic_revision
+                  ) OR EXISTS(SELECT 1 FROM json_each(?) AS hit WHERE json_extract(hit.value,'$.id')=memories.id
+                    AND ${organizationAttemptSql()} IS NOT NULL AND json_extract(hit.value,'$.attempt') IS NOT ${organizationAttemptSql()})
+                  THEN embedding_json ELSE NULL END AS embedding_json, topic_revision, ${organizationAttemptSql()} AS organization_attempt
            FROM memories
            WHERE ${hitClause} AND id IN (${placeholders})`,
         )
-          .bind(JSON.stringify(vectorResult.matches.map((match) => ({
-            id: match.id, revision: vectorMetadataRevision(match),
-          }))), ...hitParameters, ...missingIds)
+          .bind(JSON.stringify(vectorResult.matches.map((match) => ({id:match.id,revision:vectorMetadataRevision(match)}))),
+            JSON.stringify(vectorResult.matches.map(match=>({id:match.id,attempt:match.metadata?.organization_attempt??null}))), ...hitParameters, ...missingIds)
           .all<RankedMemoryRow>();
         for (const row of result.results) vectorRows.set(row.id, row);
       } catch (error) {
@@ -2196,7 +2219,7 @@ async function semanticMemories(
       const row = byId.get(match.id) ?? vectorRows.get(match.id);
       if (!row) continue;
       let matchScore = match.score;
-      if (vectorMetadataRevision(match) !== vectorRevision(row.topic_revision ?? null)) {
+      if (!vectorMatchesCurrent(match,row.topic_revision ?? null,row.organization_attempt)) {
         const currentEmbedding = parseEmbedding(row.embedding_json ?? null);
         if (!currentEmbedding) continue;
         matchScore = cosineSimilarity(vector, currentEmbedding);
@@ -2279,10 +2302,22 @@ function querySearchExcerpt(content: string, terms: string[]): string {
   return best;
 }
 
-async function indexSearchRows(rows: RankedMemoryRow[], query: string, env: Env, indexOnly = true): Promise<RankedMemoryRow[]> {
+function manualOnlyMetadata(metadata: JsonObject, registered: boolean): JsonObject {
+  if (!registered || metadata.sm_organization_manual_only !== true || !isObject(metadata.memoryIndex)) return metadata;
+  return {...metadata,memoryIndex:{...metadata.memoryIndex,recallable:false}};
+}
+async function registeredManualOnlyIds(rows: Array<{id:string;metadata_json:string}>,env:Env): Promise<Set<string>> {
+  // marker自体は利用者の任意metadata。生成版の正本にあるIDだけを採用する。
+  const candidates=rows.filter(row=>row.metadata_json.includes('"sm_organization_manual_only"') && parseMetadata(row.metadata_json).sm_organization_manual_only===true).map(row=>row.id);
+  if(!candidates.length)return new Set();
+  const registered=await env.DB.prepare("SELECT memory_id FROM memory_organization_versions WHERE memory_id IN(SELECT value FROM json_each(?))")
+    .bind(JSON.stringify(candidates)).all<{memory_id:string}>();
+  return new Set(registered.results.map(row=>row.memory_id));
+}
+async function indexSearchRows(rows: RankedMemoryRow[], getTerms: () => string[], env: Env, indexOnly = true): Promise<RankedMemoryRow[]> {
   if (rows.length === 0) return rows;
   // 選ばれた候補だけの全文を読む。旧文書も保存済み文書も、追加HTTPなしで同じ入口を作る。
-  const terms = searchQueryTerms(query);
+  const terms = getTerms();
   const projected: RankedMemoryRow[] = [];
   for (let offset = 0; offset < rows.length; offset += MAX_LIMIT) {
     const chunk = rows.slice(offset, offset + MAX_LIMIT);
@@ -2292,11 +2327,12 @@ async function indexSearchRows(rows: RankedMemoryRow[], query: string, env: Env,
        FROM memories WHERE id IN (${placeholders}) AND is_forgotten = 0`,
     ).bind(...chunk.map((row) => row.id)).all<RankedMemoryRow>();
     const originals = new Map(full.results.map((row) => [row.id, row]));
+    const manualOnly = await registeredManualOnlyIds(full.results,env);
     for (const row of chunk) {
       const original = originals.get(row.id);
       if (!original || original.updated_at !== row.updated_at ||
           row.topic_revision !== undefined && original.topic_revision !== row.topic_revision) continue;
-      const metadata = parseMetadata(row.metadata_json);
+      const metadata = manualOnlyMetadata(parseMetadata(row.metadata_json),manualOnly.has(row.id));
       const index = documentIndex({
         id: row.id, content: original.content, metadata,
         containerTag: row.container_tag, createdAt: row.created_at, updatedAt: row.updated_at,
@@ -2347,7 +2383,13 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
     throw new HttpError(400, "indexOnly must be a boolean");
   }
   const indexOnly = body.indexOnly === true;
+  if (body.manualContext !== undefined && typeof body.manualContext !== "boolean") throw new HttpError(400, "manualContext must be a boolean");
+  const manualContext = indexOnly && body.manualContext === true;
   const query = typeof body.q === "string" ? truncateUtf16(body.q.trim(), 1_000) : "";
+  let terms: string[] | undefined;
+  let pattern: string | undefined;
+  const getTerms = () => terms ??= searchQueryTerms(query);
+  const getPattern = () => pattern ??= indexQueryPatterns(getTerms());
   if (body.allContainers !== undefined && typeof body.allContainers !== "boolean") {
     throw new HttpError(400, "allContainers must be a boolean");
   }
@@ -2359,20 +2401,20 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
 
   let rows: RankedMemoryRow[];
   if (!query) {
-    rows = await recentMemories(env, containerTag, limit, scope, indexOnly);
+    rows = await recentMemories(env, containerTag, limit, scope, indexOnly, manualContext);
   } else {
     const ftsQuery = buildFtsQuery(query);
     const [lexical, semantic, indexed] = await Promise.all([
-      lexicalMemories(query, ftsQuery, containerTag, limit, scope, env, indexOnly),
-      semanticMemories(query, containerTag, limit, scope, env, indexOnly),
-      indexOnly || allContainers ? indexedMemories(query, containerTag, scope, env, indexOnly) : Promise.resolve([]),
+      lexicalMemories(query, getPattern, ftsQuery, containerTag, limit, scope, env, indexOnly, manualContext),
+      semanticMemories(query, containerTag, limit, scope, env, indexOnly, manualContext),
+      indexOnly || allContainers ? indexedMemories(getPattern, containerTag, scope, env, indexOnly, manualContext) : Promise.resolve([]),
     ]);
     // RRFの重複加点で索引一致を切り捨てず、分類・原文の関連度を判定してから最終上限に絞る。
     rows = mergeRankedMemories([...lexical, ...indexed], semantic, indexOnly || allContainers ? MAX_LIMIT * 3 : limit);
   }
 
   if (indexOnly) {
-    const { clause, parameters } = searchConditions(containerTag, scope, true, "m");
+    const { clause, parameters } = searchConditions(containerTag, scope, true, "m", manualContext, enrichmentEnabled(env));
     // A relevant older checkpoint must not disappear merely because the shared
     // container has more than one page of newer project checkpoints.
     parameters.push(MAX_INDEX_LEXICAL_SCAN);
@@ -2384,15 +2426,15 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
        WHERE consolidation.status = 'active' AND ${clause}
        ORDER BY consolidation.updated_at DESC LIMIT ?`,
     ).bind(...parameters).all<RankedMemoryRow>();
-    const relevant = query ? await filterIndexLexicalRows(active.results, query, env) : active.results;
+    const relevant = query ? await filterIndexLexicalRows(active.results, getTerms(), env) : active.results;
     const activeTopics = await topicsByMemory(relevant, env);
-    const terms = searchQueryTerms(query);
+    const terms = getTerms();
     const sortedRelevant = sortByQueryCoverage(relevant, activeTopics, terms);
     const candidates = new Map(rows.map((row) => [row.id, row]));
     for (const row of sortedRelevant.slice(0, MAX_LIMIT)) if (!candidates.has(row.id)) candidates.set(row.id, row);
     rows = [...candidates.values()];
 
-    rows = await indexSearchRows(rows, query, env);
+    rows = await indexSearchRows(rows, getTerms, env);
     const candidateTopics = await topicsByMemory(rows, env);
     rows = sortByQueryCoverage(rows, candidateTopics, terms, true, true);
     rows = rows.slice(0, limit);
@@ -2426,11 +2468,15 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
   }
 
   if (allContainers && !indexOnly) {
-    rows = await indexSearchRows(rows, query, env, false);
+    rows = await indexSearchRows(rows, getTerms, env, false);
     const candidateTopics = await topicsByMemory(rows, env);
-    const terms = searchQueryTerms(query);
+    const terms = getTerms();
     rows = sortByQueryCoverage(rows, candidateTopics, terms, true);
     rows = rows.slice(0, limit);
+  }
+  if (!allContainers && !indexOnly) {
+    const manualOnly=await registeredManualOnlyIds(rows,env);
+    rows=rows.map(row=>manualOnly.has(row.id)?{...row,metadata_json:JSON.stringify(manualOnlyMetadata(parseMetadata(row.metadata_json),true))}:row);
   }
   const topics = await topicsByMemory(rows, env);
   const containers = allContainers ? await env.DB.prepare(
@@ -2494,6 +2540,10 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
   const generatedId = crypto.randomUUID();
   const customId = requestedCustomId ?? generatedId;
   if (requestedCustomId && await env.DB.prepare(
+    `SELECT s.summary_id FROM memory_organization_versions s JOIN memories m ON m.id=s.memory_id
+     WHERE m.container_tag=? AND m.custom_id=?`,
+  ).bind(containerTag, customId).first()) throw new HttpError(409, "Generated summaries cannot be edited");
+  if (requestedCustomId && await env.DB.prepare(
     `SELECT consolidation.id FROM memory_consolidations AS consolidation
      JOIN memories AS memory ON memory.id = consolidation.memory_id
      WHERE memory.container_tag = ? AND memory.custom_id = ?`,
@@ -2544,7 +2594,7 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
          updated_at = excluded.updated_at
        WHERE NOT EXISTS (
          SELECT 1 FROM memory_consolidations WHERE memory_id = memories.id
-       )`,
+       ) AND NOT EXISTS (SELECT 1 FROM memory_organization_versions WHERE memory_id=memories.id)`,
     ).bind(
       generatedId,
       customId,
@@ -2664,7 +2714,7 @@ async function profile(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  const { clause, parameters } = searchConditions(containerTag, scopeFilter(body), false);
+  const { clause, parameters } = searchConditions(containerTag, scopeFilter(body), false, "", false, enrichmentEnabled(env));
   // SQLはコードポイント単位。末尾判定用の1文字とNUL時の全文でUTF-16のexcerpt契約を保つ。
   const rows = await env.DB.prepare(
     `SELECT CASE WHEN instr(content, char(0)) > 0 THEN content ELSE substr(content, 1, 1201) END AS content
@@ -2726,6 +2776,12 @@ async function retryEnrichment(
   const parsedMetadata = parseMetadata(row.metadata_json);
   if (!automaticEnrichmentAllowed(parsedMetadata)) {
     throw new HttpError(409, "Document is excluded from automatic enrichment");
+  }
+  if (parsedMetadata.sm_organization === true && await env.DB.prepare(
+    "SELECT id FROM memory_organization_summaries WHERE memory_id=? AND status='active'",
+  ).bind(id).first()) {
+    ctx.waitUntil(retryOrganizationEmbeddings(env,[id],true));
+    return json({id,enrichmentStatus:"pending",topicStatus:"done"},202);
   }
   const explicitTopics = existingExplicitTopics(row.metadata_json);
   const skipFacts = parsedMetadata.sm_consolidation === true;
@@ -2831,7 +2887,7 @@ async function reconcileForgottenVectors(env: Env): Promise<void> {
   const MAX_FORGOTTEN_VECTOR_SCAN = 100;
   const result = await env.DB.prepare(
     `SELECT id FROM memories
-     WHERE is_forgotten = 1
+     WHERE is_forgotten = 1 OR NOT ${organizationVisible("memories",true)}
      ORDER BY COALESCE(vector_attempted_at, updated_at) ASC
      LIMIT ?`,
   ).bind(MAX_FORGOTTEN_VECTOR_SCAN).all<{ id: string }>();
@@ -2846,7 +2902,7 @@ async function reconcileForgottenVectors(env: Env): Promise<void> {
     await env.DB.batch(ids.map((id) => env.DB.prepare(
       `UPDATE memories
        SET vector_status = 'pending', vector_attempted_at = ?
-       WHERE id = ? AND is_forgotten = 1`,
+       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisible("memories",true)})`,
     ).bind(attemptedAt, id)));
     console.error(JSON.stringify({ event: "forgotten_vector_lookup_failed", memoryIds: ids, error: diagnosticError(error, env) }));
     return;
@@ -2874,7 +2930,7 @@ async function reconcileForgottenVectors(env: Env): Promise<void> {
     return env.DB.prepare(
       `UPDATE memories
        SET vector_status = ?, vector_mutation_id = ?, vector_attempted_at = ?
-       WHERE id = ? AND is_forgotten = 1`,
+       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisible("memories",true)})`,
     ).bind(
       visibleIds.has(id) ? visibleStatus : "disabled",
       visibleIds.has(id) && !deleteFailed ? vectorMutationId(mutation) : null,
@@ -2892,7 +2948,7 @@ async function vectorStatus(env: Env): Promise<Response> {
        FROM memories WHERE is_forgotten = 0 GROUP BY vector_status ORDER BY vector_status`,
     ).all(),
     env.DB.prepare(
-      "SELECT id FROM memories WHERE is_forgotten = 0 AND embedding_json IS NOT NULL LIMIT 100",
+      `SELECT id FROM memories WHERE is_forgotten = 0 AND embedding_json IS NOT NULL AND ${organizationVisible("memories",enrichmentEnabled(env))} LIMIT 100`,
     ).all<{ id: string }>(),
   ]);
   const visible =
@@ -2907,29 +2963,97 @@ async function vectorStatus(env: Env): Promise<Response> {
   });
 }
 
+async function retryOrganizationEmbeddings(env: Env, selectedIds?: string[], force = false): Promise<void> {
+  // 一般enrichmentの再試行契約を保ち、まとめの埋め込みだけを排他的に取得する。
+  if (!enrichmentEnabled(env) || selectedIds?.length === 0) return;
+  const rows = await env.DB.prepare(`SELECT m.id,m.container_tag,m.content,m.metadata_json,m.updated_at,m.topic_revision
+    FROM memory_organization_summaries s JOIN memories m ON m.id=s.memory_id
+    WHERE s.status='active' AND m.is_forgotten=0 AND json_extract(m.metadata_json,'$.memoryIndex.recallable') IS NOT 0
+      AND (m.embedding_status IN ('pending','failed','disabled') OR (?=1 AND m.embedding_status='done') OR
+        (m.embedding_status='processing' AND COALESCE(m.vector_attempted_at,m.created_at)<strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 minutes')))
+      ${selectedIds ? "AND m.id IN(SELECT value FROM json_each(?))" : ""}
+    ORDER BY COALESCE(m.vector_attempted_at,m.created_at),m.id LIMIT 10`)
+    .bind(force ? 1 : 0, ...(selectedIds ? [JSON.stringify(selectedIds)] : []))
+    .all<Pick<MemoryRow,"id"|"container_tag"|"content"|"metadata_json"|"updated_at"|"topic_revision">>();
+  await Promise.all(rows.results.map(async row => {
+    if (row.topic_revision === null || !enrichmentEnabled(env)) return;
+    const metadata = parseMetadata(row.metadata_json);
+    const topics = Array.isArray(metadata.topics) ? metadata.topics.filter((topic): topic is string => typeof topic === "string") : [];
+    const token=crypto.randomUUID();
+    const claimed=await env.DB.batch([
+      env.DB.prepare(`INSERT INTO memory_organization_embedding_attempts(memory_id,source_revision,token,expires_at)
+        SELECT m.id,m.topic_revision,?,strftime('%Y-%m-%dT%H:%M:%fZ','now','+10 minutes')
+        FROM memories m JOIN memory_organization_summaries s ON s.memory_id=m.id
+        WHERE m.id=? AND m.topic_revision=? AND m.is_forgotten=0 AND s.status='active'
+          AND json_extract(m.metadata_json,'$.memoryIndex.recallable') IS NOT 0
+          AND (m.embedding_status IN ('pending','failed','disabled') OR (?=1 AND m.embedding_status='done') OR
+            (m.embedding_status='processing' AND COALESCE(m.vector_attempted_at,m.created_at)<strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 minutes')))
+          AND NOT EXISTS(SELECT 1 FROM memory_organization_embedding_attempts a WHERE a.memory_id=m.id AND a.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ON CONFLICT(memory_id) DO UPDATE SET source_revision=excluded.source_revision,token=excluded.token,expires_at=excluded.expires_at
+          WHERE memory_organization_embedding_attempts.expires_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')`)
+        .bind(token,row.id,row.topic_revision,force ? 1 : 0),
+      env.DB.prepare(`UPDATE memories SET embedding_status='processing',vector_status='pending',vector_mutation_id=NULL,
+          vector_attempted_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),enrichment_error=NULL
+        WHERE id=? AND EXISTS(SELECT 1 FROM memory_organization_embedding_attempts a WHERE a.memory_id=memories.id AND a.token=?)`)
+        .bind(row.id,token),
+    ]);
+    if ((claimed[0]?.meta.changes ?? 0) === 0) return;
+    const memory:EnrichmentMemory={id:row.id,containerTag:row.container_tag,content:row.content,updatedAt:row.updated_at,
+      topicRevision:row.topic_revision,explicitTopics:topics,skipFacts:true,organizationAttempt:token};
+    try {
+      if(!enrichmentEnabled(env)) {
+        await env.DB.prepare(`UPDATE memories SET embedding_status='disabled',vector_status='disabled' WHERE id=?${organizationAttemptFence(memory)}`)
+          .bind(row.id,...organizationAttemptBindings(memory)).run();
+        return;
+      }
+      const current=await env.DB.prepare(`SELECT id FROM memories WHERE id=?${organizationAttemptFence(memory)}`)
+        .bind(row.id,...organizationAttemptBindings(memory)).first();
+      if(!current)return;
+      const result=await Promise.allSettled([embedText(memory.content,env)]);
+      const errors=await persistMemoryEmbedding(memory,env,result[0]!);
+      await env.DB.prepare(`UPDATE memories SET enrichment_error=? WHERE id=?${organizationAttemptFence(memory)}`)
+        .bind(errors.length ? diagnosticError(errors.join('; '),env) : null,row.id,...organizationAttemptBindings(memory)).run();
+      if(errors.length) console.error(JSON.stringify({event:"organization_embedding_failed",memoryId:row.id,error:diagnosticError(errors.join('; '),env)}));
+    } catch(error) {
+      await env.DB.prepare(`UPDATE memories SET embedding_status='failed',vector_status='failed',enrichment_error=? WHERE id=?${organizationAttemptFence(memory)}`)
+        .bind(diagnosticError(error,env),row.id,...organizationAttemptBindings(memory)).run();
+      console.error(JSON.stringify({event:"organization_embedding_failed",memoryId:row.id,error:diagnosticError(error,env)}));
+    } finally {
+      await env.DB.prepare("UPDATE memory_organization_embedding_attempts SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE memory_id=? AND token=?")
+        .bind(row.id,token).run();
+    }
+  }));
+}
+
 async function reconcileVectors(env: Env): Promise<void> {
   await reconcileForgottenVectors(env);
   if (!enrichmentEnabled(env)) return;
+  await retryOrganizationEmbeddings(env);
+  if (!enrichmentEnabled(env)) return;
   const result = await env.DB.prepare(
-    `SELECT id, container_tag, embedding_json, vector_attempted_at, topic_revision FROM (
-       SELECT id, container_tag, embedding_json, vector_attempted_at, topic_revision
+    `SELECT id, container_tag, embedding_json, vector_attempted_at, vector_status,topic_revision,organization_attempt FROM (
+       SELECT id, container_tag, embedding_json, vector_attempted_at, vector_status,topic_revision,${organizationAttemptSql()} AS organization_attempt
        FROM memories
        WHERE is_forgotten = 0 AND embedding_json IS NOT NULL AND vector_status <> 'indexed'
+         AND ${organizationVisible("memories",enrichmentEnabled(env))}
+         AND (embedding_status='done' OR NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=memories.id))
          AND json_extract(metadata_json, '$.memoryIndex.recallable') IS NOT 0
        ORDER BY COALESCE(vector_attempted_at, created_at) ASC LIMIT 90
      )
      UNION ALL
-     SELECT id, container_tag, embedding_json, vector_attempted_at, topic_revision FROM (
-       SELECT id, container_tag, embedding_json, vector_attempted_at, topic_revision
+     SELECT id, container_tag, embedding_json, vector_attempted_at, vector_status,topic_revision,organization_attempt FROM (
+       SELECT id, container_tag, embedding_json, vector_attempted_at, vector_status,topic_revision,${organizationAttemptSql()} AS organization_attempt
        FROM memories
        WHERE is_forgotten = 0 AND embedding_json IS NOT NULL AND vector_status = 'indexed'
+         AND ${organizationVisible("memories",enrichmentEnabled(env))}
+         AND (embedding_status='done' OR NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=memories.id))
          AND json_extract(metadata_json, '$.memoryIndex.recallable') IS NOT 0
        ORDER BY COALESCE(vector_attempted_at, created_at) ASC LIMIT 10
      )`,
   ).all<Pick<
     MemoryRow,
-    "id" | "container_tag" | "embedding_json" | "vector_attempted_at" | "topic_revision"
-  >>();
+    "id" | "container_tag" | "embedding_json" | "vector_attempted_at" | "topic_revision" | "vector_status"
+  > & {organization_attempt: string|null}>();
   if (result.results.length === 0) return;
 
   const ids = result.results.map((row) => row.id);
@@ -2941,14 +3065,15 @@ async function reconcileVectors(env: Env): Promise<void> {
   let currentVectorCount = 0;
   for (const row of result.results) {
     const vector = existingById.get(row.id);
-    if (vector && vectorMetadataRevision(vector) === vectorRevision(row.topic_revision)) {
+    if (vector && vectorMatchesCurrent(vector,row.topic_revision,row.organization_attempt)) {
       currentVectorCount += 1;
       updates.push(
         env.DB.prepare(
           `UPDATE memories
            SET vector_status = 'indexed', vector_attempted_at = ?
-           WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
-        ).bind(now.toISOString(), row.id, row.topic_revision),
+           WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisible("memories",enrichmentEnabled(env))}
+             ${row.organization_attempt ? `AND ${organizationAttemptSql()}=?` : ""}`,
+        ).bind(now.toISOString(), row.id, row.topic_revision,...(row.organization_attempt?[row.organization_attempt]:[])),
       );
     }
   }
@@ -2956,8 +3081,9 @@ async function reconcileVectors(env: Env): Promise<void> {
   const stale = result.results.filter((row) => {
     const vector = existingById.get(row.id);
     if (vector) {
-      return vectorMetadataRevision(vector) !== vectorRevision(row.topic_revision);
+      return !vectorMatchesCurrent(vector,row.topic_revision,row.organization_attempt);
     }
+    if (row.vector_status === 'disabled') return true;
     const attemptedAt = row.vector_attempted_at ? Date.parse(row.vector_attempted_at) : 0;
     return !Number.isFinite(attemptedAt) || attemptedAt <= retryBefore;
   });
@@ -2975,7 +3101,7 @@ async function reconcileVectors(env: Env): Promise<void> {
       id: row.id,
       values,
       namespace,
-      metadata: { topic_revision: vectorRevision(row.topic_revision) },
+      metadata: { topic_revision: vectorRevision(row.topic_revision),...(row.organization_attempt?{organization_attempt:row.organization_attempt}:{}) },
     });
   }
 
@@ -2993,8 +3119,9 @@ async function reconcileVectors(env: Env): Promise<void> {
           statement: env.DB.prepare(
             `UPDATE memories
              SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
-             WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
-          ).bind(vectorMutationId(mutation), attemptedAt, vector.id, row.topic_revision),
+             WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisible("memories",enrichmentEnabled(env))}
+               ${row.organization_attempt ? `AND ${organizationAttemptSql()}=?` : ""}`,
+          ).bind(vectorMutationId(mutation), attemptedAt, vector.id, row.topic_revision,...(row.organization_attempt?[row.organization_attempt]:[])),
         });
       }
       const statusResults = await env.DB.batch(statusUpdates.map(({ statement }) => statement));
@@ -3270,8 +3397,9 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   } else if (projection === "index") {
     const rows = rowsResult.results.filter(isDocumentIndexRow);
     const topics = await topicsByMemory(rows, env);
+    const manualOnly = await registeredManualOnlyIds(rows,env);
     documents = rows.map((row) => {
-      const metadata = parseMetadata(row.metadata_json);
+      const metadata = manualOnlyMetadata(parseMetadata(row.metadata_json),manualOnly.has(row.id));
       return {
         ...documentDisplay(row, metadata, topics.get(row.id) ?? [], row.content_preview),
         isForgotten: false,
@@ -3281,8 +3409,9 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   } else {
     const rows = rowsResult.results.filter(isMemoryRow);
     const topics = await topicsByMemory(rows, env);
+    const manualOnly = await registeredManualOnlyIds(rows,env);
     documents = rows.map((row) => {
-      const metadata = parseMetadata(row.metadata_json);
+      const metadata = manualOnlyMetadata(parseMetadata(row.metadata_json),manualOnly.has(row.id));
       return {
         ...documentDisplay(row, metadata, topics.get(row.id) ?? [], excerpt(row.content, "", 300), row.content),
         enrichment: {
@@ -3327,15 +3456,41 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function getDocument(id: string, env: Env): Promise<Response> {
-  const row = await env.DB.prepare(`SELECT ${DOCUMENT_DISPLAY_COLUMNS} FROM memories AS m WHERE m.id = ? AND m.is_forgotten = 0`)
+async function getDocument(id: string, env: Env, sourceCursor?: string): Promise<Response> {
+  if (sourceCursor !== undefined) {
+    const page = await organizationSourcePage(env.DB,id,sourceCursor,50);
+    if (page) return page.ok ? json({organizationSources:await page.json()}) : page;
+    if (await env.DB.prepare("SELECT summary_id FROM memory_organization_versions WHERE memory_id=?").bind(id).first()) {
+      throw new HttpError(409,"Organization summary changed or is no longer active");
+    }
+    const exists = await env.DB.prepare("SELECT id FROM memories WHERE id=? AND is_forgotten=0").bind(id).first();
+    throw new HttpError(exists ? 400 : 404,exists ? "Document has no organization sources" : "Document not found");
+  }
+  const row = await env.DB.prepare(`SELECT ${DOCUMENT_DISPLAY_COLUMNS}, v.summary_id AS organization_summary_id,
+      c.id AS consolidation_id
+    FROM memories AS m LEFT JOIN memory_organization_versions v ON v.memory_id=m.id
+    LEFT JOIN memory_consolidations c ON c.memory_id=m.id WHERE m.id = ? AND m.is_forgotten = 0`)
     .bind(id)
-    .first<MemoryRow>();
-  if (!row) throw new HttpError(404, "Document not found");
-  const metadata = parseMetadata(row.metadata_json);
+    .first<MemoryRow & {organization_summary_id: string | null;consolidation_id: string | null}>();
+  if (!row) {
+    if (await env.DB.prepare("SELECT summary_id FROM memory_organization_versions WHERE memory_id=?").bind(id).first()) {
+      throw new HttpError(409, "Organization summary changed or is no longer active");
+    }
+    throw new HttpError(404, "Document not found");
+  }
+  const metadata = manualOnlyMetadata(parseMetadata(row.metadata_json),row.organization_summary_id!==null);
+  let sourcePage: unknown;
+  if (row.organization_summary_id !== null || row.consolidation_id !== null) {
+    const page = await organizationSourcePage(env.DB, id, undefined, 5);
+    if (page) {
+      if (!page.ok) return page;
+      sourcePage = await page.json();
+    } else throw new HttpError(409, "Organization summary changed or is no longer active");
+  }
   const topics = await topicsByMemory([row], env);
   return json({
     ...documentDisplay(row, metadata, topics.get(row.id) ?? [], excerpt(row.content, "", 300), row.content),
+    ...(sourcePage ? { organizationSources: sourcePage } : {}),
     enrichment: {
       embeddingStatus: row.embedding_status,
       factStatus: row.fact_status,
@@ -3373,6 +3528,9 @@ async function updateDocument(
     .first<DocumentUpdateRow>();
   if (!current) throw new HttpError(404, "Document not found");
   // メタデータの差し替えでも生成物の識別を迂回できないよう正本を照合する。
+  if (await env.DB.prepare("SELECT summary_id FROM memory_organization_versions WHERE memory_id=?").bind(id).first()) {
+    throw new HttpError(409, "Generated summaries cannot be edited");
+  }
   if (await env.DB.prepare("SELECT id FROM memory_consolidations WHERE memory_id = ?").bind(id).first()) {
     throw new HttpError(409, "Generated checkpoints cannot be edited; update their source documents instead");
   }
@@ -3471,10 +3629,10 @@ async function removeDerivedMemory(
 }
 
 async function deleteVectorAfterStaleUpsert(id: string, env: Env): Promise<void> {
-  const current = await env.DB.prepare("SELECT is_forgotten FROM memories WHERE id = ?")
+  const current = await env.DB.prepare(`SELECT is_forgotten,NOT ${organizationVisible("memories",true)} AS organizationHidden FROM memories WHERE id = ?`)
     .bind(id)
-    .first<Pick<MemoryRow, "is_forgotten">>();
-  if (current?.is_forgotten === 0) {
+    .first<Pick<MemoryRow, "is_forgotten"> & {organizationHidden: number}>();
+  if (current?.is_forgotten === 0 && !current.organizationHidden) {
     await repairActiveVectorAfterDelete(id, env, "upsert");
     return;
   }
@@ -3482,7 +3640,7 @@ async function deleteVectorAfterStaleUpsert(id: string, env: Env): Promise<void>
     await env.DB.prepare(
       `UPDATE memories
        SET vector_status = 'pending', vector_mutation_id = NULL, vector_attempted_at = NULL
-       WHERE id = ? AND is_forgotten = 1`,
+       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisible("memories",true)})`,
     ).bind(id).run();
   }
   try {
@@ -3506,13 +3664,15 @@ async function repairActiveVectorAfterDelete(
 
   for (let attempt = 0; attempt < MAX_VECTOR_DELETE_REPAIR_ATTEMPTS; attempt += 1) {
     const current = await env.DB.prepare(
-      `SELECT container_tag, metadata_json, is_forgotten, embedding_json, topic_revision
+      `SELECT container_tag, metadata_json, is_forgotten, embedding_json, topic_revision,embedding_status,
+         ${organizationAttemptSql()} AS organization_attempt,
+         NOT ${organizationVisible("memories",true)} AS organizationHidden
        FROM memories WHERE id = ?`,
     ).bind(id).first<Pick<
       MemoryRow,
-      "container_tag" | "metadata_json" | "is_forgotten" | "embedding_json" | "topic_revision"
-    >>();
-    const values = current?.is_forgotten === 0 && automaticEnrichmentAllowed(parseMetadata(current.metadata_json))
+      "container_tag" | "metadata_json" | "is_forgotten" | "embedding_json" | "topic_revision" | "embedding_status"
+    > & {organizationHidden: number;organization_attempt:string|null}>();
+    const values = current?.is_forgotten === 0 && !current.organizationHidden && (!current.organization_attempt || current.embedding_status==='done') && automaticEnrichmentAllowed(parseMetadata(current.metadata_json))
       ? parseEmbedding(current.embedding_json)
       : null;
     if (!current || !values) {
@@ -3529,15 +3689,16 @@ async function repairActiveVectorAfterDelete(
         id,
         values,
         namespace: await vectorNamespace(current.container_tag),
-        metadata: { topic_revision: vectorRevision(current.topic_revision) },
+        metadata: { topic_revision: vectorRevision(current.topic_revision),...(current.organization_attempt?{organization_attempt:current.organization_attempt}:{}) },
       }]);
     } catch (error) {
       await env.DB.prepare(
         `UPDATE memories
          SET vector_status = 'failed', vector_mutation_id = NULL, vector_attempted_at = NULL,
              enrichment_error = ?
-         WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
-      ).bind(diagnosticError(`vector restore after delete: ${String(error)}`, env), id, current.topic_revision).run();
+         WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0
+           ${current.organization_attempt ? `AND ${organizationAttemptSql()}=? AND embedding_status='done'` : ""}`,
+      ).bind(diagnosticError(`vector restore after delete: ${String(error)}`, env), id, current.topic_revision,...(current.organization_attempt?[current.organization_attempt]:[])).run();
       console.error(JSON.stringify({ event: "vector_restore_after_delete_failed", memoryId: id, error: diagnosticError(error, env) }));
       return;
     }
@@ -3546,8 +3707,9 @@ async function repairActiveVectorAfterDelete(
     const updated = await env.DB.prepare(
       `UPDATE memories
        SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
-       WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
-    ).bind(vectorMutationId(mutation), attemptedAt, id, current.topic_revision).run();
+       WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisible("memories",true)}
+         ${current.organization_attempt ? `AND ${organizationAttemptSql()}=? AND embedding_status='done'` : ""}`,
+    ).bind(vectorMutationId(mutation), attemptedAt, id, current.topic_revision,...(current.organization_attempt?[current.organization_attempt]:[])).run();
     if ((updated.meta.changes ?? 0) > 0) return;
   }
 
@@ -3556,6 +3718,7 @@ async function repairActiveVectorAfterDelete(
     `UPDATE memories
      SET vector_status = 'pending', vector_mutation_id = NULL, vector_attempted_at = NULL
      WHERE id = ? AND is_forgotten = 0 AND embedding_json IS NOT NULL
+       AND NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=memories.id)
        AND json_extract(metadata_json, '$.memoryIndex.recallable') IS NOT 0`,
   ).bind(id).run();
   console.warn(JSON.stringify({ event: "vector_restore_after_delete_deferred", memoryId: id }));
@@ -3682,6 +3845,16 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     });
   }
   if (!(await isAuthorized(request, env))) throw new HttpError(401, "Unauthorized");
+  const organizationMatch = /^\/v4\/organize\/(prepare|commit|lookup|sources)$/.exec(url.pathname);
+  if (organizationMatch && request.method === "POST") {
+    const response = await organization(request, env, organizationMatch[1]!);
+    if (response.ok && organizationMatch[1] === "commit" && enrichmentEnabled(env)) {
+      const result = await response.clone().json() as {summaries?: Array<{memoryId?: string}>};
+      const ids = result.summaries?.map(summary => summary.memoryId).filter((id): id is string => typeof id === "string") ?? [];
+      ctx.waitUntil(retryOrganizationEmbeddings(env, ids));
+    }
+    return response;
+  }
 
   if (url.pathname === "/v3/session" && request.method === "GET") {
     return json({
@@ -3729,7 +3902,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   const documentMatch = /^\/v3\/documents\/([^/]+)$/.exec(url.pathname);
   if (documentMatch?.[1]) {
     const id = decodeURIComponent(documentMatch[1]);
-    if (request.method === "GET") return getDocument(id, env);
+    if (request.method === "GET") return getDocument(id, env, url.searchParams.get("sourceCursor") ?? undefined);
     if (request.method === "PATCH") return updateDocument(id, request, env, ctx);
     if (request.method === "DELETE") return hardDeleteMemory(id, env, ctx);
   }

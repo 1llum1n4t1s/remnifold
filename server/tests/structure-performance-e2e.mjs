@@ -13,8 +13,6 @@ import { migrations, applyMigrations } from "./support/migrations.mjs";
 
 const timestamp = "2026-10-21T01:00:00.000Z";
 const embedding = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
-const checks = [];
-const metrics = [];
 
 async function bounded(promise, description) {
   let timer;
@@ -101,7 +99,7 @@ function fixture(module) {
   return { db, env, api, seed, reconcile, controls, events, state, reset, seeds, sqlReads };
 }
 
-function scenario(name,run,verify){test(name,async()=>{const f=fixture(observed);try{const current=await run(f,observed);recordMetrics(name,{operations:current.counts??observed.counts(),sqlReads:f.sqlReads});verify?.(current,undefined);const normalized=normalizeFixtureResult(current.public,f.seeds,JSON.stringify(embedding));assert.deepEqual(normalized,structureGoldens[name],`${name}: complete public response and ordered SQL/AI/vector effects`);assert.equal(JSON.stringify(normalized),JSON.stringify(structureGoldens[name]),`${name}: JSON key ordering`)}finally{f.db.close()}})}for (const [name, tags, failure, invalid] of [
+function scenario(name,run,verify){test(name,async()=>{const f=fixture(observed);try{const current=await run(f,observed);recordMetrics(name,{operations:current.counts??observed.counts(),sqlReads:f.sqlReads});verify?.(current);const normalized=normalizeFixtureResult(current.public,f.seeds,JSON.stringify(embedding));assert.deepEqual(normalized,structureGoldens[name],`${name}: complete public response and ordered SQL/AI/vector effects`);assert.equal(JSON.stringify(normalized),JSON.stringify(structureGoldens[name]),`${name}: JSON key ordering`)}finally{f.db.close()}})}for (const [name, tags, failure, invalid] of [
   ["reconcile same tag 100 rows", 1, false, false],
   ["reconcile three tags 100 rows", 3, false, false],
   ["reconcile failed upsert", 1, true, false],
@@ -118,16 +116,11 @@ function scenario(name,run,verify){test(name,async()=>{const f=fixture(observed)
   assert.equal(upserts[0].rows.length, invalid ? 99 : 100);
   assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM memories WHERE vector_status = ?").get(failure ? "failed" : "queued").n, invalid ? 99 : 100);
   return { public: { state: f.state(), events: f.events }, counts: module.counts() };
-}, (current, old) => {
+}, (current) => {
   const count = invalid ? 99 : 100;
   assert.equal(current.counts.digests, tags);
   assert.equal(current.counts.rowComparisons, 0);
   assert.equal(current.counts.rowLookups, count);
-  if (old) {
-    assert.equal(old.counts.digests, count);
-    assert.ok(old.counts.rowComparisons >= count * (count + 1) / 2);
-  }
-  metrics.push({ name, before: old?.counts, after: current.counts });
 });
 
 for (const projection of ["full", "index", "ids", "capture"]) scenario(`document ${projection} and GET DTO`, async (f) => {
@@ -160,19 +153,12 @@ for (const indexOnly of [false, true]) scenario(`search ${indexOnly ? "index" : 
   }
   const { timing: _timing, ...body } = result.body;
   return { public: { status: result.status, body, events: f.events }, counts: module.counts() };
-}, (current, old) => {
-  // index投影はFTS順位用の独立した1回も必要。indexedMemoriesの重複だけが減る。
-  assert.equal(current.counts.indexQueryPatterns, indexOnly ? 2 : 1);
+}, (current) => {
+  // 同一requestのFTS順位・indexedMemoriesで成功したpatternを共有する。
+  assert.equal(current.counts.indexQueryPatterns, 1);
   assert.equal(current.counts.excerpt, indexOnly ? 0 : 3);
   assert.equal(current.counts.candidateLower, 12);
-  if (old) {
-    assert.equal(old.counts.indexQueryPatterns, indexOnly ? 3 : 2);
-    if (!indexOnly) assert.equal(old.counts.excerpt - current.counts.excerpt, 3);
-    else assert.equal(current.counts.excerpt, old.counts.excerpt);
-    assert.ok(current.counts.candidateLower > 0);
-    assert.equal(old.counts.candidateLower, current.counts.candidateLower * 4);
-  }
-  metrics.push({ name: `search ${indexOnly ? "index" : "full"}`, before: old?.counts, after: current.counts });
+  assert.ok(current.counts.candidateLower > 0);
 });
 
 for (const mode of ["success", "vector failure", "embedding and enrichment failure", "stale revision"]) scenario(`enrichment ${mode}`, async (f) => {

@@ -7,6 +7,12 @@ import "../topics.test.mjs";
 import "../races.test.mjs";
 import "../mcp-oauth.test.mjs";
 import "../remote-mcp.test.mjs";
+import "../organization.test.mjs";
+import "../organization-sources.test.mjs";
+import "../organization-core.test.mjs";
+import "../organization-core-queues.test.mjs";
+import "../organization-core-recovery.test.mjs";
+import "../organization-core-conflicts.test.mjs";
 class TestDatabase {
   constructor(ctx) {
     this.ctx = ctx;

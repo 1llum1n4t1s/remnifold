@@ -4,17 +4,12 @@
 // 初回40件backfillで全project集計を繰り返すこと、expression indexが対象照会に使われないこと。
 // 実行: cargo xtask server-test
 // 認証済み Worker API、全 migration 適用済み SQLite、非同期完了を通す統合検証。
-import test, { assert } from "./support/test.mjs";
+import { assert } from "./support/test.mjs";
 import worker from "../src/index.ts";
-import { checkpoint, embedding, fixture, migrations, output } from "./worker-fixture.mjs";
+import { checkpoint, embedding, fixture, migrations, output, scenarioWithLogs as scenario } from "./worker-fixture.mjs";
 
 
 
-function scenario(name, run) { test(name, async () => {
- const f=fixture(); const logs=[]; const original={log:console.log,error:console.error,warn:console.warn};
- const capture=(...values)=>{for(const value of values){try{logs.push(JSON.parse(value))}catch{}}};Object.keys(original).forEach(k=>console[k]=capture);
- try { await run(f, logs); } catch(error) { original.error(JSON.stringify({test:name,events:logs})); throw error; } finally { await f.drain(); Object.assign(console,original); f.db.close(); }
-}); }
 for (const operation of ["forget", "patch", "upsert"]) scenario(`${operation} invalidation failure rolls back source and checkpoint together`, async (f) => {
   const [id] = await f.seed(); const first = (await f.consolidate()).body; await f.drain();
   const before = f.db.prepare("SELECT * FROM memories WHERE id = ?").get(id);

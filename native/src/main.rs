@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
-use remnifold::{capture, common, hooks, live_test, local, mcp, provision, topics_setup, updater};
+use remnifold::{
+    capture, common, hooks, live_test, local, mcp, organization, provision, topics_setup, updater,
+};
 use serde_json::Value;
 use std::io::{self, Read};
 
@@ -73,6 +75,7 @@ fn run() -> Result<()> {
         "setup" => local::setup(&args[1..])?,
         "server-setup" => provision::run(&args[1..])?,
         "topics-setup" => topics_setup::run(&args[1..])?,
+        "memory-organize" => organization::run(&args[1..])?,
         "server-live-test" => live_test::run(&args[1..])?,
         "status" => local::status()?,
         "plugin-update" => updater::run(&args[1..])?,

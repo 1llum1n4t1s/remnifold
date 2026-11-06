@@ -135,12 +135,12 @@ fn plain_line(s: &str) -> String {
         .trim()
         .to_owned()
 }
-fn meaningful(s: &str) -> Vec<String> {
+fn meaningful(s: &str) -> impl Iterator<Item = String> + '_ {
     let mut fenced = false;
-    s.lines().filter_map(|line|{if line.trim_start().starts_with("```"){fenced=!fenced;return None} if fenced||re(r"^\s*#{1,6}\s").is_match(line)||re(r"^\s*\[[^\]\n]*\]\((?:thread|codex)://[^)]+\)\s*$").is_match(line){return None} let l=plain_line(line);if l.is_empty()||re(r"(?i)^(?:(?:Session|Turn|Part|Source(?: SHA-256)?|Imported snapshot|updated_at|rollout_path|cwd|thread_id|git_branch|task_group|task_outcome|keywords)\s*:|rollout_summaries[\\/]|User request|User comment:|Referenced assistant response:|Final assistant response|Codex saved memory import|Historical memory evidence|v\d+$|<|:codex-|::)").is_match(&l){None}else{Some(l)}}).collect()
+    s.lines().filter_map(move |line|{if line.trim_start().starts_with("```"){fenced=!fenced;return None} if fenced||re(r"^\s*#{1,6}\s").is_match(line)||re(r"^\s*\[[^\]\n]*\]\((?:thread|codex)://[^)]+\)\s*$").is_match(line){return None} let l=plain_line(line);if l.is_empty()||re(r"(?i)^(?:(?:Session|Turn|Part|Source(?: SHA-256)?|Imported snapshot|updated_at|rollout_path|cwd|thread_id|git_branch|task_group|task_outcome|keywords)\s*:|rollout_summaries[\\/]|User request|User comment:|Referenced assistant response:|Final assistant response|Codex saved memory import|Historical memory evidence|v\d+$|<|:codex-|::)").is_match(&l){None}else{Some(l)}})
 }
 fn first(s: &str) -> String {
-    meaningful(s).into_iter().find(|l|!re(r"^(?:ゆーくん[、,。!！\s]*|ありがとう[。!！\s]*|了解(?:です)?[。!！\s]*|承知しました[。!！\s]*)$").is_match(l)).unwrap_or_default()
+    meaningful(s).find(|l|!re(r"^(?:ゆーくん[、,。!！\s]*|ありがとう[。!！\s]*|了解(?:です)?[。!！\s]*|承知しました[。!！\s]*)$").is_match(l)).unwrap_or_default()
 }
 pub fn index_request_text(s: &str) -> String {
     let projected = crate::capture::project_request_text(s, false);
@@ -199,11 +199,22 @@ pub fn build_memory_index(
     .map(|s| short_text(&s, 60))
     .collect();
     let brief=re(r"^(?:はい|いいえ|了解(?:です|しました)?|承知しました|ありがとう(?:ございます)?|お疲れ(?:様|さま)(?:です|でした)?|[Oo][Kk]|続けて|お願いします|よろしく(?:お願いします)?)[。！!\s]*$").is_match(&request_line);
-    let detailed =
-        !sections.is_empty() || meaningful(response).join(" ").encode_utf16().count() >= 160;
-    let invocation = re(r"(?i)^[$/][a-z][a-z0-9_:-]*$")
-        .is_match(crate::capture::project_request_text(request, true).trim());
-    let fallback = first(response);
+    let invocation = request_line.is_empty()
+        && re(r"(?i)^[$/][a-z][a-z0-9_:-]*$")
+            .is_match(crate::capture::project_request_text(request, true).trim());
+    let detailed = (brief || invocation)
+        && (!sections.is_empty()
+            || meaningful(response)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .encode_utf16()
+                .count()
+                >= 160);
+    let fallback = if request_line.is_empty() {
+        first(response)
+    } else {
+        String::new()
+    };
     let mut v = json!({"version":1,"title":if !title.is_empty()&&!re(r"(?i)^(?:s|Codex task|Memory [a-f0-9]+)$").is_match(&title){title.clone()}else{short_text(if !request_line.is_empty(){&request_line}else if !fallback.is_empty(){&fallback}else{"保存された記録"},100)},"description":short_text(&if brief&&detailed{format!("{}の継続結果・詳細",if title.is_empty(){"作業"}else{&title})}else if !request_line.is_empty(){request_line.clone()}else{fallback},180),"sections":sections,"recallable":(!request_line.is_empty()||invocation&&detailed)&&(!brief||detailed),"sourceKind":source_kind});
     if let Some(d) = date(source_timestamp) {
         v["sourceUpdatedAt"] = json!(d)
@@ -741,21 +752,48 @@ fn normalized(s: &str) -> String {
         .replace_all(&s.nfkc().collect::<String>().to_lowercase(), " ")
         .to_string()
 }
-pub fn matching_topic_terms(s: &str, terms: &[String]) -> Vec<String> {
+struct PreparedTerm<'a> {
+    original: &'a str,
+    normalized: String,
+    token_like: bool,
+    ends_ascii_digit: bool,
+    weight: usize,
+}
+fn prepare_terms(terms: &[String]) -> (Vec<PreparedTerm<'_>>, usize) {
+    let prepared: Vec<_> = terms
+        .iter()
+        .map(|term| {
+            let normalized = normalized(term);
+            PreparedTerm {
+                original: term,
+                token_like: re(r"^[a-z\d ]+$").is_match(&normalized),
+                ends_ascii_digit: normalized.ends_with(|c: char| c.is_ascii_digit()),
+                normalized,
+                weight: term.encode_utf16().count().min(12),
+            }
+        })
+        .collect();
+    let total = prepared.iter().map(|term| term.weight).sum();
+    (prepared, total)
+}
+fn matching_prepared_terms<'a, 't>(
+    s: &str,
+    terms: &'a [PreparedTerm<'t>],
+) -> Vec<&'a PreparedTerm<'t>> {
     let s = normalized(s);
     terms
         .iter()
         .filter(|term| {
-            let t = normalized(term);
-            if !re(r"^[a-z\d ]+$").is_match(&t) {
-                return s.contains(&t);
+            let t = &term.normalized;
+            if !term.token_like {
+                return s.contains(t);
             }
-            s.match_indices(&t).any(|(pos, _)| {
+            s.match_indices(t).any(|(pos, _)| {
                 let before = s[..pos].chars().next_back();
                 let after = s[pos + t.len()..].chars().next();
                 !before.is_some_and(|c| c.is_ascii_alphanumeric())
                     && !after.is_some_and(|c| {
-                        if t.ends_with(|c: char| c.is_ascii_digit()) {
+                        if term.ends_ascii_digit {
                             c.is_ascii_alphanumeric()
                         } else {
                             c.is_ascii_alphabetic()
@@ -763,7 +801,13 @@ pub fn matching_topic_terms(s: &str, terms: &[String]) -> Vec<String> {
                     })
             })
         })
-        .cloned()
+        .collect()
+}
+pub fn matching_topic_terms(s: &str, terms: &[String]) -> Vec<String> {
+    let (prepared, _) = prepare_terms(terms);
+    matching_prepared_terms(s, &prepared)
+        .into_iter()
+        .map(|term| term.original.to_owned())
         .collect()
 }
 
@@ -823,7 +867,7 @@ struct Candidate {
     matches: Vec<String>,
     project_only: bool,
 }
-fn score(candidate: &mut Candidate, terms: &[String], automatic: bool) {
+fn score(candidate: &mut Candidate, terms: &[PreparedTerm<'_>], total: usize, automatic: bool) {
     let index = &candidate.index;
     let mut project = String::new();
     if !automatic {
@@ -844,28 +888,24 @@ fn score(candidate: &mut Candidate, terms: &[String], automatic: bool) {
         strings(&index["topics"]).join(" "),
         project
     );
-    let total = terms
-        .iter()
-        .map(|s| s.encode_utf16().count().min(12))
-        .sum::<usize>() as f64;
-    let weight = |terms: &[String]| {
+    let weight = |terms: &[&PreparedTerm<'_>]| {
         if terms.is_empty() {
             0.
         } else {
-            terms
-                .iter()
-                .map(|s| s.encode_utf16().count().min(12))
-                .sum::<usize>() as f64
-                / total
+            terms.iter().map(|term| term.weight).sum::<usize>() as f64 / total as f64
         }
     };
-    candidate.index_relevance = weight(&matching_topic_terms(&base, terms));
-    candidate.matches =
-        matching_topic_terms(&format!("{base} {}", text(&index["searchExcerpt"])), terms);
-    candidate.relevance = weight(&candidate.matches);
+    candidate.index_relevance = weight(&matching_prepared_terms(&base, terms));
+    let matches =
+        matching_prepared_terms(&format!("{base} {}", text(&index["searchExcerpt"])), terms);
+    candidate.relevance = weight(&matches);
+    candidate.matches = matches
+        .into_iter()
+        .map(|term| term.original.to_owned())
+        .collect();
     candidate.project_only = !project.is_empty()
         && !terms.is_empty()
-        && matching_topic_terms(&project, terms).len() == terms.len()
+        && matching_prepared_terms(&project, terms).len() == terms.len()
 }
 fn semantic(c: &Candidate, minimum: f64) -> bool {
     c.row["semanticSimilarity"]
@@ -971,6 +1011,7 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
     if query.is_empty() {
         return Ok(result);
     }
+    let (prepared_terms, total_weight) = prepare_terms(&terms);
     let settings = if options["settings"].is_object() {
         options["settings"].clone()
     } else {
@@ -1082,7 +1123,7 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
         }
     }
     for c in &mut candidates {
-        score(c, &terms, automatic)
+        score(c, &prepared_terms, total_weight, automatic)
     }
     candidates.retain(|c| {
         !text(&c.index["id"]).is_empty()
@@ -1163,7 +1204,7 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
                         c.index["recallable"] = json!(false)
                     }
                 }
-                score(c, &terms, automatic)
+                score(c, &prepared_terms, total_weight, automatic)
             }
         }
     }
@@ -1219,8 +1260,14 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
             && c.index["consolidation"] != true
             && selected.iter().any(|checkpoint| {
                 checkpoint.index["consolidation"] == true
-                    && strings(&checkpoint.index["sourceMemoryIds"])
-                        .contains(&text(&c.index["id"]).to_owned())
+                    && checkpoint.index["sourceMemoryIds"]
+                        .as_array()
+                        .is_some_and(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::trim)
+                                .any(|id| !id.is_empty() && id == text(&c.index["id"]))
+                        })
                     && c.matches
                         .iter()
                         .all(|term| checkpoint.matches.contains(term))
@@ -1361,12 +1408,33 @@ pub fn list_topics(config: &Config, options: &Value) -> Result<Value> {
     Ok(v)
 }
 pub fn read_document(config: &Config, id: &str) -> Result<Value> {
-    let document = request(
-        config,
-        &format!("/v3/documents/{}", encode(id)),
-        None,
-        &json!({}),
-    )?;
+    read_document_page(config, id, None)
+}
+
+pub fn read_document_page(config: &Config, id: &str, source_cursor: Option<&str>) -> Result<Value> {
+    if source_cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > 2048) {
+        bail!("Invalid organization source cursor.");
+    }
+    let mut path = format!("/v3/documents/{}", encode(id));
+    if let Some(cursor) = source_cursor {
+        path += &format!("?sourceCursor={}", encode(cursor));
+    }
+    let document = request(config, &path, None, &json!({}))?;
+    if source_cursor.is_some() {
+        let page = document.get("organizationSources").ok_or_else(|| anyhow::anyhow!(
+            "Organization source paging is unavailable; retrieve the summary again with a supported server."
+        ))?;
+        if document.get("content").is_some() {
+            bail!(
+                "Organization source paging is unavailable; retrieve the summary again with a supported server."
+            );
+        }
+        let page = organization_source_page(page, id)?;
+        return Ok(
+            json!({"text":format!("Organization sources (use getDocument for each ID and truncated filepath; pass nextCursor as sourceCursor to continue):\n{}",serde_json::to_string(&page)?),
+            "document":{"id":id,"organizationSources":page}}),
+        );
+    }
     let index = document_index(&document, "", &[]);
     let mut content = crate::capture::project_document_content(choose(&[
         &document["content"],
@@ -1398,11 +1466,19 @@ pub fn read_document(config: &Config, id: &str) -> Result<Value> {
             }
         }
     }
-    let output = format!(
+    let mut output = format!(
         "{}\n\nこれは過去の記録です。現在の状態と照合して利用してください。\n\n{content}",
         format_index_item(&index)
     );
     let mut v = json!({"id":text(&document["id"]),"content":content,"topics":index["topics"],"index":public_index(&index)});
+    if let Some(page) = document.get("organizationSources") {
+        let page = organization_source_page(page, id)?;
+        output += &format!(
+            "\n\nOrganization sources (use getDocument for each ID and truncated filepath; pass nextCursor as sourceCursor to continue):\n{}",
+            serde_json::to_string(&page)?
+        );
+        v["organizationSources"] = page;
+    }
     if let Some(p) = index.get("provenance") {
         v["provenance"] = p.clone()
     }
@@ -1427,6 +1503,74 @@ pub fn read_document(config: &Config, id: &str) -> Result<Value> {
         v["enrichment"] = enrichment
     }
     Ok(json!({"text":output,"document":v}))
+}
+
+fn organization_source_page(page: &Value, id: &str) -> Result<Value> {
+    let invalid = || anyhow::anyhow!("Invalid organization source page.");
+    let bounded = |value: &Value, maximum: usize| {
+        value
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= maximum)
+            .map(str::to_owned)
+            .ok_or_else(invalid)
+    };
+    if page["protocol"] != 1 || page["documentId"] != id || !page["hasMore"].is_boolean() {
+        return Err(invalid());
+    }
+    let rows = page["sources"]
+        .as_array()
+        .filter(|rows| rows.len() <= 50)
+        .ok_or_else(invalid)?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let mut source = json!({"id":bounded(&row["id"],64)?,"containerTag":bounded(&row["containerTag"],640)?,
+            "createdAt":bounded(&row["createdAt"],80)?,"updatedAt":bounded(&row["updatedAt"],80)?});
+        if let Some(kind) = row.get("sourceKind") {
+            let kind = kind
+                .as_str()
+                .filter(|kind| matches!(*kind, "document" | "checkpoint" | "capturePart"))
+                .ok_or_else(invalid)?;
+            source["sourceKind"] = json!(kind);
+            if kind == "capturePart" {
+                source["groupId"] = json!(bounded(&row["groupId"], 64)?);
+                source["part"] = json!(
+                    row["part"]
+                        .as_u64()
+                        .filter(|part| (1..=10000).contains(part))
+                        .ok_or_else(invalid)?
+                );
+            }
+        }
+        if let Some(path) = row.get("filepath") {
+            let path = path
+                .as_str()
+                .filter(|path| !path.trim().is_empty() && path.encode_utf16().count() <= 4096)
+                .ok_or_else(invalid)?;
+            source["filepath"] = json!(path);
+        }
+        if let Some(truncated) = row.get("filepathTruncated") {
+            if truncated.as_bool() != Some(true) || source.get("filepath").is_some() {
+                return Err(invalid());
+            }
+            source["filepathTruncated"] = json!(true);
+        }
+        sources.push(source);
+    }
+    let has_more = page["hasMore"] == true;
+    let next_cursor = if has_more {
+        json!(bounded(&page["nextCursor"], 2048)?)
+    } else {
+        if !page["nextCursor"].is_null() {
+            return Err(invalid());
+        }
+        Value::Null
+    };
+    let projected = json!({"protocol":1,"documentId":id,"revision":bounded(&page["revision"],160)?,
+        "sources":sources,"hasMore":has_more,"nextCursor":next_cursor});
+    if serde_json::to_vec(&projected)?.len() > 64 * 1024 {
+        return Err(invalid());
+    }
+    Ok(projected)
 }
 
 #[cfg(test)]
@@ -1552,6 +1696,53 @@ mod tests {
             matching_topic_terms(".NET8 RUST_analyzer rustacean", &terms),
             terms
         );
+        let compatibility = vec!["ＲＵＳＴ_api-v2".into(), "net٣".into(), "net8".into()];
+        assert_eq!(
+            matching_topic_terms("Rust-api_v2 net٣2 net8x", &compatibility),
+            compatibility[..2]
+        );
+        assert!(matching_topic_terms("xnet٣x", &["net٣".into()]).is_empty());
+        let terms = vec!["ﬃ".into(), "ﬃ".into(), "rust".into()];
+        assert_eq!(matching_topic_terms("ffi rust", &terms), terms);
+        let (prepared, total) = prepare_terms(&terms);
+        let mut candidate = Candidate {
+            row: json!({}),
+            index: json!({"title":"ffi","searchExcerpt":"rust"}),
+            rank: 0,
+            relevance: 0.,
+            index_relevance: 0.,
+            matches: vec![],
+            project_only: false,
+        };
+        score(&mut candidate, &prepared, total, false);
+        assert_eq!(candidate.matches, terms);
+        assert_eq!(candidate.index_relevance, 2. / 6.);
+        assert_eq!(candidate.relevance, 1.);
+        candidate.index = json!({"provenance":{"project":"rust"}});
+        let terms = vec!["rust".into()];
+        let (prepared, total) = prepare_terms(&terms);
+        score(&mut candidate, &prepared, total, false);
+        assert!(candidate.project_only);
+        assert_eq!(candidate.index_relevance, 1.);
+        score(&mut candidate, &prepared, total, true);
+        assert!(!candidate.project_only);
+        assert_eq!(candidate.relevance, 0.);
+        candidate.index = json!({"provenance":{"project":"base"},"searchExcerpt":"excerpt"});
+        let terms = vec!["base excerpt".into()];
+        let (prepared, total) = prepare_terms(&terms);
+        score(&mut candidate, &prepared, total, false);
+        assert_eq!(candidate.index_relevance, 0.);
+        assert_eq!(candidate.relevance, 1.);
+        assert_eq!(candidate.matches, terms);
+        let terms = vec![String::new()];
+        let (prepared, total) = prepare_terms(&terms);
+        score(&mut candidate, &prepared, total, false);
+        assert!(candidate.relevance.is_nan() && candidate.index_relevance.is_nan());
+        assert_eq!(candidate.matches, terms);
+        let (prepared, total) = prepare_terms(&[]);
+        score(&mut candidate, &prepared, total, false);
+        assert_eq!(candidate.relevance, 0.);
+        assert!(candidate.matches.is_empty() && !candidate.project_only);
         assert_eq!(
             automatic_search_text(r#"修正 "D:\Dev\Remnifold\native\src\main.rs""#),
             "修正 Remnifold"
@@ -1593,8 +1784,157 @@ mod tests {
         assert_eq!(index["provenance"]["project"], "Kiriha");
         assert_eq!(index["recallable"], true);
         assert!(public_index(&index).get("provenance").is_none());
-        assert!(!build_memory_index("Kiriha","ありがとう。","完了です。","","conversation")["recallable"].as_bool().unwrap());
-        assert!(build_memory_index("Kiriha","/gogo",&"詳細".repeat(100),"","conversation")["recallable"].as_bool().unwrap());
+        let expected = |title: &str, description: &str, sections: &[&str], recallable| {
+            json!({"version":1,"title":title,"description":description,"sections":sections,
+                "recallable":recallable,"sourceKind":"conversation","sourceUpdatedAt":"2026-10-01T00:00:00Z"})
+        };
+        let below = format!("{}x", "😀".repeat(79));
+        let boundary = "😀".repeat(80);
+        let invocation = "<skill><name>gogo</name><path>x</path>definition</skill>\n/gogo";
+        let long_response = format!(
+            "## 検証\n```rust\nignored answer\n```\nSession: metadata\n[task](codex://thread/old)\nありがとう。\n了解です。\n- [保持した根拠](https://example.test)\n## 理由\n{}",
+            "後続の詳しい説明。\n".repeat(100)
+        );
+        for (title, request, response, output) in [
+            (
+                "Kiriha",
+                "選択を直す",
+                long_response.clone(),
+                expected("Kiriha", "選択を直す", &["検証", "理由"], true),
+            ),
+            (
+                "Kiriha",
+                "はい",
+                "完了です。".to_owned(),
+                expected("Kiriha", "はい", &[], false),
+            ),
+            (
+                "Kiriha",
+                "はい",
+                "## 検証\n修正済み".to_owned(),
+                expected("Kiriha", "Kirihaの継続結果・詳細", &["検証"], true),
+            ),
+            (
+                "Kiriha",
+                "はい",
+                below,
+                expected("Kiriha", "はい", &[], false),
+            ),
+            (
+                "Kiriha",
+                "はい",
+                boundary.clone(),
+                expected("Kiriha", "Kirihaの継続結果・詳細", &[], true),
+            ),
+            (
+                "Kiriha",
+                invocation,
+                boundary.clone(),
+                expected("Kiriha", &boundary, &[], true),
+            ),
+            (
+                "Kiriha",
+                invocation,
+                "完了です。".to_owned(),
+                expected("Kiriha", "完了です。", &[], false),
+            ),
+            (
+                "Kiriha",
+                "/gogo",
+                "完了です。".to_owned(),
+                expected("Kiriha", "/gogo", &[], true),
+            ),
+            (
+                "Kiriha",
+                "ありがとう。",
+                "完了です。".to_owned(),
+                expected("Kiriha", "完了です。", &[], false),
+            ),
+            (
+                "Kiriha",
+                "",
+                long_response,
+                expected("Kiriha", "保持した根拠", &["検証", "理由"], false),
+            ),
+            (
+                "Codex task",
+                "",
+                String::new(),
+                expected("保存された記録", "", &[], false),
+            ),
+            (
+                "",
+                "手動記録を保存",
+                "未使用の回答\n".repeat(100),
+                expected("手動記録を保存", "手動記録を保存", &[], true),
+            ),
+        ] {
+            assert_eq!(
+                build_memory_index(
+                    title,
+                    request,
+                    &response,
+                    "2026-10-01T00:00:00Z",
+                    "conversation"
+                ),
+                output,
+                "request={request:?}"
+            );
+        }
+    }
+    #[test]
+    fn generated_summary_storage_date_does_not_become_the_source_date() {
+        let source_date = "2020-04-01T00:00:00Z";
+        let stored_date = "2026-11-06T00:00:00Z";
+        let original = json!({"id":"original-2020","containerTag":"memories","content":"2020年に確認した根拠と採用理由。",
+            "createdAt":source_date,"updatedAt":source_date,
+            "metadata":{"memoryIndex":{"version":1,"title":"Original evidence","description":"2020年の根拠","recallable":true,"sourceUpdatedAt":source_date}}});
+        let summary = json!({"id":"summary-2026","containerTag":"memories","content":"2020年の原文を根拠に採用した結論。要約の生成日は2026年。",
+            "createdAt":stored_date,"updatedAt":stored_date,
+            "metadata":{"sm_organization":true,"memoryIndex":{"version":1,"title":"Generated summary","description":"2020年の根拠から整理した結論","recallable":true}}});
+        let (config, handle, requests) = fixture(vec![summary, original]);
+        let generated = read_document(&config, "summary-2026").unwrap();
+        let source = read_document(&config, "original-2020").unwrap();
+        handle.join().unwrap();
+        let index = &generated["document"]["index"];
+        assert!(index.get("sourceUpdatedAt").is_none());
+        assert_eq!(index["updatedAt"], stored_date);
+        assert_eq!(index["createdAt"], stored_date);
+        assert!(text(&generated["text"]).contains(&format!("storedDate={stored_date}")));
+        assert!(!text(&generated["text"]).contains("sourceDate="));
+        assert!(text(&generated["document"]["content"]).contains("2020年の原文"));
+        assert!(text(&generated["document"]["content"]).contains("生成日は2026年"));
+        assert_eq!(source["document"]["index"]["sourceUpdatedAt"], source_date);
+        assert!(text(&source["text"]).contains(&format!("sourceDate={source_date}")));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+    #[test]
+    fn ordinary_metadata_markers_do_not_disable_automatic_recall() {
+        let ordinary = row("ordinary", "Kiriha 選択解除");
+        let mut manual_marker = ordinary.clone();
+        manual_marker["metadata"]["sm_organization_manual_only"] = json!(true);
+        let mut both_markers = manual_marker.clone();
+        both_markers["metadata"]["sm_organization"] = json!(true);
+        let mut opted_out = both_markers.clone();
+        opted_out["metadata"]["memoryIndex"]["recallable"] = json!(false);
+        let responses = [ordinary, manual_marker, both_markers, opted_out]
+            .into_iter().map(|document| json!({"searchScope":"all-containers","searchedContainers":["memories"],"spaceDiscoveryComplete":true,"results":[document]})).collect();
+        let (config, handle, requests) = fixture(responses);
+        for expected in [true, true, true, false] {
+            let result = search_index(
+                &config,
+                &json!({"query":"Kiriha 選択解除","automatic":true}),
+            )
+            .unwrap();
+            let rows = result["results"].as_array().unwrap();
+            assert_eq!(!rows.is_empty(), expected);
+            if expected {
+                assert_eq!(rows[0]["id"], "ordinary");
+                assert_eq!(rows[0]["recallable"], true);
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 4);
     }
     #[test]
     fn structured_answers_and_prompt_escaping() {
@@ -1623,7 +1963,8 @@ mod tests {
         source["metadata"]["memoryIndex"]["sourceUpdatedAt"] = json!("2026-10-01T00:00:00Z");
         let mut checkpoint = row("checkpoint", "UNLHA32 実装");
         checkpoint["metadata"]["sm_consolidation"] = json!(true);
-        checkpoint["metadata"]["sourceMemoryIds"] = json!(["new"]);
+        checkpoint["metadata"]["sourceMemoryIds"] =
+            json!([" new ", "new", "", " ", null, 7, "new"]);
         let (config, handle, requests) = fixture(vec![
             json!({"searchScope":"all-containers","searchedContainers":["memories"],"spaceDiscoveryComplete":true,"results":[old,source,checkpoint]}),
         ]);
@@ -1660,6 +2001,90 @@ mod tests {
         assert!(!text(&read["document"]["content"]).contains("Session:"));
         assert!(!text(&read["document"]["content"]).contains("Part:"));
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+    #[test]
+    fn authenticated_organization_source_pages_and_legacy_server() {
+        let page = json!({"protocol":1,"documentId":"summary","revision":"r1","sources":[
+            {"id":"original","containerTag":"legacy/記憶","createdAt":"2026-11-01","updatedAt":"2026-11-02","sourceKind":"capturePart","groupId":"capture-group","part":21,"filepath":"D:/記憶/😀.md","content":"must not project"},
+            {"id":"long-path","containerTag":"legacy/記憶","createdAt":"2026-11-01","updatedAt":"2026-11-02","sourceKind":"checkpoint","filepathTruncated":true}
+        ],"hasMore":true,"nextCursor":"cursor&😀%"});
+        let doc = json!({"id":"summary","content":"Summary conclusion","organizationSources":page});
+        let mut empty_page = page.clone();
+        empty_page["sources"] = json!([]);
+        let (config, handle, requests) = fixture(vec![
+            doc.clone(),
+            json!({"organizationSources":page.clone()}),
+            json!({"organizationSources":empty_page}),
+            doc,
+            json!({"id":"old","content":"Old server document"}),
+        ]);
+        let preview = read_document(&config, "summary").unwrap();
+        assert_eq!(
+            preview["document"]["organizationSources"]["sources"][0]["containerTag"],
+            "legacy/記憶"
+        );
+        assert!(
+            preview["document"]["organizationSources"]["sources"][0]
+                .get("content")
+                .is_none()
+        );
+        assert!(text(&preview["text"]).contains("original"));
+        assert!(text(&preview["text"]).contains("nextCursor"));
+        assert_eq!(
+            preview["document"]["organizationSources"]["sources"][0]["filepath"],
+            "D:/記憶/😀.md"
+        );
+        assert_eq!(
+            preview["document"]["organizationSources"]["sources"][1]["filepathTruncated"],
+            true
+        );
+        assert!(text(&preview["text"]).contains("D:/記憶/😀.md"));
+        assert!(text(&preview["text"]).contains("filepathTruncated"));
+        assert_eq!(
+            preview["document"]["organizationSources"]["sources"][0]["sourceKind"],
+            "capturePart"
+        );
+        assert_eq!(
+            preview["document"]["organizationSources"]["sources"][0]["groupId"],
+            "capture-group"
+        );
+        assert_eq!(
+            preview["document"]["organizationSources"]["sources"][0]["part"],
+            21
+        );
+        assert_eq!(
+            preview["document"]["organizationSources"]["sources"][1]["sourceKind"],
+            "checkpoint"
+        );
+        let next = read_document_page(&config, "summary", Some("cursor&😀%")).unwrap();
+        assert!(next["document"].get("content").is_none());
+        let empty = read_document_page(&config, "summary", Some("cursor")).unwrap();
+        assert_eq!(empty["document"]["organizationSources"]["hasMore"], true);
+        assert_eq!(
+            empty["document"]["organizationSources"]["sources"],
+            json!([])
+        );
+        assert!(
+            read_document_page(&config, "summary", Some("cursor"))
+                .unwrap_err()
+                .to_string()
+                .contains("Organization source paging is unavailable")
+        );
+        let error = read_document_page(&config, "old", Some("cursor")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Organization source paging is unavailable; retrieve the summary again with a supported server."
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            requests.lock().unwrap()[1]["path"],
+            "/v3/documents/summary?sourceCursor=cursor%26%F0%9F%98%80%25"
+        );
+        let mut oversized = page;
+        oversized["sources"] = json!(vec![oversized["sources"][0].clone(); 51]);
+        assert!(organization_source_page(&oversized, "summary").is_err());
+        oversized["sources"] = json!([]);
+        assert!(organization_source_page(&oversized, "summary").is_ok());
     }
     #[test]
     fn mixed_index_and_legacy_hydration_keeps_results_and_failures_aligned() {

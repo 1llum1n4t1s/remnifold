@@ -9,6 +9,7 @@ type DocumentMetadata = {
   memoryIndex?: SavedMemoryIndex; title?: unknown; sourceTimestamp?: unknown; sourceUpdatedAt?: unknown;
   completedAt?: unknown; type?: unknown; containerTag?: unknown; topics?: unknown; project?: unknown;
   sm_project_id?: unknown; filepath?: unknown; sm_consolidation?: unknown; sourceMemoryIds?: unknown;
+  sm_organization_manual_only?: unknown;
   sessionId?: unknown; turn?: unknown; part?: unknown; parts?: unknown; consolidationCreatedAt?: unknown;
 };
 type Provenance = { projectId?: unknown; containerTag?: unknown; filepath?: unknown; project?: unknown };

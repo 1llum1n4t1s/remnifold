@@ -14,8 +14,6 @@ import { migrations, applyMigrations } from "./support/migrations.mjs";
 
 const timestamp = "2026-10-21T01:00:00.000Z";
 const embedding = JSON.stringify(Array.from({ length: 1024 }, (_, index) => Math.sin(index + 1)));
-const checks = [];
-const metrics = [];
 const privateFilters = { AND: [{ key: "sm_scope", filterType: "metadata", value: "private" }] };
 
 async function bounded(promise, description) {

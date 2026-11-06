@@ -440,6 +440,28 @@ pub fn api_with_source(
     timeout_ms: u64,
     source: &str,
 ) -> Result<Value> {
+    api_with_limit(config, path, method, body, timeout_ms, source, None)
+}
+pub fn api_bounded(config: &Config, path: &str, body: &Value, maximum_bytes: u64) -> Result<Value> {
+    api_with_limit(
+        config,
+        path,
+        "POST",
+        Some(body),
+        30_000,
+        "codex-kagayoi-memory",
+        Some(maximum_bytes),
+    )
+}
+fn api_with_limit(
+    config: &Config,
+    path: &str,
+    method: &str,
+    body: Option<&Value>,
+    timeout_ms: u64,
+    source: &str,
+    maximum_bytes: Option<u64>,
+) -> Result<Value> {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     let client = CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
@@ -467,6 +489,26 @@ pub fn api_with_source(
         unsupported_global_search: false,
     })?;
     let status = response.status();
+    if let Some(maximum) = maximum_bytes {
+        use std::io::Read;
+        if !status.is_success() {
+            return Err(ApiError {
+                status: Some(status.as_u16()),
+                unsupported_global_search: false,
+            }
+            .into());
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(maximum + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("Memory API response could not be read."))?;
+        if bytes.len() as u64 > maximum {
+            bail!("Memory API response exceeds the size limit.");
+        }
+        return serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("Memory API returned invalid JSON."));
+    }
     if !status.is_success() {
         let detail = response.json::<Value>().unwrap_or(Value::Null);
         let detail = detail
