@@ -38,7 +38,6 @@ The command verifies the R2 publication and exact Windows executable, rejects co
 - Update Rust manifests and the root `Cargo.lock` together and run locked checks. Keep the native crate's declared minimum Rust version distinct from the current development/CI toolchain.
 - Native tool versions, download URLs, and SRI values are pinned in `dev/`; update their manifest and integrity expectations together. Keep archive traversal, linked-path, cached-tool tampering, and digest checks effective. Do not weaken integrity checks or invoke a JavaScript package manager as a fallback.
 - Keep `.github/dependabot.yml` covering Cargo workspace dependencies weekly, with minor/patch updates separate from majors. The workflow uses no executable Actions, so it has no GitHub Actions dependency entries. Metadata-only JavaScript manifests do not need npm dependency maintenance.
-- Preserve the trust boundary in `.github/workflows/dependabot-auto-merge.yml`: execute only trusted default-branch workflow code, never PR code. Automatic merges require a same-repository Dependabot PR, allowed dependency-only changes, verified commits, successful latest CI for the exact head, passing remaining checks/statuses, and unchanged head/base with a mergeable PR immediately before merging. When required CI workflows change, keep `REQUIRED_WORKFLOWS` and the `workflow_run` trigger aligned; inspect the workflow summary for held PRs rather than bypassing its checks.
 
 ## Validation
 

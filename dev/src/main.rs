@@ -52,9 +52,6 @@ fn run() -> Result<()> {
     if command == "r2-smoke" {
         return r2::smoke(&args.collect::<Vec<_>>());
     }
-    if command == "dependabot" {
-        return ci::dependabot(&args.collect::<Vec<_>>());
-    }
     if command == "ci-release-branch" {
         if args.next().is_some() {
             bail!("ci-release-branch does not accept arguments");
