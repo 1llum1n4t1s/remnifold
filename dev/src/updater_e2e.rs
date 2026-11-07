@@ -201,7 +201,7 @@ struct Fixture {
     expected: BTreeMap<String, String>,
 }
 // umask が 0002 の環境でも、更新領域の祖先を共有書込み可能にしない。
-fn create_private_fixture_dir(path: &Path, recursive: bool) -> Result<()> {
+pub(crate) fn create_private_fixture_dir(path: &Path, recursive: bool) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(recursive);
     #[cfg(unix)]

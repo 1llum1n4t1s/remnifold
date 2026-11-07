@@ -146,8 +146,10 @@ fn run() -> Result<()> {
         "check" | "updater-test" | "bootstrap-test"
     ) {
         updater_e2e::validate_work_root(&repo, &work)?;
+        updater_e2e::create_private_fixture_dir(&work, true)?;
+    } else {
+        fs::create_dir_all(&work)?;
     }
-    fs::create_dir_all(&work)?;
     let binary = options
         .get("--binary")
         .map(PathBuf::from)
