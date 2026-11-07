@@ -1094,6 +1094,7 @@ fn r2_cases(
                 "latest-failed" => "RELEASE_CI_NOT_SUCCESSFUL",
                 "missing-target" | "duplicate-target" | "unsafe-key" => "INVALID_R2_MANIFEST",
                 "index-commit" | "index-attempt" => "INVALID_R2_INDEX",
+                "schema-cross" => "R2_RELEASE_IDENTITY_MISMATCH",
                 "redirect" | "index-missing" | "archive-missing" => "R2_DOWNLOAD_FAILED",
                 "same-version" => "LOCAL_SOURCE_MODIFIED",
                 "witness-log-gone" | "witness-log-oversized" => "R2_WITNESS_LOG_UNAVAILABLE",
