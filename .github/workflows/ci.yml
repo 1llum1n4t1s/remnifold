@@ -190,12 +190,13 @@ jobs:
     name: publish-r2
     needs: native-package
     if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       needs.native-package.result == 'success' &&
       github.event_name == 'push' &&
       github.repository == '1llum1n4t1s/remnifold' &&
       github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) &&
       startsWith(github.ref, 'refs/heads/release/')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, m3mb14]
     environment: r2-release
     timeout-minutes: 30
     permissions:
