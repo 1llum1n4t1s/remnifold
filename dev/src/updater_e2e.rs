@@ -200,6 +200,18 @@ struct Fixture {
     sha: String,
     expected: BTreeMap<String, String>,
 }
+// umask が 0002 の環境でも、更新領域の祖先を共有書込み可能にしない。
+fn create_private_fixture_dir(path: &Path, recursive: bool) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    Ok(())
+}
 impl Fixture {
     fn calls(&self) -> Result<Vec<Value>> {
         Ok(fs::read_to_string(self.root.join("calls.jsonl"))?
@@ -1477,9 +1489,9 @@ fn run_suite(
     validate_work_root(repo, work)?;
     safe_path(binary)?;
     ensure!(!work.starts_with(repo), "updater fixtures must be external");
-    fs::create_dir_all(work)?;
+    create_private_fixture_dir(work, true)?;
     let root = work.join(format!("updater-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&root)?;
+    create_private_fixture_dir(&root, false)?;
     println!("Updater validation directory: {}", root.display());
     let package = unpack(archive, &root.join("published"))?;
     let input_archive = archive.to_path_buf();
@@ -1606,7 +1618,7 @@ fn run_suite(
                    fault: &str|
      -> Result<Fixture> {
         let directory = root.join(name);
-        fs::create_dir(&directory)?;
+        create_private_fixture_dir(&directory, false)?;
         fs::create_dir(directory.join("temp"))?;
         let source = directory.join(source_name);
         copy_tree(initial, &source)?;
