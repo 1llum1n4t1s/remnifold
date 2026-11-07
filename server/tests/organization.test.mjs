@@ -147,7 +147,17 @@ scenario('vector bookkeeping does not invalidate coverage, direct SQL content ch
 scenario('summary replacement preserves prior exact coverage and rejects stale writers', async f => {
   const firstId = await f.save('First evidence');
   const first = await f.api('/v4/organize/commit', f.payload(await f.prepare())); assert.equal(first.status, 200);
-  await f.save('Second evidence'); const next = await f.prepare(); const update = f.payload(next);
+  const secondId = await f.save('Second evidence'); let next;
+  // 生成summaryだけのID windowでは、対象sourceがあっても空の結果を返せる。
+  // この3レコードでは空windowの次にcursorが折り返すため、prepareは最大2回で足りる。
+  for (let attempt = 0; attempt < 2; attempt++) {
+    next = await f.prepare();
+    if (next.sources.some(source => source.id === secondId)) break;
+    assert.equal(next.sources.length, 0, 'Unexpected sources before the replacement evidence');
+    assert.equal(next.group, undefined, 'Unexpected capture progress in the replacement fixture');
+  }
+  assert.deepEqual(next.sources.map(source => source.id), [secondId], 'Replacement evidence must be prepared within two bounded windows');
+  const update = f.payload(next);
   Object.assign(update.summaries[0], { id: first.body.summaries[0].id, revision: first.body.summaries[0].revision,
     content: 'Final conclusion retaining both first and second evidence and all reasons.' });
   const replaced = await f.api('/v4/organize/commit', update); assert.equal(replaced.status, 200, JSON.stringify(replaced.body));
