@@ -11,16 +11,10 @@ use std::{
 #[path = "../../native/src/hook_command.rs"]
 pub(crate) mod hook_command;
 
-pub const TARGETS: [&str; 5] = [
-    "x86_64-pc-windows-msvc",
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-];
+pub const TARGETS: [&str; 4] = crate::release_manifest::TARGETS;
 pub fn executable(target: &str) -> Result<&'static str> {
     ensure!(
-        TARGETS.contains(&target),
+        crate::release_manifest::LEGACY_TARGETS.contains(&target),
         "unsupported native target: {target}"
     );
     Ok(if target.contains("windows") {
@@ -363,6 +357,10 @@ pub fn build(
     output: &Path,
     commit: &str,
 ) -> Result<PathBuf> {
+    ensure!(
+        TARGETS.contains(&target),
+        "Unsupported current package target"
+    );
     safe_path(output)?;
     ensure!(
         !output.starts_with(repo) || output.starts_with(repo.join("dist")),
@@ -526,24 +524,25 @@ mod tests {
     }
     #[test]
     fn targets_require_matching_binary_headers() {
+        let targets = crate::release_manifest::LEGACY_TARGETS;
         let mut pe = vec![0u8; 128];
         pe[..2].copy_from_slice(b"MZ");
         pe[60] = 64;
         pe[64..70].copy_from_slice(b"PE\0\0\x64\x86");
         assert!(identity(&pe, TARGETS[0]).is_ok());
-        assert!(identity(&pe, TARGETS[3]).is_err());
-        for (target, arm) in [(TARGETS[3], false), (TARGETS[4], true)] {
+        assert!(identity(&pe, targets[3]).is_err());
+        for (target, arm) in [(targets[3], false), (targets[4], true)] {
             let mut elf = vec![0u8; 64];
             elf[..6].copy_from_slice(&[127, b'E', b'L', b'F', 2, 1]);
             elf[18] = if arm { 183 } else { 62 };
             assert!(identity(&elf, target).is_ok());
-            assert!(identity(&elf, if arm { TARGETS[3] } else { TARGETS[4] }).is_err());
+            assert!(identity(&elf, if arm { targets[3] } else { targets[4] }).is_err());
         }
-        for (target, arm) in [(TARGETS[1], true), (TARGETS[2], false)] {
+        for (target, arm) in [(targets[1], true), (targets[2], false)] {
             let mut mach = vec![0xcf, 0xfa, 0xed, 0xfe];
             mach.extend_from_slice(if arm { &[12, 0, 0, 1] } else { &[7, 0, 0, 1] });
             assert!(identity(&mach, target).is_ok());
-            assert!(identity(&mach, if arm { TARGETS[2] } else { TARGETS[1] }).is_err());
+            assert!(identity(&mach, if arm { targets[2] } else { targets[1] }).is_err());
         }
         assert!(executable("unsupported").is_err());
     }

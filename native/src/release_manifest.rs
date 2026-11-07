@@ -60,13 +60,27 @@ pub fn parse_updater_config(bytes: &[u8]) -> Result<DistributionConfig> {
 pub const MAX_JSON: usize = 32 * 1024;
 pub const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 pub const MAX_EXPANDED: u64 = 128 * 1024 * 1024;
-pub const TARGETS: [&str; 5] = [
+pub const CURRENT_RELEASE_SCHEMA: u32 = 2;
+pub const TARGETS: [&str; 4] = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+];
+pub const LEGACY_TARGETS: [&str; 5] = [
     "x86_64-pc-windows-msvc",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
 ];
+pub fn targets_for_schema(schema: u32) -> Result<&'static [&'static str]> {
+    match schema {
+        1 => Ok(&LEGACY_TARGETS),
+        CURRENT_RELEASE_SCHEMA => Ok(&TARGETS),
+        _ => anyhow::bail!("Invalid release schema"),
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -142,7 +156,7 @@ fn identity(
     attempt: u64,
 ) -> Result<()> {
     ensure!(
-        schema == 1
+        targets_for_schema(schema).is_ok()
             && repository == REPOSITORY
             && version(ver)
             && hex(commit, 40)
@@ -178,11 +192,12 @@ impl ReleaseManifest {
             self.run_id,
             self.run_attempt,
         )?;
+        let targets = targets_for_schema(self.schema)?;
         ensure!(
-            self.targets.len() == TARGETS.len(),
+            self.targets.len() == targets.len(),
             "Incomplete release targets"
         );
-        for target in TARGETS {
+        for &target in targets {
             let a = self
                 .targets
                 .get(target)
@@ -308,21 +323,34 @@ pub fn parse_index(bytes: &[u8]) -> Result<VersionIndex> {
     v.validate()?;
     Ok(v)
 }
-pub const MANIFEST_MARKER: &str = "REMNIFOLD_R2_MANIFEST_V1";
-pub const ASSET_MARKER: &str = "REMNIFOLD_R2_ASSET_V1";
-pub const CANDIDATE_MARKER: &str = "REMNIFOLD_R2_CANDIDATE_V1";
+pub const MANIFEST_MARKER: &str = "REMNIFOLD_R2_MANIFEST_V2";
+pub const ASSET_MARKER: &str = "REMNIFOLD_R2_ASSET_V2";
+pub const CANDIDATE_MARKER: &str = "REMNIFOLD_R2_CANDIDATE_V2";
+fn markers(schema: u32) -> Result<(&'static str, &'static str, &'static str)> {
+    targets_for_schema(schema)?;
+    Ok(if schema == 1 {
+        (
+            "REMNIFOLD_R2_MANIFEST_V1",
+            "REMNIFOLD_R2_ASSET_V1",
+            "REMNIFOLD_R2_CANDIDATE_V1",
+        )
+    } else {
+        (MANIFEST_MARKER, ASSET_MARKER, CANDIDATE_MARKER)
+    })
+}
 pub const MAX_WITNESS_LOG: usize = 4 * 1024 * 1024;
 pub fn witness_lines(manifest: &ReleaseManifest, digest: &str) -> Result<Vec<String>> {
     manifest.validate()?;
     ensure!(hex(digest, 64), "Invalid witness digest");
+    let (manifest_marker, asset_marker, _) = markers(manifest.schema)?;
     let mut lines = vec![format!(
-        "{MANIFEST_MARKER} {} {} {} {} {digest}",
+        "{manifest_marker} {} {} {} {} {digest}",
         manifest.version, manifest.source_commit, manifest.run_id, manifest.run_attempt
     )];
-    for target in TARGETS {
+    for &target in targets_for_schema(manifest.schema)? {
         let asset = &manifest.targets[target];
         lines.push(format!(
-            "{ASSET_MARKER} {target} {} {} {}",
+            "{asset_marker} {target} {} {} {}",
             asset.sha256, asset.size, asset.key
         ));
     }
@@ -335,8 +363,9 @@ pub fn witness_lines(manifest: &ReleaseManifest, digest: &str) -> Result<Vec<Str
 pub fn candidate_line(manifest: &ReleaseManifest, digest: &str) -> Result<String> {
     manifest.validate()?;
     ensure!(hex(digest, 64), "Invalid candidate digest");
+    let (_, _, candidate_marker) = markers(manifest.schema)?;
     Ok(format!(
-        "{CANDIDATE_MARKER} {} {} {} {} {digest}",
+        "{candidate_marker} {} {} {} {} {digest}",
         manifest.version, manifest.source_commit, manifest.run_id, manifest.run_attempt
     ))
 }
@@ -427,7 +456,7 @@ mod tests {
     }
     fn complete() -> ReleaseManifest {
         let mut m = ReleaseManifest {
-            schema: 1,
+            schema: CURRENT_RELEASE_SCHEMA,
             repository: REPOSITORY.into(),
             version: "1.0.15".into(),
             source_commit: "a".repeat(40),
@@ -455,6 +484,61 @@ mod tests {
             );
         }
         m
+    }
+    #[test]
+    fn legacy_and_current_schemas_require_their_own_targets_and_markers() {
+        let current = complete();
+        let mut legacy = current.clone();
+        legacy.schema = 1;
+        assert!(legacy.validate().is_err());
+        let target = "x86_64-apple-darwin";
+        let mut asset = legacy.targets[TARGETS[0]].clone();
+        asset.key = asset_key(
+            &legacy.version,
+            &legacy.source_commit,
+            legacy.run_id,
+            legacy.run_attempt,
+            target,
+            &asset.sha256,
+        );
+        legacy.targets.insert(target.into(), asset);
+        let digest = "d".repeat(64);
+        for manifest in [&legacy, &current] {
+            let bytes = serde_json::to_vec(manifest).unwrap();
+            assert_eq!(&parse_manifest(&bytes).unwrap(), manifest);
+            let lines = witness_lines(manifest, &digest).unwrap();
+            assert_eq!(
+                lines.len(),
+                targets_for_schema(manifest.schema).unwrap().len() + 1
+            );
+            let log = lines.join("\n");
+            verify_witness(log.as_bytes(), manifest, &digest).unwrap();
+            let other = if manifest.schema == 1 { 2 } else { 1 };
+            assert!(
+                verify_witness(
+                    log.replace(&format!("_V{}", manifest.schema), &format!("_V{other}"))
+                        .as_bytes(),
+                    manifest,
+                    &digest
+                )
+                .is_err()
+            );
+            let line = candidate_line(manifest, &digest).unwrap();
+            verify_candidate(line.as_bytes(), manifest, &digest).unwrap();
+            assert!(
+                verify_candidate(
+                    line.replace(&format!("_V{}", manifest.schema), &format!("_V{other}"))
+                        .as_bytes(),
+                    manifest,
+                    &digest
+                )
+                .is_err()
+            );
+        }
+        legacy.schema = CURRENT_RELEASE_SCHEMA;
+        assert!(legacy.validate().is_err());
+        assert!(targets_for_schema(0).is_err());
+        assert!(targets_for_schema(3).is_err());
     }
     #[test]
     fn exact_targets_and_bound_keys_are_required() {
@@ -505,6 +589,11 @@ mod tests {
             manifest_sha256: "d".repeat(64),
         };
         assert!(parse_index(&serde_json::to_vec(&index).unwrap()).is_ok());
+        index.schema = CURRENT_RELEASE_SCHEMA;
+        assert!(parse_index(&serde_json::to_vec(&index).unwrap()).is_ok());
+        index.schema = 3;
+        assert!(index.validate().is_err());
+        index.schema = CURRENT_RELEASE_SCHEMA;
         index.manifest_key.push_str("?token=secret");
         assert!(index.validate().is_err());
     }
@@ -513,14 +602,14 @@ mod tests {
         let m = complete();
         let digest = "d".repeat(64);
         let lines = witness_lines(&m, &digest).unwrap();
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 5);
         let log = lines
             .iter()
             .map(|line| format!("2026-11-03T12:34:56.1234567Z {line}\r\n"))
             .collect::<String>();
         verify_witness(log.as_bytes(), &m, &digest).unwrap();
         assert!(verify_witness(format!("{log}{}\n", lines[0]).as_bytes(), &m, &digest).is_err());
-        assert!(verify_witness(lines[..5].join("\n").as_bytes(), &m, &digest).is_err());
+        assert!(verify_witness(lines[..4].join("\n").as_bytes(), &m, &digest).is_err());
         assert!(verify_witness(log.replace(" 7 2 ", " 7 3 ").as_bytes(), &m, &digest).is_err());
         assert!(
             verify_witness(

@@ -363,7 +363,8 @@ pub(super) fn published(
     let manifest =
         protocol::parse_manifest(&bytes).map_err(|_| anyhow::anyhow!("INVALID_R2_MANIFEST"))?;
     ensure!(
-        manifest.source_commit == commit
+        manifest.schema == index.schema
+            && manifest.source_commit == commit
             && manifest.version == version
             && manifest.repository == context.repository
             && manifest.run_id == index.run_id

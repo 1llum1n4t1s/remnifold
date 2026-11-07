@@ -395,11 +395,227 @@ struct StageRecord {
     sha256: String,
     native_manifest_sha256: String,
 }
+/// Owner-trusted build input; CI binds it to its own run only after verification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalInputRecord {
+    schema: u32,
+    repository: String,
+    version: String,
+    source_commit: String,
+    target: String,
+    key: String,
+    size: u64,
+    sha256: String,
+    native_manifest_sha256: String,
+}
+impl LocalInputRecord {
+    fn validate(&self, version: &str, commit: &str, target: &str) -> Result<()> {
+        ensure!(
+            self.schema == 1
+                && self.repository == manifest::REPOSITORY
+                && self.version == version
+                && manifest::version(version)
+                && self.source_commit == commit
+                && manifest::hex(commit, 40)
+                && self.target == target
+                && manifest::TARGETS.contains(&target)
+                && !target.contains("windows")
+                && self.size > 0
+                && self.size <= manifest::MAX_ARCHIVE
+                && manifest::hex(&self.sha256, 64)
+                && manifest::hex(&self.native_manifest_sha256, 64)
+                && self.key == format!("local-inputs/{commit}/{target}/{}.tar.gz", self.sha256),
+            "Local input identity mismatch"
+        );
+        Ok(())
+    }
+    fn verify_bytes(&self, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            bytes.len() as u64 == self.size && hash(bytes) == self.sha256,
+            "Local input archive size or digest mismatch"
+        );
+        let (_, native) = native_parts(bytes, &self.target)?;
+        ensure!(
+            hash(&native) == self.native_manifest_sha256,
+            "Local input native manifest mismatch"
+        );
+        Ok(())
+    }
+}
+fn local_record_key(commit: &str, target: &str) -> String {
+    format!("local-inputs/{commit}/{target}/record.json")
+}
+fn require_local_import_origin(
+    event: &str,
+    repository: &str,
+    workflow: &str,
+    reference: &str,
+    version: &str,
+) -> Result<()> {
+    ensure!(
+        event == "push"
+            && repository == manifest::REPOSITORY
+            && reference == format!("refs/heads/release/{version}")
+            && workflow
+                == format!(
+                    "{}/.github/workflows/ci.yml@{reference}",
+                    manifest::REPOSITORY
+                ),
+        "Local input import requires a trusted release push"
+    );
+    Ok(())
+}
+fn download_local_input(
+    store: &Store,
+    id: &Identity,
+    target: &str,
+) -> Result<(LocalInputRecord, Vec<u8>)> {
+    let input = store.get(STAGING, &local_record_key(&id.commit, target), manifest::MAX_JSON as u64)?
+        .context("Local input missing for GITHUB_SHA and target; stage the verified local build before pushing")?;
+    let record: LocalInputRecord = manifest::parse_strict(&input)?;
+    record.validate(&id.version, &id.commit, target)?;
+    let bytes = store
+        .get(STAGING, &record.key, record.size)?
+        .context("Local input archive missing")?;
+    record.verify_bytes(&bytes)?;
+    Ok((record, bytes))
+}
+fn upload_local_input(store: &Store, record: &LocalInputRecord, bytes: &[u8]) -> Result<()> {
+    record.verify_bytes(bytes)?;
+    let key = local_record_key(&record.source_commit, &record.target);
+    if let Some(existing) = store.get(STAGING, &key, manifest::MAX_JSON as u64)? {
+        let previous: LocalInputRecord = manifest::parse_strict(&existing)?;
+        ensure!(previous == *record, "Conflicting local input record");
+        let archive = store
+            .get(STAGING, &record.key, record.size)?
+            .context("Existing local input archive missing")?;
+        ensure!(archive == bytes, "Existing local input archive changed");
+        return Ok(());
+    }
+    store.put(STAGING, &record.key, bytes, true)?;
+    store.put(STAGING, &key, &serde_json::to_vec(record)?, true)
+}
+pub fn local_input(args: &[String]) -> Result<()> {
+    let action = args
+        .first()
+        .context("local-input requires stage or import")?;
+    ensure!(
+        matches!(action.as_str(), "stage" | "import"),
+        "Unknown local-input action"
+    );
+    let allowed: &[&str] = if action == "stage" {
+        &["--target", "--archive", "--binary", "--source-commit"]
+    } else {
+        &["--target", "--work-root"]
+    };
+    let (apply, o) = options(&args[1..], allowed)?;
+    let get = |key: &str| o.get(key).context("Missing local-input option");
+    let target = get("--target")?;
+    ensure!(
+        manifest::TARGETS.contains(&target.as_str()) && !target.contains("windows"),
+        "Local input requires a supported Unix target"
+    );
+    if action == "stage" {
+        let commit = get("--source-commit")?;
+        crate::source::verify_checkout(&repo(), commit)?;
+        let archive = Path::new(get("--archive")?);
+        let binary = Path::new(get("--binary")?);
+        crate::package::verify(&repo(), target, binary, archive, commit)?;
+        crate::source::verify(&repo(), archive, commit)?;
+        ensure!(
+            fs::metadata(archive)?.len() <= manifest::MAX_ARCHIVE,
+            "Oversized local input archive"
+        );
+        let bytes = fs::read(archive)?;
+        let (_, native) = native_parts(&bytes, target)?;
+        let version = serde_json::from_slice::<serde_json::Value>(&fs::read(
+            repo().join("package.json"),
+        )?)?["version"]
+            .as_str()
+            .context("Missing version")?
+            .to_owned();
+        let digest = hash(&bytes);
+        let record = LocalInputRecord {
+            schema: 1,
+            repository: manifest::REPOSITORY.into(),
+            version,
+            source_commit: commit.clone(),
+            target: target.clone(),
+            key: format!("local-inputs/{commit}/{target}/{digest}.tar.gz"),
+            size: bytes.len() as u64,
+            sha256: digest,
+            native_manifest_sha256: hash(&native),
+        };
+        record.validate(&record.version, commit, target)?;
+        if apply {
+            upload_local_input(&Store::new("R2_CI")?, &record, &bytes)?;
+        }
+        println!(
+            "Local input verified{}",
+            if apply {
+                " and staged"
+            } else {
+                "; --apply required to upload"
+            }
+        );
+        return Ok(());
+    }
+    let id = identity(false)?;
+    require_local_import_origin(
+        &env("GITHUB_EVENT_NAME")?,
+        &env("GITHUB_REPOSITORY")?,
+        &env("GITHUB_WORKFLOW_REF")?,
+        &env("GITHUB_REF")?,
+        &id.version,
+    )?;
+    let root = PathBuf::from(get("--work-root")?);
+    crate::updater_e2e::validate_work_root(&repo(), &root)?;
+    fs::create_dir_all(&root)?;
+    let store = Store::new("R2_CI")?;
+    let (record, bytes) = download_local_input(&store, &id, target)?;
+    LocalVerifier { repo: repo(), root }.verify(
+        target,
+        &bytes,
+        &record.native_manifest_sha256,
+        &id.commit,
+    )?;
+    if !apply {
+        println!("Local input verified; --apply required to bind and stage for CI");
+        return Ok(());
+    }
+    let staged = StageRecord {
+        target: target.clone(),
+        version: id.version,
+        source_commit: id.commit,
+        run_id: id.run,
+        run_attempt: id.attempt,
+        key: format!(
+            "ci/{}/{}/{target}/{}.tar.gz",
+            id.run, id.attempt, record.sha256
+        ),
+        size: record.size,
+        sha256: record.sha256,
+        native_manifest_sha256: record.native_manifest_sha256,
+    };
+    store.put(STAGING, &staged.key, &bytes, true)?;
+    stage_output(&staged)
+}
+fn stage_output(record: &StageRecord) -> Result<()> {
+    let output = PathBuf::from(env("GITHUB_OUTPUT")?);
+    crate::package::safe_path(&output)?;
+    writeln!(
+        fs::OpenOptions::new().append(true).open(output)?,
+        "{}={}",
+        output_key(&record.target)?,
+        serde_json::to_string(record)?
+    )?;
+    Ok(())
+}
 fn output_key(target: &str) -> Result<&'static str> {
     Ok(match target {
         "x86_64-pc-windows-msvc" => "windows_x64",
         "aarch64-apple-darwin" => "macos_arm64",
-        "x86_64-apple-darwin" => "macos_x64",
         "x86_64-unknown-linux-gnu" => "linux_x64",
         "aarch64-unknown-linux-gnu" => "linux_arm64",
         _ => bail!("Invalid target"),
@@ -530,6 +746,10 @@ pub fn stage(args: &[String]) -> Result<()> {
     let id = identity(false)?;
     let get = |key: &str| o.get(key).context("Missing R2 stage option");
     let target = get("--target")?;
+    ensure!(
+        manifest::TARGETS.contains(&target.as_str()),
+        "Unsupported current stage target"
+    );
     ensure!(
         get("--source-commit")? == &id.commit,
         "Stage source mismatch"
@@ -755,7 +975,10 @@ fn checked_job<'a>(
     Ok(job)
 }
 fn validate_stage_origins(http: &GitHub, id: &Identity, records: &[StageRecord]) -> Result<()> {
-    ensure!(records.len() == 5, "Incomplete stage origins");
+    ensure!(
+        records.len() == manifest::TARGETS.len(),
+        "Incomplete stage origins"
+    );
     let mut origins = BTreeMap::new();
     for (position, r) in records.iter().enumerate() {
         ensure!(
@@ -888,7 +1111,8 @@ fn bootstrap_binary_verified(
     );
     let release = manifest::parse_manifest(&bytes)?;
     ensure!(
-        release.source_commit == commit
+        release.schema == index.schema
+            && release.source_commit == commit
             && release.version == version
             && release.run_id == index.run_id
             && release.run_attempt == index.run_attempt,
@@ -1015,14 +1239,18 @@ pub fn publish(args: &[String]) -> Result<()> {
     let input = env("REMNIFOLD_R2_STAGE_RECORDS")?;
     ensure!(input.len() <= manifest::MAX_JSON, "Oversized stage records");
     let records: BTreeMap<String, String> = manifest::parse_strict(input.as_bytes())?;
-    ensure!(records.len() == 5, "Incomplete matrix records");
+    ensure!(
+        records.len() == manifest::TARGETS.len(),
+        "Incomplete matrix records"
+    );
     let mut targets = BTreeMap::new();
     let mut staged = Vec::new();
     for target in manifest::TARGETS {
-        let r: StageRecord = serde_json::from_str(
+        let r: StageRecord = manifest::parse_strict(
             records
                 .get(output_key(target)?)
-                .context("Missing matrix target")?,
+                .context("Missing matrix target")?
+                .as_bytes(),
         )?;
         ensure!(
             r.target == target
@@ -1061,7 +1289,7 @@ pub fn publish(args: &[String]) -> Result<()> {
         staged.push(r);
     }
     let release = ReleaseManifest {
-        schema: 1,
+        schema: manifest::CURRENT_RELEASE_SCHEMA,
         repository: manifest::REPOSITORY.into(),
         version: id.version.clone(),
         source_commit: id.commit.clone(),
@@ -1164,7 +1392,14 @@ fn publish_verified(
     verifier: &dyn ArchiveVerifier,
 ) -> Result<PublicationProof> {
     release.validate()?;
-    ensure!(staged.len() == 5, "Incomplete verified publication");
+    ensure!(
+        release.schema == manifest::CURRENT_RELEASE_SCHEMA,
+        "New publication requires current release schema"
+    );
+    ensure!(
+        staged.len() == manifest::TARGETS.len(),
+        "Incomplete verified publication"
+    );
     for (position, r) in staged.iter().enumerate() {
         ensure!(
             r.target == manifest::TARGETS[position],
@@ -1200,7 +1435,8 @@ fn publish_verified(
         );
         let old = manifest::parse_manifest(&old_bytes)?;
         ensure!(
-            old.source_commit == id.commit
+            old.schema == index.schema
+                && old.source_commit == id.commit
                 && old.version == id.version
                 && old.run_id == index.run_id
                 && old.run_attempt == index.run_attempt,
@@ -1213,8 +1449,8 @@ fn publish_verified(
             manifest::verify_candidate(&log, &old, &index.manifest_sha256)?;
         }
         let mut original_archives = Vec::new();
-        for target in manifest::TARGETS {
-            let a = &old.targets[target];
+        for target in manifest::targets_for_schema(old.schema)? {
+            let a = &old.targets[*target];
             let actual = store
                 .get(PUBLIC, &a.key, a.size)?
                 .context("Missing published archive")?;
@@ -1242,8 +1478,8 @@ fn publish_verified(
         selected = old;
         selected.run_id = id.run;
         selected.run_attempt = id.attempt;
-        for target in manifest::TARGETS {
-            let asset = selected.targets.get_mut(target).unwrap();
+        for target in manifest::targets_for_schema(selected.schema)? {
+            let asset = selected.targets.get_mut(*target).unwrap();
             asset.key = manifest::asset_key(
                 &id.version,
                 &id.commit,
@@ -1258,10 +1494,13 @@ fn publish_verified(
         selected_verified = true;
     }
     ensure!(
-        selected_archives.len() == 5,
+        selected_archives.len() == manifest::targets_for_schema(selected.schema)?.len(),
         "Incomplete verified publication archives"
     );
-    for (target, bytes) in manifest::TARGETS.iter().zip(selected_archives.iter()) {
+    for (target, bytes) in manifest::targets_for_schema(selected.schema)?
+        .iter()
+        .zip(selected_archives.iter())
+    {
         let asset = &selected.targets[*target];
         ensure!(
             asset.size == bytes.len() as u64 && asset.sha256 == hash(bytes),
@@ -1271,7 +1510,10 @@ fn publish_verified(
             verifier.verify(target, bytes, &asset.native_manifest_sha256, &id.commit)?;
         }
     }
-    for (target, bytes) in manifest::TARGETS.iter().zip(selected_archives.iter()) {
+    for (target, bytes) in manifest::targets_for_schema(selected.schema)?
+        .iter()
+        .zip(selected_archives.iter())
+    {
         store.put(PUBLIC, &selected.targets[*target].key, bytes, true)?;
         verify_public(http, &selected.targets[*target].key, bytes)?;
     }
@@ -1284,7 +1526,7 @@ fn publish_verified(
     let response=http.request(Method::POST,&format!("statuses/{}",id.commit)).json(&serde_json::json!({"state":"success","context":manifest::STATUS_CONTEXT,"description":format!("sha256:{digest}"),"target_url":manifest::status_url(id.run,id.attempt)})).send().map_err(|_|anyhow::anyhow!("GitHub status request failed"))?;
     ensure!(response.status().is_success(), "GitHub status rejected");
     let index = VersionIndex {
-        schema: 1,
+        schema: selected.schema,
         repository: manifest::REPOSITORY.into(),
         version: id.version.clone(),
         source_commit: id.commit.clone(),
@@ -1436,7 +1678,9 @@ mod tests {
                 let path = first.next().unwrap();
                 let mut s = shared.lock().unwrap();
                 let mut status = 200u16;
-                let response: Vec<u8> = if let Some(key) = path.strip_prefix("/remnifold-updates/")
+                let response: Vec<u8> = if let Some(key) = path
+                    .strip_prefix("/remnifold-updates/")
+                    .or_else(|| path.strip_prefix("/remnifold-builds/"))
                 {
                     if method == "PUT" {
                         s.writes.push(format!("PUT {key}"));
@@ -1645,7 +1889,7 @@ mod tests {
             attempt,
         };
         let mut release = ReleaseManifest {
-            schema: 1,
+            schema: manifest::CURRENT_RELEASE_SCHEMA,
             repository: manifest::REPOSITORY.into(),
             version: id.version.clone(),
             source_commit: id.commit.clone(),
@@ -1714,13 +1958,16 @@ mod tests {
         let first =
             publish_objects(&f.store, &f.github, &id, &release, &staged, &archives).unwrap();
         let first_lines = manifest::witness_lines(&first.release, &first.digest).unwrap();
-        assert_eq!(first_lines.len(), 6);
+        assert_eq!(first_lines.len(), manifest::TARGETS.len() + 1);
         manifest::verify_witness(first_lines.join("\n").as_bytes(), &release, &first.digest)
             .unwrap();
         let writes = f.state.lock().unwrap().writes.clone();
-        assert_eq!(writes.len(), 8);
-        assert_eq!(writes[6], "STATUS");
-        assert_eq!(writes[7], "PUT releases/1.0.15/index.json");
+        assert_eq!(writes.len(), manifest::TARGETS.len() + 3);
+        assert_eq!(writes[manifest::TARGETS.len() + 1], "STATUS");
+        assert_eq!(
+            writes[manifest::TARGETS.len() + 2],
+            "PUT releases/1.0.15/index.json"
+        );
         let (next, next_release, next_staged, next_archives) = rebuilt_publication(2);
         let reused = publish_objects(
             &f.store,
@@ -1964,6 +2211,208 @@ mod tests {
         gzip.write_all(&[0; 1024]).unwrap();
         let bytes = gzip.finish().unwrap();
         assert!(native_parts(&bytes, manifest::TARGETS[0]).is_err());
+    }
+    fn local_input_fixture(body: &[u8]) -> (LocalInputRecord, Vec<u8>) {
+        let target = "aarch64-apple-darwin";
+        let mut archive = tar::Builder::new(Vec::new());
+        for (name, bytes) in [
+            ("remnifold/bin/remnifold", body),
+            ("remnifold/native-build.json", b"native metadata".as_slice()),
+        ] {
+            let mut header = tar::Header::new_ustar();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append_data(&mut header, name, bytes).unwrap();
+        }
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&archive.into_inner().unwrap()).unwrap();
+        let bytes = gzip.finish().unwrap();
+        let digest = hash(&bytes);
+        (
+            LocalInputRecord {
+                schema: 1,
+                repository: manifest::REPOSITORY.into(),
+                version: "1.0.15".into(),
+                source_commit: "a".repeat(40),
+                target: target.into(),
+                key: format!("local-inputs/{}/{target}/{digest}.tar.gz", "a".repeat(40)),
+                size: bytes.len() as u64,
+                sha256: digest,
+                native_manifest_sha256: hash(b"native metadata"),
+            },
+            bytes,
+        )
+    }
+    #[test]
+    fn local_input_rejects_identity_and_byte_changes() {
+        let (record, bytes) = local_input_fixture(b"executable");
+        record
+            .validate("1.0.15", &"a".repeat(40), &record.target)
+            .unwrap();
+        record.verify_bytes(&bytes).unwrap();
+        for field in [
+            "schema",
+            "repository",
+            "version",
+            "sourceCommit",
+            "target",
+            "key",
+            "size",
+            "sha256",
+            "nativeManifestSha256",
+        ] {
+            let mut value = serde_json::to_value(&record).unwrap();
+            value[field] = match field {
+                "schema" | "size" => serde_json::json!(0),
+                _ => serde_json::json!("incorrect"),
+            };
+            let changed: LocalInputRecord =
+                manifest::parse_strict(&serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(
+                changed
+                    .validate("1.0.15", &"a".repeat(40), &record.target)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut changed = bytes.clone();
+        changed[0] ^= 1;
+        assert!(record.verify_bytes(&changed).is_err());
+        assert!(record.verify_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut changed = record.clone();
+        changed.native_manifest_sha256 = "b".repeat(64);
+        assert!(changed.verify_bytes(&bytes).is_err());
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        assert!(
+            manifest::parse_strict::<LocalInputRecord>(&serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("size");
+        assert!(
+            manifest::parse_strict::<LocalInputRecord>(&serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
+    }
+    #[test]
+    fn local_input_import_rejects_main_pr_manual_and_foreign_origins() {
+        let version = "1.0.20";
+        let reference = "refs/heads/release/1.0.20";
+        let workflow = format!(
+            "{}/.github/workflows/ci.yml@{reference}",
+            manifest::REPOSITORY
+        );
+        require_local_import_origin("push", manifest::REPOSITORY, &workflow, reference, version)
+            .unwrap();
+        for (event, repository, workflow, reference) in [
+            (
+                "push",
+                manifest::REPOSITORY,
+                workflow.as_str(),
+                "refs/heads/main",
+            ),
+            (
+                "pull_request",
+                manifest::REPOSITORY,
+                workflow.as_str(),
+                reference,
+            ),
+            (
+                "workflow_dispatch",
+                manifest::REPOSITORY,
+                workflow.as_str(),
+                reference,
+            ),
+            ("push", "foreign/repository", workflow.as_str(), reference),
+            ("push", manifest::REPOSITORY, "foreign/workflow", reference),
+        ] {
+            assert!(
+                require_local_import_origin(event, repository, workflow, reference, version)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn release_local_input_missing_or_invalid_fails_without_stage_writes() {
+        let f = publication_fixture();
+        let (id, _, _, _) = publication();
+        let target = "aarch64-apple-darwin";
+        let error = download_local_input(&f.store, &id, target).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Local input missing for GITHUB_SHA")
+        );
+        let (mut record, bytes) = local_input_fixture(b"build");
+        record.source_commit = "b".repeat(40);
+        f.state.lock().unwrap().files.insert(
+            local_record_key(&id.commit, target),
+            serde_json::to_vec(&record).unwrap(),
+        );
+        f.state
+            .lock()
+            .unwrap()
+            .files
+            .insert(record.key.clone(), bytes);
+        assert!(download_local_input(&f.store, &id, target).is_err());
+        assert!(f.state.lock().unwrap().writes.is_empty());
+    }
+    #[test]
+    fn local_input_create_only_retries_and_conflicts_use_full_bytes() {
+        let f = publication_fixture();
+        let (record, bytes) = local_input_fixture(b"first");
+        let key = local_record_key(&record.source_commit, &record.target);
+        assert!(
+            f.store
+                .get(STAGING, &key, manifest::MAX_JSON as u64)
+                .unwrap()
+                .is_none()
+        );
+        upload_local_input(&f.store, &record, &bytes).unwrap();
+        upload_local_input(&f.store, &record, &bytes).unwrap();
+        assert_eq!(f.state.lock().unwrap().writes.len(), 2);
+        let (other, other_bytes) = local_input_fixture(b"different build");
+        assert!(upload_local_input(&f.store, &other, &other_bytes).is_err());
+        f.state
+            .lock()
+            .unwrap()
+            .files
+            .insert(record.key.clone(), b"tampered".to_vec());
+        assert!(upload_local_input(&f.store, &record, &bytes).is_err());
+        f.state.lock().unwrap().files.remove(&record.key);
+        assert!(upload_local_input(&f.store, &record, &bytes).is_err());
+    }
+    #[test]
+    fn competing_local_inputs_accept_one_complete_record() {
+        let f = publication_fixture();
+        let (first, first_bytes) = local_input_fixture(b"first build");
+        let (second, second_bytes) = local_input_fixture(b"second build");
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| upload_local_input(&f.store, &first, &first_bytes));
+            let right = scope.spawn(|| upload_local_input(&f.store, &second, &second_bytes));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_ne!(left.is_ok(), right.is_ok());
+        let accepted: LocalInputRecord = manifest::parse_strict(
+            &f.store
+                .get(
+                    STAGING,
+                    &local_record_key(&first.source_commit, &first.target),
+                    manifest::MAX_JSON as u64,
+                )
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let bytes = f
+            .store
+            .get(STAGING, &accepted.key, accepted.size)
+            .unwrap()
+            .unwrap();
+        accepted.verify_bytes(&bytes).unwrap();
+        assert!(accepted == first || accepted == second);
     }
     #[test]
     fn github_real_http_rejects_failed_matrix_and_foreign_event_before_writes() {

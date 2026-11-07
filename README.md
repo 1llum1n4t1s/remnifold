@@ -39,6 +39,8 @@ Starting with 1.0.16, published native packages are served from [Remnifold updat
 
 Mac Intel is not supported.
 
+Starting with 1.0.20, releases use a four-target schema-2 manifest and V2 publication witness. An updater from 1.0.19 or earlier cannot read this format: first use the authenticated Windows bootstrap or trusted-source Unix bootstrap below to obtain the new updater. Keep the same server connection and existing registration. The new updater still reads historical five-target schema-1 releases and their verification receipts; historical releases are not rewritten.
+
 For an existing `remnifold@personal` installation, use the native executable's `plugin-update` command with authenticated native GitHub CLI and Codex CLI. The updater verifies the release commit, successful CI publisher logs, R2 manifest, archive hashes, and package source before using Codex's official plugin CLI. Publication does not update your installation automatically.
 
 Run these commands from the extracted plugin folder, using the same published version and work root for all three steps:

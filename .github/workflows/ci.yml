@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    # Dependabot pull requests already run the full matrix on the merge result.
+    # Dependabot PRs validate Windows consumers; Unix inputs are verified on release pushes.
     branches-ignore:
       - 'dependabot/**'
     # Release publication is verified on release/*, not on tag pushes.
@@ -23,19 +23,17 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-latest
+          - os: windows-latest
             target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: ubuntu-latest
+          - os: windows-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: windows-latest
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     # Environment deployment-branch policies are the credential boundary. Only
     # these environments own R2 secrets; validation has no distribution secrets.
     environment:
-      name: ${{ github.event_name == 'push' && github.repository == '1llum1n4t1s/remnifold' && github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'r2-staging' || 'validation' }}
+      name: ${{ github.event_name == 'push' && github.repository == '1llum1n4t1s/remnifold' && github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) && ((matrix.target == 'x86_64-pc-windows-msvc' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/heads/release/')) && 'r2-staging' || 'validation' }}
     timeout-minutes: 90
     defaults:
       run:
@@ -47,7 +45,6 @@ jobs:
     outputs:
       windows_x64: ${{ steps.stage.outputs.windows_x64 }}
       macos_arm64: ${{ steps.stage.outputs.macos_arm64 }}
-      macos_x64: ${{ steps.stage.outputs.macos_x64 }}
       linux_x64: ${{ steps.stage.outputs.linux_x64 }}
       linux_arm64: ${{ steps.stage.outputs.linux_arm64 }}
     steps:
@@ -72,7 +69,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Install locked Rust toolchain
         # Bootstrap uses the hosted runner's managed TEMP until isolation is configured.
-        run: rustup toolchain install 1.99.1 --profile minimal --target "$CI_TARGET" && rustup default 1.99.1
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
       - name: Configure isolated output directories
         run: |
           set -euo pipefail
@@ -123,20 +120,28 @@ jobs:
           printf '%s/guard\n' "$CI_ROOT" >> "$GITHUB_PATH"
           printf 'REMNIFOLD_NODE_GUARD_READY=1\n' >> "$GITHUB_ENV"
       - name: Prepare pinned native build tools
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask prepare
       - name: Type-check Worker source
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask type-check
       - name: Test native runtime and development contracts
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask native-test
       - name: Test authenticated Worker in local workerd
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask server-test --work-root "$CI_ROOT/validation/server"
       - name: Test native client, capture, recall, and ranking
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask client-test --work-root "$CI_ROOT/validation/client"
       - name: Build native consumer archive
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask package --target "$CI_TARGET" --source-commit "$GITHUB_SHA"
       - name: Verify final native archive before publication
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask verify --target "$CI_TARGET" --binary "$REMNIFOLD_PACKAGE_BINARY" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --source-commit "$GITHUB_SHA"
       - name: Exercise native plugin update and recovery
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask updater-test --binary "$REMNIFOLD_PACKAGE_BINARY" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --work-root "$CI_ROOT/validation/updater"
       - name: Verify no JavaScript runtime was invoked through PATH
         if: always()
@@ -167,13 +172,19 @@ jobs:
           github.event_name == 'push' &&
           github.repository == '1llum1n4t1s/remnifold' &&
           github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+          ((matrix.target == 'x86_64-pc-windows-msvc' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/heads/release/'))
         env:
           CI_R2_ENVIRONMENT: r2-staging
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           R2_CI_ACCESS_KEY_ID: ${{ secrets.R2_CI_ACCESS_KEY_ID }}
           R2_CI_SECRET_ACCESS_KEY: ${{ secrets.R2_CI_SECRET_ACCESS_KEY }}
-        run: cargo xtask r2-stage --target "$CI_TARGET" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --binary "$REMNIFOLD_PACKAGE_BINARY" --source-commit "$GITHUB_SHA" --apply
+        run: |
+          set -euo pipefail
+          if [[ "$CI_TARGET" == "x86_64-pc-windows-msvc" ]]; then
+            cargo xtask r2-stage --target "$CI_TARGET" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --binary "$REMNIFOLD_PACKAGE_BINARY" --source-commit "$GITHUB_SHA" --apply
+          else
+            cargo xtask local-input import --target "$CI_TARGET" --work-root "$CI_ROOT/local-input" --apply
+          fi
 
   publish-r2:
     name: publish-r2

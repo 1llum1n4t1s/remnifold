@@ -40,6 +40,16 @@ mod tests {
             assert!(scope.contains("github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref)"));
         }
         assert!(stage.contains("github.ref == 'refs/heads/main'"));
+        let scope = "((matrix.target == 'x86_64-pc-windows-msvc' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/heads/release/'))";
+        assert!(
+            matrix.contains(scope),
+            "Unix main jobs must select the secret-free validation environment"
+        );
+        assert!(
+            stage.contains(scope),
+            "Unix main jobs must skip distribution calls"
+        );
+        assert!(!stage.contains("continue-on-error"));
         assert!(stage.contains("startsWith(github.ref, 'refs/heads/release/')"));
         assert!(publisher.contains("needs.native-package.result == 'success'"));
         assert!(publisher.contains("needs: native-package"));
@@ -110,13 +120,7 @@ mod tests {
     #[test]
     fn matrix_output_names_are_unique_and_workflows_have_no_executable_actions() {
         let workflow = include_str!("../../.github/workflows/ci.yml");
-        for name in [
-            "windows_x64",
-            "macos_arm64",
-            "macos_x64",
-            "linux_x64",
-            "linux_arm64",
-        ] {
+        for name in ["windows_x64", "macos_arm64", "linux_x64", "linux_arm64"] {
             assert_eq!(
                 workflow
                     .matches(&format!(
@@ -132,6 +136,21 @@ mod tests {
                 .starts_with("uses:")
         }));
         assert!(!workflow.contains("setup-node") && !workflow.contains("upload-artifact"));
+        assert_eq!(
+            workflow.matches("          - os: windows-latest").count(),
+            4
+        );
+        assert!(!workflow.contains("target: x86_64-apple-darwin"));
+        assert!(workflow.contains("cargo xtask local-input import --target"));
+        for name in [
+            "Build native consumer archive",
+            "Verify final native archive before publication",
+            "Exercise native plugin update and recovery",
+        ] {
+            assert!(workflow.contains(&format!(
+                "      - name: {name}\n        if: matrix.target == 'x86_64-pc-windows-msvc'"
+            )));
+        }
         assert!(workflow.contains("absolute executable paths are not intercepted"));
         assert!(
             !include_str!("../../.github/dependabot.yml")

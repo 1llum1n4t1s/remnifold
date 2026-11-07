@@ -40,6 +40,9 @@ fn run() -> Result<()> {
         .to_path_buf();
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());
+    if command == "local-input" {
+        return r2::local_input(&args.collect::<Vec<_>>());
+    }
     if command == "bootstrap-release" {
         return bootstrap_release::run(&repo, &args.collect::<Vec<_>>());
     }
@@ -111,6 +114,10 @@ fn run() -> Result<()> {
         .map(String::as_str)
         .unwrap_or(host_target());
     package::executable(target)?;
+    anyhow::ensure!(
+        package::TARGETS.contains(&target),
+        "Unsupported current target"
+    );
     let source_mode = options
         .get("--source-mode")
         .map(String::as_str)
@@ -274,7 +281,7 @@ fn host_target() -> &'static str {
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "aarch64-apple-darwin"
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin"
+        panic!("Intel macOS is not supported")
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         "aarch64-unknown-linux-gnu"
     } else {

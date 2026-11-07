@@ -684,6 +684,9 @@ fn r2_cases(
     let focus = std::env::var("REMNIFOLD_UPDATER_R2_FOCUS").ok();
     for fault in [
         "success",
+        "legacy-success",
+        "schema-cross",
+        "witness-schema-cross",
         "recovery",
         "same-version",
         "binary-tamper",
@@ -799,6 +802,7 @@ fn r2_cases(
         let asset_key = format!("{prefix}/{target}/{asset_hash}.tar.gz");
         let manifest_key = format!("{prefix}/manifest.json");
         let mut targets = serde_json::Map::new();
+        let release_schema = if fault == "legacy-success" { 1 } else { 2 };
         for t in [
             "x86_64-pc-windows-msvc",
             "aarch64-apple-darwin",
@@ -806,6 +810,9 @@ fn r2_cases(
             "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-gnu",
         ] {
+            if release_schema == 2 && t == "x86_64-apple-darwin" {
+                continue;
+            }
             targets.insert(t.into(), json!({"key":format!("{prefix}/{t}/{asset_hash}.tar.gz"),"size":archive_bytes.len(),"sha256":asset_hash,"nativeManifestSha256":native_hash}));
         }
         if fault == "missing-target" {
@@ -820,7 +827,7 @@ fn r2_cases(
         if fault == "native-hash" {
             targets.get_mut(target).unwrap()["nativeManifestSha256"] = json!("0".repeat(64));
         }
-        let manifest = json!({"schema":1,"repository":REPO,"version":f.version,"sourceCommit":f.sha,"runId":100,"runAttempt":1,"targets":targets});
+        let manifest = json!({"schema":release_schema,"repository":REPO,"version":f.version,"sourceCommit":f.sha,"runId":100,"runAttempt":1,"targets":targets});
         let mut manifest_bytes = serde_json::to_vec(&manifest)?;
         if fault == "duplicate-target" {
             let text = String::from_utf8(manifest_bytes)?;
@@ -836,7 +843,7 @@ fn r2_cases(
                 .into_bytes();
         }
         let manifest_hash = hash(&manifest_bytes);
-        let mut index = json!({"schema":1,"repository":REPO,"version":f.version,"sourceCommit":f.sha,"runId":100,"runAttempt":1,"manifestKey":manifest_key,"manifestSha256":manifest_hash});
+        let mut index = json!({"schema":if fault == "schema-cross" { 1 } else { release_schema },"repository":REPO,"version":f.version,"sourceCommit":f.sha,"runId":100,"runAttempt":1,"manifestKey":manifest_key,"manifestSha256":manifest_hash});
         if fault == "index-commit" {
             index["sourceCommit"] = json!("f".repeat(40));
         }
@@ -906,7 +913,7 @@ fn r2_cases(
             anchor["description"] = json!(format!("sha256:{}", "0".repeat(64)));
         }
         let mut marker_fields = vec![
-            "REMNIFOLD_R2_MANIFEST_V1".to_owned(),
+            format!("REMNIFOLD_R2_MANIFEST_V{release_schema}"),
             f.version.clone(),
             f.sha.clone(),
             "100".into(),
@@ -931,7 +938,12 @@ fn r2_cases(
         job_log.insert_str(0, "\u{1b}[32mUnrelated CI diagnostic\u{1b}[0m\n");
         for (target, asset) in manifest["targets"].as_object().unwrap() {
             let asset_line = format!(
-                "REMNIFOLD_R2_ASSET_V1 {target} {} {} {}\n",
+                "REMNIFOLD_R2_ASSET_V{} {target} {} {} {}\n",
+                if fault == "witness-schema-cross" {
+                    1
+                } else {
+                    release_schema
+                },
                 asset["sha256"].as_str().unwrap(),
                 asset["size"],
                 asset["key"].as_str().unwrap()
@@ -990,7 +1002,11 @@ fn r2_cases(
             continue;
         }
         let before = f.snapshot()?;
-        if fault == "success" || fault == "recovery" || fault == "witness-legacy-gh" {
+        if fault == "success"
+            || fault == "legacy-success"
+            || fault == "recovery"
+            || fault == "witness-legacy-gh"
+        {
             f.success("--check-published", "published")?;
             ensure!(
                 before == f.snapshot()? && f.adds()? == 0,

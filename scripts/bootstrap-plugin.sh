@@ -28,7 +28,6 @@ for tool in gh curl tar head mkfifo; do command -v "$tool" >/dev/null 2>&1 || fa
 if command -v sha256sum >/dev/null 2>&1; then hash_tool=sha256sum; else command -v shasum >/dev/null 2>&1 || fail 'missing SHA-256 tool'; hash_tool=shasum; fi
 case "$(uname -s)/$(uname -m)" in
   Darwin/arm64) target=aarch64-apple-darwin ;;
-  Darwin/x86_64) target=x86_64-apple-darwin ;;
   Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
   Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-gnu ;;
   *) fail 'unsupported platform' ;;
@@ -173,16 +172,23 @@ if LC_ALL=C grep -q -- '--allow-escape-sequences' "$session/gh-api-help.txt"; th
 else
   run_bound 4194304 120 "$logs" gh api --hostname github.com "repos/$repo/actions/jobs/$job/logs"
 fi
-manifest_seen=0; assets=0; seen=' '; selected_hash= selected_size= selected_key=
+manifest_seen=0; witness_version=; assets=0; seen=' '; selected_hash= selected_size= selected_key=
 while IFS= read -r line || [ -n "$line" ]; do
   line=${line%$'\r'}
   case "$line" in *REMNIFOLD_R2_MANIFEST*|*REMNIFOLD_R2_ASSET*) ;; *) continue ;; esac
   if [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z\  ]]; then line=${line#* }; fi
-  if [[ "$line" =~ ^REMNIFOLD_R2_MANIFEST_V1\ ([^\ ]+)\ ([0-9a-f]{40})\ ([1-9][0-9]*)\ ([1-9][0-9]*)\ ([0-9a-f]{64})$ ]]; then
+  if [[ "$line" =~ ^REMNIFOLD_R2_MANIFEST_V[12]\ ([^\ ]+)\ ([0-9a-f]{40})\ ([1-9][0-9]*)\ ([1-9][0-9]*)\ ([0-9a-f]{64})$ ]]; then
     [ "$manifest_seen" = 0 ] && [ "${BASH_REMATCH[1]}" = "$version" ] && [ "${BASH_REMATCH[2]}" = "$commit" ] || fail 'manifest witness'
     publication_run=${BASH_REMATCH[3]}; publication_attempt=${BASH_REMATCH[4]}; manifest_hash=${BASH_REMATCH[5]}; manifest_seen=1
-  elif [[ "$line" =~ ^REMNIFOLD_R2_ASSET_V1\ ([a-z0-9_-]+)\ ([0-9a-f]{64})\ ([1-9][0-9]{0,8})\ ([a-zA-Z0-9_./+-]+)$ ]]; then
+    marker=${line%% *}; marker_version=${marker##*_V}
+    [ -z "$witness_version" ] || [ "$witness_version" = "$marker_version" ] || fail 'mixed witness versions'
+    witness_version=$marker_version
+  elif [[ "$line" =~ ^REMNIFOLD_R2_ASSET_V[12]\ ([a-z0-9_-]+)\ ([0-9a-f]{64})\ ([1-9][0-9]{0,8})\ ([a-zA-Z0-9_./+-]+)$ ]]; then
     t=${BASH_REMATCH[1]}; h=${BASH_REMATCH[2]}; n=${BASH_REMATCH[3]}; k=${BASH_REMATCH[4]}
+    marker=${line%% *}; marker_version=${marker##*_V}
+    [ -z "$witness_version" ] || [ "$witness_version" = "$marker_version" ] || fail 'mixed witness versions'
+    witness_version=$marker_version
+    [ "$marker_version/$t" != '2/x86_64-apple-darwin' ] || fail 'unsupported witness target'
     case "$t" in x86_64-pc-windows-msvc|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;; *) fail 'unknown witness target' ;; esac
     case "$seen" in *" $t "*) fail 'duplicate witness target' ;; esac
     [ "$n" -le 134217728 ] || fail 'archive size bound'
@@ -191,7 +197,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     if [ "$t" = "$target" ]; then selected_hash=$h; selected_size=$n; selected_key=$k; fi
   else fail 'malformed publication witness'; fi
 done <"$logs"
-[ "$manifest_seen" = 1 ] && [ "$assets" = 5 ] && [ -n "$selected_key" ] || fail 'incomplete publication witness'
+expected_assets=4; [ "$witness_version" != 1 ] || expected_assets=5
+[ "$manifest_seen" = 1 ] && [ "$assets" = "$expected_assets" ] && [ -n "$selected_key" ] || fail 'incomplete publication witness'
 while IFS=$'\t' read -r t h n k; do
   [ "$k" = "releases/$version/$commit/$publication_run-$publication_attempt/$t/$h.tar.gz" ] || fail 'noncanonical archive key'
 done <"$session/assets.tsv"
