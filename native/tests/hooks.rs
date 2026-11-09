@@ -227,6 +227,67 @@ fn loopback_fixture_waits_for_request_bytes_after_accept() {
 }
 
 #[test]
+fn continuation_requires_verified_history_but_keeps_recent_task_awareness() {
+    let fixture = Fixture::new();
+    let root = root();
+    let transcript = root.join("session.jsonl");
+    let topic = json!({"type":"event_msg","payload":{"type":"user_message","message":"Repair Unicode transcript boundaries"}});
+    let payload =
+        json!({"session_id":"fixture-session","transcript_path":transcript,"prompt":"続けて"});
+    // セッションを確認できない履歴は話題検索へ流さず、独立した recent 取得は保つ。
+    for header in [
+        String::new(),
+        format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":false}})
+        ),
+        format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":"another-session"}})
+        ),
+    ] {
+        fs::write(&transcript, format!("{header}{topic}\n")).unwrap();
+        fixture.requests.lock().unwrap().clear();
+        let output = hook(
+            &root,
+            &fixture.url,
+            "UserPromptSubmit",
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        assert!(!output.to_string().contains("topic-doc"));
+        let requests = fixture.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|(path, _)| path == "/v3/documents/list")
+        );
+        assert!(!requests.iter().any(|(path, _)| path == "/v4/search"));
+    }
+    fs::write(
+        &transcript,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture-session\"}}\n",
+    )
+    .unwrap();
+    append(&transcript, topic);
+    fixture.requests.lock().unwrap().clear();
+    let output = hook(
+        &root,
+        &fixture.url,
+        "UserPromptSubmit",
+        &serde_json::to_vec(&payload).unwrap(),
+    );
+    assert!(output.to_string().contains("topic-doc"));
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path == "/v4/search")
+    );
+}
+
+#[test]
 fn native_hook_recall_state_recovery_revision_and_partial_failure() {
     let fixture = Fixture::new();
     let root = root();

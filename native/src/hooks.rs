@@ -119,9 +119,7 @@ pub fn recall_query(value: &str) -> String {
 }
 
 fn mismatched(row: &Value, session: &str) -> bool {
-    row["type"] == "session_meta"
-        && truthy(&row["payload"]["id"])
-        && row["payload"]["id"] != session
+    row["type"] == "session_meta" && row["payload"]["id"].as_str() != Some(session)
 }
 
 fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String {
@@ -144,19 +142,22 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
         let size = meta.len();
         let mut header = vec![0; size.min(64 * 1024) as usize];
         file.read_exact(&mut header).ok()?;
-        if size > MIB {
-            let end = header.iter().position(|&b| b == b'\n')?;
-            let row: Value = serde_json::from_slice(&header[..end]).ok()?;
-            if mismatched(&row, session) {
-                return None;
+        // 不一致が見つからないだけでは所属を証明できない。完全なヘッダー行で
+        // 明示的一致を確認し、先頭行以外の session_meta も既存 reader 同様に許す。
+        let mut matching_session = false;
+        for entry in header.split_inclusive(|&b| b == b'\n') {
+            if entry.last() != Some(&b'\n') {
+                break;
             }
-        }
-        for entry in header.split(|&b| b == b'\n').take(10) {
             if let Ok(row) = serde_json::from_slice::<Value>(entry) {
                 if mismatched(&row, session) {
                     return None;
                 }
+                matching_session |= row["type"] == "session_meta";
             }
+        }
+        if !matching_session {
+            return None;
         }
         let lower = size.saturating_sub(TOPIC_BYTES);
         let mut position = size;
@@ -164,6 +165,7 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
         let mut complete = false;
         let mut oversized = false;
         let mut users = 0;
+        let mut recovered = None;
         while position > lower {
             if now() + 250 >= deadline {
                 return None;
@@ -207,32 +209,49 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
                             if mismatched(&row, session) {
                                 return None;
                             }
-                            let record = &row["payload"];
-                            let message = if row["type"] == "event_msg"
-                                && record["type"] == "user_message"
-                            {
-                                text(&record["message"]).to_owned()
-                            } else if row["type"] == "response_item" && record["role"] == "user" {
-                                record["content"]
-                                    .as_array()
-                                    .map(|blocks| {
-                                        blocks
-                                            .iter()
-                                            .filter(|b| b["type"] == "input_text")
-                                            .filter_map(|b| b["text"].as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    })
-                                    .unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
-                            if !message.is_empty() && !re!(r"^\s*(?:Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)\b|<subagent_notification\b)").is_match(&message) {
-                                let query = recall_query(&message);
-                                if !query.is_empty() {
-                                    users += 1;
-                                    if users > 16 { return None; }
-                                    if query != current && !query.starts_with(['!', '/']) && !search::recall_topic_terms(&query).is_empty() { return Some(query); }
+                            // 最新の発言より前の所属行まで確認してから採用する。
+                            // 先に戻ると、ヘッダー窓より後で混在した別 session を見落とす。
+                            if row["type"] == "session_meta" && recovered.is_some() {
+                                return recovered;
+                            }
+                            if recovered.is_none() {
+                                let record = &row["payload"];
+                                let message = if row["type"] == "event_msg"
+                                    && record["type"] == "user_message"
+                                {
+                                    text(&record["message"]).to_owned()
+                                } else if row["type"] == "response_item" && record["role"] == "user"
+                                {
+                                    record["content"]
+                                        .as_array()
+                                        .map(|blocks| {
+                                            blocks
+                                                .iter()
+                                                .filter(|b| b["type"] == "input_text")
+                                                .filter_map(|b| b["text"].as_str())
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        })
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                let subagent = re!(r"^\s*(?:Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)\b|<subagent_notification\b)")
+                                    .is_match(&message);
+                                if !message.is_empty() && !subagent {
+                                    let query = recall_query(&message);
+                                    if !query.is_empty() {
+                                        users += 1;
+                                        if users > 16 {
+                                            return None;
+                                        }
+                                        if query != current
+                                            && !query.starts_with(['!', '/'])
+                                            && !search::recall_topic_terms(&query).is_empty()
+                                        {
+                                            recovered = Some(query);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -247,7 +266,7 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
             }
             position = start;
         }
-        None
+        recovered
     }
     read_topic(payload, current, deadline).unwrap_or_default()
 }
@@ -735,6 +754,81 @@ mod tests {
         let mut wrong = payload.clone();
         wrong["session_id"] = json!("other");
         assert_eq!(previous_user_topic(&wrong, "continue", now() + 9000), "");
+    }
+
+    #[test]
+    fn history_recovery_requires_a_complete_matching_session_header() {
+        let (_root, payload) = fixture();
+        let transcript = text(&payload["transcript_path"]);
+        let topic = "Repair Unicode transcript boundaries";
+        // 正常な発言があっても、履歴の所属を確認できなければ検索に使わない。
+        for header in [
+            String::new(),
+            "{invalid}\n".into(),
+            format!("{}\n", json!({"type":"session_meta","payload":{}})),
+            format!("{}\n", json!({"type":"session_meta","payload":{"id":""}})),
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":false}})
+            ),
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":"other"}})
+            ),
+            json!({"type":"session_meta","payload":{"id":"session"}}).to_string(),
+        ] {
+            fs::write(transcript, header).unwrap();
+            append(&payload, &user(topic));
+            assert_eq!(previous_user_topic(&payload, "continue", now() + 9000), "");
+        }
+        // session_meta の先頭行固定は既存 reader の契約にない。
+        fs::write(transcript, user("/continue").repeat(12)).unwrap();
+        append(
+            &payload,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
+        );
+        append(&payload, &user(topic));
+        assert_eq!(
+            previous_user_topic(&payload, "continue", now() + 9000),
+            topic
+        );
+        // 同一 session の所属行が再び現れても、まだ候補がなければ過去を探す。
+        append(
+            &payload,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
+        );
+        append(&payload, &user("/continue"));
+        assert_eq!(
+            previous_user_topic(&payload, "continue", now() + 9000),
+            topic
+        );
+        // 一致ヘッダーの後に別所属が現れた場合も採用しない。
+        append(
+            &payload,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n",
+        );
+        assert_eq!(previous_user_topic(&payload, "continue", now() + 9000), "");
+        // 読取り上限より後にある一致は、所属確認として使わない。
+        fs::write(transcript, vec![b' '; 64 * 1024]).unwrap();
+        append(
+            &payload,
+            b"\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
+        );
+        append(&payload, &user(topic));
+        assert_eq!(previous_user_topic(&payload, "continue", now() + 9000), "");
+        // ヘッダー窓の外で別会話が混在しても、発言だけを先に採用しない。
+        fs::write(
+            transcript,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
+        )
+        .unwrap();
+        append(&payload, &vec![b' '; 64 * 1024]);
+        append(
+            &payload,
+            b"\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n",
+        );
+        append(&payload, &user(topic));
+        assert_eq!(previous_user_topic(&payload, "continue", now() + 9000), "");
     }
 
     #[test]
