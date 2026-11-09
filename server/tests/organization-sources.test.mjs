@@ -86,7 +86,7 @@ test('organization sources: summary to checkpoint hierarchy preserves exact iden
     f.db.prepare("INSERT INTO memory_organization_versions VALUES (?,'summary')").run(summary);
     f.db.prepare("INSERT INTO memory_organization_versions VALUES (?,'summary')").run(generated);
     for (const id of [legacy, checkpoint, generated]) f.db.prepare("INSERT INTO memory_organization_dependencies VALUES ('summary',?,?)").run(id, revision(id));
-    f.db.prepare("INSERT INTO memory_organization_coverage VALUES (?,?,'active')").run(legacy, revision(legacy));
+    f.db.prepare("INSERT INTO memory_organization_coverage(memory_id,source_revision,status) VALUES (?,?,'active')").run(legacy, revision(legacy));
     f.db.prepare("INSERT INTO memory_organization_coverage_summaries VALUES (?,'summary')").run(legacy);
     f.db.prepare("INSERT INTO memory_consolidation_projects(project_key,source_container_tag,created_at,updated_at) VALUES ('project','memories','now','now')").run();
     f.db.prepare("INSERT INTO memory_consolidations VALUES ('checkpoint','project',?,1,'active','now','now')").run(checkpoint);

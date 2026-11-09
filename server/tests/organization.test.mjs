@@ -77,6 +77,30 @@ scenario('atomic publication hides ordinary search while recent awareness, direc
   assert.equal(f.calls.length, 0);
 });
 
+scenario('automatic authored summaries retain recall eligibility when their index is reconstructed', async f => {
+  const id = await f.save('OrganizationRecall original evidence and decision', { memoryIndex: {
+    version: 1, title: 'OrganizationRecall original decision', description: 'OrganizationRecall retain the verified decision and evidence', sourceKind: 'conversation', recallable: true,
+  } });
+  const batch = await f.prepare();
+  assert.equal(batch.sources[0].recallClass, 'automatic');
+  const body = f.payload(batch);
+  body.summaries[0].title = 'OrganizationRecall final decision';
+  body.summaries[0].content = 'はい';
+  const committed = await f.api('/v4/organize/commit', body);
+  assert.equal(committed.status, 200, JSON.stringify(committed.body));
+  const summaryId = committed.body.summaries[0].memoryId;
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM memory_organization_hidden WHERE memory_id=?').get(id).n, 1);
+  const result = await f.api('/v4/search', { q: 'OrganizationRecall', allContainers: true, indexOnly: true });
+  assert.equal(result.status, 200);
+  assert.ok(!result.body.results.some(row => row.id === id));
+  const summary = result.body.results.find(row => row.id === summaryId);
+  assert.ok(summary);
+  assert.equal(summary.metadata.memoryIndex.recallable, true);
+  const retrieved = await f.api(`/v3/documents/${summaryId}`, undefined, 'GET');
+  assert.equal(retrieved.status, 200);
+  assert.equal(retrieved.body.content, 'はい');
+});
+
 scenario('all required summaries must remain valid; forgetting one restores original visibility', async f => {
   const id = await f.save(); const batch = await f.prepare(); const result = await f.api('/v4/organize/commit', f.payload(batch, 2));
   assert.equal(result.status, 200); assert.equal(f.db.prepare('SELECT COUNT(*) n FROM memory_organization_hidden').get().n, 1);
@@ -352,7 +376,8 @@ scenario('AI-off organization preserves over 200 original vectors for immediate 
     ids.push(id);vector.seedEmbedding(id,n===200?0:1);
   }
   for(let n=0;n<40;n++){
-    const batch=await f.prepare();if(!batch.sources.length)break;
+    // An empty bounded ID window is not proof that discovery is complete.
+    const batch=await f.prepare();if(!batch.sources.length)continue;
     assert.equal((await f.api('/v4/organize/commit',f.payload(batch))).status,200);
   }
   assert.equal(f.db.prepare('SELECT COUNT(*) n FROM memory_organization_complete').get().n,201);

@@ -948,6 +948,7 @@ async function consolidationTargets(env: Env, now: Date, projectKey?: string): P
                    THEN json_extract(m.metadata_json, '$.sm_project_id') END AS project_id
        FROM memories AS m
        WHERE m.is_forgotten = 0
+         AND json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0
          AND json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1
          AND NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id)
          ${projectKey === undefined ? "" : `AND ${CONSOLIDATION_PROJECT_KEY_SQL} = ?`}
@@ -1046,6 +1047,7 @@ async function newConsolidationSources(projectKey: string, env: Env): Promise<Co
             m.created_at AS createdAt, COALESCE(m.topic_revision, m.updated_at) AS sourceRevision
      FROM memories AS m
      WHERE m.is_forgotten = 0
+       AND json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0
        AND json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1
        AND NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id)
        AND ${CONSOLIDATION_PROJECT_KEY_SQL} = ?
@@ -1175,17 +1177,23 @@ async function persistConsolidation(
     "(m.id = ? AND COALESCE(m.topic_revision, m.updated_at) = ?)"
   ).join(" OR ");
   const sourceGuard = sources.length > 0
-    ? `(SELECT COUNT(*) FROM memories AS m WHERE m.is_forgotten = 0 AND (${pairClause})) = ${sources.length}`
+    ? `(SELECT COUNT(*) FROM memories AS m WHERE m.is_forgotten = 0
+          AND json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0
+          AND (${pairClause})) = ${sources.length}`
     : "0";
   const previousGuard = previous
     ? `EXISTS (
          SELECT 1 FROM memory_consolidations AS current
+         JOIN memories AS current_memory ON current_memory.id = current.memory_id
          WHERE current.id = ? AND current.project_key = ? AND current.status = 'active'
+           AND current_memory.is_forgotten = 0
+           AND json_extract(current_memory.metadata_json, '$.memoryIndex.recallable') IS NOT 0
        ) AND NOT EXISTS (
          SELECT 1 FROM memory_consolidation_sources AS prior_source
          LEFT JOIN memories AS prior_memory ON prior_memory.id = prior_source.memory_id
          WHERE prior_source.consolidation_id = ?
            AND (prior_memory.id IS NULL OR prior_memory.is_forgotten <> 0 OR
+                json_extract(prior_memory.metadata_json, '$.memoryIndex.recallable') IS 0 OR
                 COALESCE(prior_memory.topic_revision, prior_memory.updated_at) <> prior_source.source_revision)
        )`
     : "NOT EXISTS (SELECT 1 FROM memory_consolidations WHERE project_key = ? AND status = 'active')";
@@ -1307,13 +1315,17 @@ async function consolidateTarget(
     let previous = await activeConsolidation(target.projectKey, env);
     if (previous) {
       const stale = await env.DB.prepare(
-        `SELECT 1 FROM memory_consolidation_sources AS source
+        `SELECT 1 FROM memories AS checkpoint
+         WHERE checkpoint.id = ? AND json_extract(checkpoint.metadata_json, '$.memoryIndex.recallable') IS 0
+         UNION ALL
+         SELECT 1 FROM memory_consolidation_sources AS source
          LEFT JOIN memories AS memory ON memory.id = source.memory_id
          WHERE source.consolidation_id = ? AND (
            memory.id IS NULL OR memory.is_forgotten <> 0 OR
+           json_extract(memory.metadata_json, '$.memoryIndex.recallable') IS 0 OR
            COALESCE(memory.topic_revision, memory.updated_at) <> source.source_revision
          ) LIMIT 1`,
-      ).bind(previous.id).first();
+      ).bind(previous.memoryId, previous.id).first();
       if (stale) {
         await invalidateDependentConsolidations(previous.memoryId, env, ctx);
         console.log(JSON.stringify({
@@ -2686,6 +2698,7 @@ async function profile(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const containerTag = stringValue(body.containerTag, "containerTag", MAX_CONTAINER_TAG_LENGTH);
   const query = typeof body.q === "string" ? body.q.trim() : "";
+  const scope = scopeFilter(body);
   if (query) {
     const search = await searchMemories({ ...body, q: query, containerTag }, env);
     return json({
@@ -2699,11 +2712,12 @@ async function profile(request: Request, env: Env): Promise<Response> {
      FROM facts AS f
      JOIN memories AS m ON m.id = f.source_memory_id
      WHERE f.container_tag = ? AND f.status = 'active' AND m.is_forgotten = 0
+       ${scope ? "AND json_extract(m.metadata_json, '$.sm_scope') = ?" : ""}
      GROUP BY f.subject_key, f.predicate_key, f.object_key
      ORDER BY confidence DESC, MAX(f.updated_at) DESC
      LIMIT ?`,
   )
-    .bind(containerTag, DEFAULT_LIMIT)
+    .bind(containerTag, ...(scope ? [scope] : []), DEFAULT_LIMIT)
     .all<{ subject: string; predicate: string; object: string; confidence: number }>();
   if (factResult.results.length > 0) {
     return json({
@@ -2714,7 +2728,7 @@ async function profile(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  const { clause, parameters } = searchConditions(containerTag, scopeFilter(body), false, "", false, enrichmentEnabled(env));
+  const { clause, parameters } = searchConditions(containerTag, scope, false, "", false, enrichmentEnabled(env));
   // SQLはコードポイント単位。末尾判定用の1文字とNUL時の全文でUTF-16のexcerpt契約を保つ。
   const rows = await env.DB.prepare(
     `SELECT CASE WHEN instr(content, char(0)) > 0 THEN content ELSE substr(content, 1, 1201) END AS content

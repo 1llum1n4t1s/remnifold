@@ -168,7 +168,7 @@ export function documentIndex(document: MemoryDocument, fallbackContainer?: stri
   }
   if (saved && Array.isArray(saved.sections)) index.sections = saved.sections.filter((s) => typeof s === "string").slice(0, 4).map((s) => shortText(s, 60));
   if (saved?.recallable === false) index.recallable = false;
-  else if (saved?.recallable === true && !index.description) index.recallable = true;
+  else if (saved?.recallable === true && (saved.sourceKind === 'organization' || !index.description)) index.recallable = true;
   const containerTag = document.containerTag || document.containerTags?.[0] || fallbackContainer;
   const topicValues = Array.isArray(document.topics)
     ? document.topics

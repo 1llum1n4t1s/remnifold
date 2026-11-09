@@ -1,8 +1,123 @@
 // 実行: cargo xtask server-test
 // 認証済み Worker API、全 migration 適用済み SQLite、非同期完了を通す統合検証。
-import { assert } from "./support/test.mjs";
+import test, { assert } from "./support/test.mjs";
 import worker from "../src/index.ts";
 import { checkpoint, embedding, fixture, migrations, output, scenarioWithLogs as scenario } from "./worker-fixture.mjs";
+
+const scopeFilters = value => ({ AND: [{ key: "sm_scope", filterType: "metadata", value }] });
+function insertProfileFact(f, id, source, object, status = 'active') {
+  const now = new Date().toISOString();
+  f.db.prepare(`INSERT INTO facts(id,container_tag,source_memory_id,subject,predicate,object,
+    subject_key,predicate_key,object_key,is_exclusive,confidence,status,created_at,updated_at)
+    VALUES (?,'memories',?,'Source','has',?,'source','has',?,0,1,?,?,?)`)
+    .run(id, source, object, object, status, now, now);
+}
+function setRecallable(f, id, value) {
+  f.db.prepare("UPDATE memories SET metadata_json=json_set(metadata_json,'$.memoryIndex.recallable',json(?)) WHERE id=?")
+    .run(JSON.stringify(value), id);
+}
+async function extraSource(f) {
+  const saved = await f.api('/v3/documents', { containerTag:'memories', content:'Fresh eligible source', metadata:{sm_project_id:'log-project'} });
+  assert.equal(saved.status, 201); return saved.body.id;
+}
+
+scenario("profile facts respect source scope and empty scoped facts fall back to scoped memories", async f => {
+  const [inside, outside] = await f.seed(); f.env.AI_ENRICHMENT_MODE = 'off';
+  for (const [id, scope] of [[inside, 'private'], [outside, 'shared']]) {
+    f.db.prepare("UPDATE memories SET metadata_json=json_set(metadata_json,'$.sm_scope',?) WHERE id=?").run(scope,id);
+  }
+  insertProfileFact(f, 'outside-fact', outside, 'outside fact');
+  const fallback = await f.api('/v4/profile', {containerTag:'memories',filters:scopeFilters('private')});
+  assert.deepEqual(fallback.body.profile.dynamic, ['Verified source 0']);
+  insertProfileFact(f, 'inside-fact', inside, 'inside fact');
+  const scoped = await f.api('/v4/profile', {containerTag:'memories',filters:scopeFilters('private')});
+  assert.deepEqual(scoped.body.profile.dynamic, ['Source has inside fact']);
+  const shared = await f.api('/v4/profile', {containerTag:'memories',filters:scopeFilters('shared')});
+  assert.deepEqual(shared.body.profile.dynamic, ['Source has outside fact']);
+  const legacy = await f.api('/v4/profile', {containerTag:'memories'});
+  assert.deepEqual(new Set(legacy.body.profile.dynamic), new Set(['Source has inside fact','Source has outside fact']));
+});
+
+for (const optout of [false, 0]) scenario(`consolidation excludes opt-out ${JSON.stringify(optout)} from target counts and AI input`, async f => {
+  const [excluded, eligible] = await f.seed(); setRecallable(f, excluded, optout);
+  const result = await f.consolidate(); assert.equal(result.body.status, 'consolidated');
+  assert.deepEqual(result.body.sourceMemoryIds, [eligible]);
+  assert.ok(!f.calls[0].messages[1].content.includes('Verified source 0'));
+  assert.equal(f.db.prepare('SELECT is_forgotten FROM memories WHERE id=?').get(excluded).is_forgotten, 0);
+  assert.equal((await f.api(`/v3/documents/${excluded}`, undefined, 'GET')).status, 200);
+});
+scenario("all opt-out originals do not create a consolidation target", async f => {
+  const ids=await f.seed(); for(const id of ids) setRecallable(f,id,false);
+  assert.equal((await f.consolidate()).body.status,'no_unconsolidated_memories');
+  assert.equal(f.calls.length,0); assert.equal(f.active().length,0);
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM memory_consolidation_projects').get().n,0);
+});
+for (const subject of ['source','previous-source','previous-checkpoint']) scenario(`opt-out ${subject} during consolidation generation blocks publication`, async f => {
+  const [id]=await f.seed(); let previous;
+  if(subject!=='source') { previous=(await f.consolidate()).body; await f.drain(); await extraSource(f); }
+  f.respond(async()=>{ setRecallable(f,subject==='previous-checkpoint'?previous.memoryId:id,false); return output(checkpoint); });
+  assert.equal((await f.consolidate()).status,409); assert.equal(f.lease(),null);
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM memory_consolidations').get().n,previous?1:0);
+});
+for (const subject of ['source','checkpoint']) scenario(`legacy opt-out ${subject} invalidates previous checkpoint before AI carryforward`, async f => {
+  const [excluded,eligible]=await f.seed(); const first=(await f.consolidate()).body; await f.drain();
+  setRecallable(f,subject==='source'?excluded:first.memoryId,false); await extraSource(f);
+  const result=await f.consolidate(); assert.equal(result.body.status,'consolidated');
+  assert.equal(JSON.parse(f.calls.at(-1).messages[1].content).previousCheckpoint,null);
+  assert.equal(f.db.prepare('SELECT status FROM memory_consolidations WHERE id=?').get(first.consolidationId).status,'invalid');
+  assert.ok(result.body.sourceMemoryIds.includes(eligible));
+  if(subject==='source') assert.ok(!result.body.sourceMemoryIds.includes(excluded));
+});
+
+for (const subject of ['source-false','source-zero','checkpoint']) test(`0011 repairs persisted opt-out ${subject} checkpoint and permits clean recovery`, async()=>{
+  const f=fixture({beforeMigration:'0011_'});
+  try {
+    const [excluded,eligible]=await f.seed(); const first=(await f.consolidate()).body; await f.drain();
+    insertProfileFact(f,'repair-original',eligible,'original claim','superseded');
+    insertProfileFact(f,'repair-blocked',eligible,'still supported supersession','superseded');
+    insertProfileFact(f,'repair-synthetic',first.memoryId,'synthetic claim');
+    insertProfileFact(f,'repair-live',eligible,'live superseding claim');
+    const now=new Date().toISOString();
+    for(const [id,from,to,source] of [['repair-relation','repair-synthetic','repair-original',first.memoryId],['live-relation','repair-live','repair-blocked',eligible]]) {
+      f.db.prepare(`INSERT INTO fact_relations(id,container_tag,from_fact_id,relation,to_fact_id,source_memory_id,confidence,created_at)
+        VALUES (?,'memories',?,'supersedes',?,?,1,?)`).run(id,from,to,source,now);
+    }
+    setRecallable(f,subject==='checkpoint'?first.memoryId:excluded,subject==='source-zero'?0:false);
+    const original=f.db.prepare('SELECT * FROM memories WHERE id=?').get(excluded);
+    const membership=f.db.prepare('SELECT * FROM memory_consolidation_sources ORDER BY memory_id').all();
+    const migration=migrations.find(m=>m.name.startsWith('0011_')); assert.ok(migration);
+    f.db.exec(migration.sql);
+    const repaired=f.db.prepare('SELECT * FROM memories WHERE id=?').get(first.memoryId);
+    assert.equal(repaired.is_forgotten,1); assert.equal(repaired.status,'superseded');
+    assert.equal(repaired.vector_status,'pending'); assert.equal(repaired.vector_mutation_id,null); assert.equal(repaired.vector_attempted_at,null);
+    assert.equal(f.active().length,0);
+    assert.deepEqual(f.db.prepare('SELECT active_consolidation_id,initial_backfill_completed FROM memory_consolidation_projects').get(),{active_consolidation_id:null,initial_backfill_completed:0});
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM facts WHERE source_memory_id=?').get(first.memoryId).n,0);
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM memory_topics WHERE memory_id=?').get(first.memoryId).n,0);
+    assert.equal(f.db.prepare("SELECT status FROM facts WHERE id='repair-original'").get().status,'active');
+    assert.equal(f.db.prepare("SELECT status FROM facts WHERE id='repair-blocked'").get().status,'superseded');
+    assert.deepEqual(f.db.prepare('SELECT * FROM memories WHERE id=?').get(excluded),original);
+    assert.deepEqual(f.db.prepare('SELECT * FROM memory_consolidation_sources ORDER BY memory_id').all(),membership);
+    f.db.exec(migration.sql);
+    assert.deepEqual(f.db.prepare('SELECT * FROM memories WHERE id=?').get(first.memoryId),repaired);
+    assert.equal((await f.api(`/v3/documents/${excluded}`,undefined,'GET')).status,200);
+    f.env.AI_ENRICHMENT_MODE='off'; const deleted=[];
+    f.env.MEMORY_VECTORS.getByIds=async ids=>ids.map(id=>({id}));
+    f.env.MEMORY_VECTORS.deleteByIds=async ids=>{deleted.push(...ids);return {};};
+    worker.scheduled({cron:'*/15 * * * *',scheduledTime:Date.now()},f.env,f.ctx); await f.drain();
+    assert.ok(deleted.includes(first.memoryId));
+    const automatic=await f.api('/v3/search',{containerTag:'memories',indexOnly:true});
+    assert.ok(!automatic.body.results.some(m=>m.id===first.memoryId));
+    if(subject!=='checkpoint') assert.ok(!automatic.body.results.some(m=>m.id===excluded));
+    assert.notEqual((await f.api('/v4/enrich',{id:first.memoryId})).status,202);
+    f.env.AI_ENRICHMENT_MODE='on'; const rebuilt=await f.api('/v4/consolidate',{projectId:'log-project'});
+    assert.equal(rebuilt.body.status,'consolidated');
+    assert.equal(JSON.parse(f.calls.at(-1).messages[1].content).previousCheckpoint,null);
+    assert.ok(rebuilt.body.sourceMemoryIds.includes(eligible));
+    if(subject!=='checkpoint') assert.ok(!rebuilt.body.sourceMemoryIds.includes(excluded));
+    await f.drain();
+  } finally { await f.drain(); f.db.close(); }
+});
 
 
 

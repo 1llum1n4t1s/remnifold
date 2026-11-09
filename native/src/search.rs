@@ -368,7 +368,10 @@ pub fn document_index(doc: &Value, fallback_container: &str, terms: &[String]) -
     }
     if saved["recallable"] == false {
         index["recallable"] = json!(false)
-    } else if saved["recallable"] == true && text(&index["description"]).is_empty() {
+    } else if saved["recallable"] == true
+        && ((has_saved && saved["sourceKind"] == "organization")
+            || text(&index["description"]).is_empty())
+    {
         index["recallable"] = json!(true)
     }
     let container = choose(&[
@@ -1880,6 +1883,25 @@ mod tests {
                 output,
                 "request={request:?}"
             );
+        }
+    }
+    #[test]
+    fn authored_organization_recall_survives_index_reconstruction() {
+        for (version, kind, stored, expected) in [
+            (1, "organization", true, true),
+            (2, "organization", true, false),
+            (1, "conversation", true, false),
+            (1, "organization", false, false),
+        ] {
+            let document = json!({"id":"summary","content":"はい","metadata":{"memoryIndex":{
+                "version":version,"title":"OrganizationNative final conclusion","description":"はい",
+                "sections":["はい"],"sourceKind":kind,"recallable":stored}}});
+            let index = document_index(&document, "memories", &[]);
+            assert_eq!(index["recallable"], expected, "version={version}, kind={kind}, stored={stored}");
+            if version == 1 {
+                assert_eq!(index["description"], "はい");
+                assert_eq!(index["sections"], json!(["はい"]));
+            }
         }
     }
     #[test]

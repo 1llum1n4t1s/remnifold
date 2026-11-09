@@ -998,11 +998,11 @@ fn organization_contracts(
         .send()?
         .error_for_status()?;
     let source: Value = client.post(format!("{endpoint}/v3/documents"))
-        .bearer_auth(API_KEY).json(&json!({"containerTag":"memories","content":"OrganizationNative original evidence 😀","metadata":{"type":"conversation","sessionId":"organized-task"}}))
+        .bearer_auth(API_KEY).json(&json!({"containerTag":"memories","content":"OrganizationNative original evidence 😀","metadata":{"type":"conversation","sessionId":"organized-task","memoryIndex":{"version":1,"title":"OrganizationNative original evidence","description":"OrganizationNative retain the verified decision and evidence","sourceKind":"conversation","recallable":true}}}))
         .send()?.error_for_status()?.json()?;
     for n in 1..7 {
         client.post(format!("{endpoint}/v3/documents"))
-            .bearer_auth(API_KEY).json(&json!({"containerTag":"memories","content":format!("OrganizationNative original evidence {n} 😀"),"metadata":{"type":"conversation","sessionId":"organized-task"}}))
+            .bearer_auth(API_KEY).json(&json!({"containerTag":"memories","content":format!("OrganizationNative original evidence {n} 😀"),"metadata":{"type":"conversation","sessionId":"organized-task","memoryIndex":{"version":1,"title":"OrganizationNative original evidence","description":"OrganizationNative retain the verified decision and evidence","sourceKind":"conversation","recallable":true}}}))
             .send()?.error_for_status()?;
     }
     let invoke = |action: &str, body: Value| -> Result<Value> {
@@ -1025,7 +1025,8 @@ fn organization_contracts(
     let selected = batch["sources"]
         .as_array()
         .context("organization sources")?;
-    let commit = json!({"batchId":batch["batchId"],"summaries":[{"ref":"final","title":"OrganizationNative final conclusion","topic":"OrganizationNative","content":"OrganizationNative selected the validated approach because the original evidence supports it. 😀","sources":selected.iter().map(|s| s["id"].clone()).collect::<Vec<_>>()}],
+    ensure!(selected.iter().all(|s| s["recallClass"] == "automatic"), "organization automatic source partition");
+    let commit = json!({"batchId":batch["batchId"],"summaries":[{"ref":"final","title":"OrganizationNative final conclusion","topic":"OrganizationNative","content":"はい","sources":selected.iter().map(|s| s["id"].clone()).collect::<Vec<_>>()}],
         "coverage":selected.iter().map(|s| json!({"id":s["id"],"revision":s["revision"],"status":"complete","summaries":["final"]})).collect::<Vec<_>>()});
     let published = invoke("commit", commit.clone())?;
     ensure!(
@@ -1064,6 +1065,19 @@ fn organization_contracts(
         json!({"name":"getDocument","arguments":{"documentId":summary_id}}),
     )?;
     ensure!(preview["isError"] != true, "organization summary retrieval");
+    ensure!(preview["structuredContent"]["document"]["index"]["recallable"] == true
+        && preview["structuredContent"]["document"]["content"] == "はい",
+        "organization authored summary retains its index and body");
+    let recall_home = home.join("organization-authored-recall");
+    fs::create_dir_all(&recall_home)?;
+    fs::write(recall_home.join("remnifold.json"), serde_json::to_vec(
+        &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"maxMemories":5,"minimumSimilarity":0.7}),
+    )?)?;
+    let recalled = hook(binary, &recall_home, project, endpoint, "UserPromptSubmit",
+        json!({"session_id":"organization-authored-new-task","cwd":project,"prompt":"OrganizationNative"}))?;
+    let context = recalled["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+    ensure!(context.contains(summary_id) && !context.contains(source["id"].as_str().context("source ID")?),
+        "organization authored summary survives real automatic recall while its original is hidden");
     let first = &preview["structuredContent"]["document"]["organizationSources"];
     ensure!(
         first["sources"].as_array().is_some_and(|s| s.len() == 5) && first["hasMore"] == true,

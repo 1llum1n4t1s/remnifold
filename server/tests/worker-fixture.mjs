@@ -17,10 +17,12 @@ export function scenarioWithLogs(name, run) { test(name, async () => {
  try { await run(f, logs); } catch(error) { original.error(JSON.stringify({test:name,events:logs})); throw error; } finally { await f.drain(); Object.assign(console,original); f.db.close(); }
 }); }
 
-export function fixture() {
+export function fixture({ beforeMigration } = {}) {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  applyMigrations(db);
+  if (beforeMigration) {
+    for (const migration of migrations) if (migration.name < beforeMigration) db.exec(migration.sql);
+  } else applyMigrations(db);
   const DB = adapter(db);
   const waits = [];
   const ctx = { waitUntil(promise) { waits.push(Promise.resolve(promise).then(() => ({ status: "fulfilled" }), (error) => ({ status: "rejected", error: String(error) }))); } };
