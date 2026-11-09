@@ -1476,6 +1476,124 @@ pub fn run(
 pub fn bootstrap_tests(repo: &Path, work: &Path, binary: &Path, archive: &Path) -> Result<()> {
     run_suite(repo, None, work, binary, archive, None, None, true)
 }
+
+#[cfg(test)]
+mod bootstrap_shell_contract {
+    use std::process::Command;
+
+    #[test]
+    fn bootstrap_shell_modes_keep_publication_independent_of_installation() {
+        let source = include_str!("../../scripts/bootstrap-plugin.sh").replace("\r\n", "\n");
+        let download_guard = source
+            .split_once("if [ \"$download_only\" = 1 ]; then")
+            .expect("download-only guard")
+            .1
+            .split_once("\nmember=")
+            .expect("extraction boundary")
+            .0;
+        let delegation = source
+            .split_once("printf '%s\\n' \"Verified $target archive")
+            .expect("verified archive boundary")
+            .1
+            .split_once('\n')
+            .expect("verified archive message")
+            .1;
+        assert!(download_guard.contains(".truncated == false and (.tree | type) == \"array\""));
+        assert!(
+            download_guard
+                .contains(".type == \"blob\" and .path == \"native/src/updater/bootstrap.rs\"")
+        );
+        let bash = if cfg!(windows) {
+            "C:/Program Files/Git/bin/bash.exe"
+        } else {
+            "bash"
+        };
+        for (apply, download, capability, version, expected) in [
+            ("0", "0", "true", "1.0.20", vec!["plugin-bootstrap"]),
+            (
+                "1",
+                "0",
+                "false",
+                "1.0.17",
+                vec!["plugin-update", "plugin-update", "plugin-update"],
+            ),
+            ("0", "1", "true", "1.0.20", vec![]),
+            ("0", "1", "false", "1.0.17", vec![]),
+            ("0", "0", "false", "1.0.17", vec![]),
+            ("0", "0", "truncated", "1.0.20", vec![]),
+        ] {
+            // 検証済みアーカイブ以降だけを実行し、実バイナリ・Codex・通信を呼ばない。
+            let script = format!(
+                "set -euo pipefail\napply=$1; download_only=$2; capability=$3\nversion=$4; commit=authenticated-release-commit\nsession='/private/work root'\narchive=verified.tar.gz\nbinary='/private/verified binary'\nquery() {{ [ \"$1\" = \"git/trees/$commit?recursive=1\" ]; [ \"$capability\" != truncated ] || fail 'subprocess failed (diagnostics retained)'; value=$capability; }}\nfail() {{ printf '%s\\n' \"Bootstrap rejected: $1\" >&2; exit 1; }}\nrun_bound() {{ shift 3; printf 'CALL'; printf '<%s>' \"$@\"; printf '\\n'; }}\nif [ \"$download_only\" = 1 ]; then{download_guard}\n{delegation}"
+            );
+            let output = Command::new(bash)
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    &script,
+                    "bootstrap-test",
+                    apply,
+                    download,
+                    capability,
+                    version,
+                ])
+                .output()
+                .expect("Bash is required for bootstrap shell contract checks");
+            if capability == "truncated" {
+                assert_eq!(output.status.code(), Some(1));
+                assert!(output.stdout.is_empty());
+                assert_eq!(
+                    String::from_utf8(output.stderr).unwrap(),
+                    "Bootstrap rejected: subprocess failed (diagnostics retained)\n"
+                );
+                continue;
+            }
+            if apply == "0" && download == "0" && capability == "false" {
+                assert_eq!(output.status.code(), Some(1));
+                assert!(output.stdout.is_empty());
+                assert_eq!(
+                    String::from_utf8(output.stderr).unwrap(),
+                    "Bootstrap rejected: release lacks native publication checking; use --download-only or a trusted current native plugin-bootstrap with --version set to this release\n"
+                );
+                continue;
+            }
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let calls: Vec<_> = stdout
+                .lines()
+                .filter(|line| line.starts_with("CALL"))
+                .collect();
+            assert_eq!(calls.len(), expected.len(), "{stdout}");
+            for (call, command) in calls.iter().zip(expected) {
+                assert!(call.starts_with(&format!("CALL</private/verified binary><{command}><--version><{version}><--work-root></private/work root/update>")), "{call}");
+            }
+            if apply == "1" {
+                for (call, mode) in
+                    calls
+                        .iter()
+                        .zip(["--check-published", "--apply", "--verify-only"])
+                {
+                    assert!(call.ends_with(&format!("<{mode}>")), "{call}");
+                }
+            } else if download == "0" {
+                assert!(
+                    calls[0].ends_with("</private/work root/update>"),
+                    "{stdout}"
+                );
+            } else {
+                assert!(
+                    stdout.contains("Verified archive: verified.tar.gz"),
+                    "{stdout}"
+                );
+            }
+        }
+    }
+}
 fn run_suite(
     repo: &Path,
     tools: Option<&Toolchain>,

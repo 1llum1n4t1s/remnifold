@@ -216,6 +216,10 @@ run_bound 134217728 150 "$archive" download_archive
 if [ "$hash_tool" = sha256sum ]; then actual=$(sha256sum "$archive"); else actual=$(shasum -a 256 "$archive"); fi
 [ "${actual%% *}" = "$selected_hash" ] || fail 'archive SHA-256'
 if [ "$download_only" = 1 ]; then printf '%s\n' "Verified archive: $archive"; exit 0; fi
+if [ "$apply" = 0 ]; then
+  query "git/trees/$commit?recursive=1" 'if .truncated == false and (.tree | type) == "array" then any(.tree[]; .type == "blob" and .path == "native/src/updater/bootstrap.rs") else error("bootstrap capability tree") end'
+  [ "$value" = true ] || fail 'release lacks native publication checking; use --download-only or a trusted current native plugin-bootstrap with --version set to this release'
+fi
 member=remnifold/bin/remnifold
 run_bound 1024 60 "$session/member.txt" tar -tzf "$archive" "$member"
 [ "$(cat "$session/member.txt")" = "$member" ] || fail 'executable member must be unique'
@@ -227,10 +231,13 @@ run_bound 134217728 120 "$binary" tar -xOzf "$archive" "$member"
 [ -s "$binary" ] || fail 'empty executable'
 chmod 700 "$binary"
 printf '%s\n' "Verified $target archive from CI $witness_run attempt $witness_attempt, publisher job $job."
-run_bound 1048576 600 "$session/check-published.txt" "$binary" plugin-update --version "$version" --work-root "$session/update" --check-published
 if [ "$apply" = 1 ]; then
+  run_bound 1048576 600 "$session/check-published.txt" "$binary" plugin-update --version "$version" --work-root "$session/update" --check-published
   run_bound 1048576 600 "$session/apply.txt" "$binary" plugin-update --version "$version" --work-root "$session/update" --apply
   run_bound 1048576 600 "$session/verify-only.txt" "$binary" plugin-update --version "$version" --work-root "$session/update" --verify-only
   printf '%s\n' 'Installation verified. Start a new Codex task and review the current hook trust settings.'
   printf '%s\n' "Keep the verification receipt under $session/update for verification without retained R2 objects or CI logs; GitHub access remains required."
-else printf '%s\n' 'Publication verified; installation was not changed and no verification receipt was created. Use --apply to install.'; fi
+else
+  run_bound 1048576 600 "$session/check-published.txt" "$binary" plugin-bootstrap --version "$version" --work-root "$session/update"
+  printf '%s\n' 'Publication verified; installation was not changed and no verification receipt was created. Use --apply to install.'
+fi
