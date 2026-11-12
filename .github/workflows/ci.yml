@@ -73,10 +73,8 @@ jobs:
       - name: Configure isolated output directories
         run: |
           set -euo pipefail
-          # 作業ルートは全OSでランナー既定の一時フォルダー（$RUNNER_TEMP）配下に置き、特定ドライブへ固定しない。
-          # Windows の $RUNNER_TEMP はバックスラッシュ区切りのため、以降の "/" 連結と揃えるよう cygpath -m で正規化する。
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            root="$(cygpath -m "$RUNNER_TEMP")/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+            root="D:/Codex/remnifold/ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
             executable=.exe
           else
             root="$RUNNER_TEMP/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
