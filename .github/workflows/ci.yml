@@ -73,8 +73,10 @@ jobs:
       - name: Configure isolated output directories
         run: |
           set -euo pipefail
+          # 作業ルートは全OSでランナー既定の一時フォルダー（$RUNNER_TEMP）配下に置き、特定ドライブへ固定しない。
+          # Windows の $RUNNER_TEMP はバックスラッシュ区切りのため、以降の "/" 連結と揃えるよう cygpath -m で正規化する。
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            root="D:/Codex/remnifold/ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+            root="$(cygpath -m "$RUNNER_TEMP")/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
             executable=.exe
           else
             root="$RUNNER_TEMP/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
@@ -190,13 +192,12 @@ jobs:
     name: publish-r2
     needs: native-package
     if: >-
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       needs.native-package.result == 'success' &&
       github.event_name == 'push' &&
       github.repository == '1llum1n4t1s/remnifold' &&
       github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) &&
       startsWith(github.ref, 'refs/heads/release/')
-    runs-on: [self-hosted, Linux, ARM64, m3mb14]
+    runs-on: ubuntu-latest
     environment: r2-release
     timeout-minutes: 30
     permissions:
