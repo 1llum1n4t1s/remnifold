@@ -69,19 +69,22 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - name: Install locked Rust toolchain
         # Bootstrap uses the hosted runner's managed TEMP until isolation is configured.
-        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
+        run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
       - name: Configure isolated output directories
         run: |
           set -euo pipefail
+          # Windows の updater fixture は D:/Claude/remnifold 配下の作業ルートだけを受け付ける
+          # （dev/src/updater_e2e.rs の validate_work_root）。$RUNNER_TEMP（D:/a/_temp）では拒否されるため、
+          # Windows だけ同じ D: ドライブ上の固定接頭辞へ run/attempt/target 別に置く。Unix は $RUNNER_TEMP のまま。
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            root="D:/Codex/remnifold/ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+            root="D:/Claude/remnifold/ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
             executable=.exe
           else
             root="$RUNNER_TEMP/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
             executable=
           fi
           export CI_ROOT="$root"
-          rustup run 1.99.1 rustc --edition 2024 dev/src/ci_runner.rs -o "$RUNNER_TEMP/remnifold-ci-paths.exe"
+          rustup run 1.100.0 rustc --edition 2024 dev/src/ci_runner.rs -o "$RUNNER_TEMP/remnifold-ci-paths.exe"
           "$RUNNER_TEMP/remnifold-ci-paths.exe" ensure-directory "$root"
           mkdir -p "$root/tmp" "$root/tools" "$root/validation" "$root/guard"
           {
@@ -237,7 +240,7 @@ jobs:
             printf 'TEMP=%s/tmp\nTMP=%s/tmp\nTMPDIR=%s/tmp\n' "$root" "$root" "$root"
           } >> "$GITHUB_ENV"
       - name: Install locked Rust toolchain
-        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
+        run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
       - name: Require the release branch to match package version
         run: cargo xtask ci-release-branch
       - name: Verify all staged targets and publish immutable R2 release

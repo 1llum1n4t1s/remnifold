@@ -104,9 +104,9 @@ mod tests {
         assert!(workflow.contains("remnifold-ci-paths.exe\" reports \"$CI_ROOT/validation\""));
         assert!(workflow.contains("cargo xtask ci-release-branch"));
         assert!(!workflow.contains("shell: 'remnifold_ci.exe"));
-        let install = workflow.find("rustup toolchain install 1.99.1").unwrap();
+        let install = workflow.find("rustup toolchain install 1.100.0").unwrap();
         let helper = workflow
-            .find("rustup run 1.99.1 rustc --edition 2024 dev/src/ci_runner.rs")
+            .find("rustup run 1.100.0 rustc --edition 2024 dev/src/ci_runner.rs")
             .unwrap();
         let configure = workflow
             .find("remnifold-ci-paths.exe\" ensure-directory")
