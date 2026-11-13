@@ -74,8 +74,9 @@ fn arguments(argv: &[String]) -> Result<BTreeMap<String, String>> {
 }
 
 fn default_work_root() -> Result<PathBuf> {
+    // Windows は利用者ごとの %LOCALAPPDATA%\remnifold\bootstrap を使い、特定のドライブを前提にしない。
     #[cfg(windows)]
-    let path = PathBuf::from("D:/Claude/remnifold/bootstrap");
+    let path = default_work_parent()?.join("bootstrap");
     #[cfg(not(windows))]
     let path = fs::canonicalize(env::temp_dir())?.join("remnifold-bootstrap");
     ensure!(path.is_absolute(), "INVALID_WORK_ROOT");
@@ -116,11 +117,6 @@ fn bootstrap(argv: &[String]) -> Result<Value> {
     }
     let version = &args["--version"];
     let work = absolute(&args["--work-root"])?;
-    #[cfg(windows)]
-    ensure!(
-        within(&absolute("D:/Claude/remnifold")?, &work),
-        "INVALID_WORK_ROOT"
-    );
     let config: Value = if let Some(path) = args.get("--config") {
         serde_json::from_slice(&fs::read(absolute(path)?)?)?
     } else {
@@ -357,7 +353,10 @@ mod tests {
         let path = default_work_root().unwrap();
         assert!(path.is_absolute());
         #[cfg(windows)]
-        assert_eq!(path, PathBuf::from("D:/Claude/remnifold/bootstrap"));
+        assert_eq!(
+            path,
+            PathBuf::from(env::var_os("LOCALAPPDATA").unwrap()).join("remnifold/bootstrap")
+        );
         #[cfg(not(windows))]
         {
             assert_eq!(

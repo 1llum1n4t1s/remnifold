@@ -411,11 +411,6 @@ pub fn run(repo: &Path, args: &[String]) -> Result<()> {
     crate::package::safe_path(&root)?;
     let codex_home = codex_home()?;
     publication_roots(repo, &root, &codex_home)?;
-    #[cfg(windows)]
-    ensure!(
-        root.starts_with("D:/Claude/remnifold"),
-        "Bootstrap work root must be under D:/Claude/remnifold"
-    );
     let _root_guard = private_work::PrivateWorkGuard::open(&root)?;
     publication_roots(repo, &root, &codex_home)?;
     let invocation = root.join(format!("bootstrap-release-{}", uuid::Uuid::new_v4()));

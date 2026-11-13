@@ -63,6 +63,21 @@ fn home() -> Result<PathBuf> {
             .ok_or_else(|| anyhow::anyhow!("HOME_MISSING"))?,
     ))
 }
+/// 作業ルートを省略したときの親フォルダ。
+/// Windows は利用者ごとの `%LOCALAPPDATA%\remnifold`、それ以外は `~/.cache/remnifold`。
+/// どの利用者・ドライブ構成でも存在する場所だけを使い、特定の環境のフォルダを前提にしない。
+/// 明示した `--work-root` はリポジトリ・プラグイン・Codex home の外であることなどを別途検証する。
+pub(crate) fn default_work_parent() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let base = match env::var_os("LOCALAPPDATA") {
+        Some(path) => PathBuf::from(path),
+        None => home()?.join("AppData/Local"),
+    };
+    #[cfg(not(windows))]
+    let base = home()?.join(".cache");
+    ensure!(base.is_absolute(), "INVALID_WORK_ROOT");
+    Ok(base.join("remnifold"))
+}
 fn absolute(value: &str) -> Result<PathBuf> {
     let expanded = if let Some(suffix) = value.strip_prefix("~/") {
         home()?.join(suffix)
@@ -1345,16 +1360,11 @@ fn update(argv: &[String]) -> Result<Value> {
             .ok_or_else(|| anyhow::anyhow!("INVALID_CONFIG"))?,
     )?;
     let codex_home = absolute(&env::var("CODEX_HOME").unwrap_or_else(|_| "~/.codex".into()))?;
-    let default_work = if cfg!(windows) {
-        format!("D:/Claude/remnifold/plugin-auto-update-{version}")
-    } else {
-        format!("~/.cache/remnifold/plugin-auto-update-{version}")
+    // 既定の作業ルートは利用者ごとの場所に置き、特定のドライブやフォルダ構成を前提にしない。
+    let work = match args.get("--work-root") {
+        Some(path) => absolute(path)?,
+        None => default_work_parent()?.join(format!("plugin-auto-update-{version}")),
     };
-    let work = absolute(
-        args.get("--work-root")
-            .map(String::as_str)
-            .unwrap_or(&default_work),
-    )?;
     ensure!(
         !within(&source, &work)
             && !within(&work, &source)
@@ -1363,11 +1373,6 @@ fn update(argv: &[String]) -> Result<Value> {
             && !work
                 .ancestors()
                 .any(|ancestor| ancestor.join(".git").exists()),
-        "INVALID_WORK_ROOT"
-    );
-    #[cfg(windows)]
-    ensure!(
-        within(&absolute("D:/Claude/remnifold")?, &work),
         "INVALID_WORK_ROOT"
     );
     no_links(&work, true)?;

@@ -304,11 +304,6 @@ pub fn smoke(args: &[String]) -> Result<()> {
         !root.starts_with(repo()),
         "Smoke work root must be external"
     );
-    #[cfg(windows)]
-    ensure!(
-        root.starts_with("D:/Claude/remnifold"),
-        "Smoke work root outside allowed directory"
-    );
     fs::create_dir_all(&root)?;
     let nonce = uuid::Uuid::new_v4().to_string();
     let key = format!("validation/{nonce}+build.json");
@@ -1311,11 +1306,6 @@ pub fn publish(args: &[String]) -> Result<()> {
     ensure!(
         !root.starts_with(repo()),
         "Publication work root must be external"
-    );
-    #[cfg(windows)]
-    ensure!(
-        root.starts_with("D:/Claude/remnifold"),
-        "Publication work root outside allowed directory"
     );
     fs::create_dir_all(&root)?;
     let invocation = root.join(format!("publisher-{}", uuid::Uuid::new_v4()));

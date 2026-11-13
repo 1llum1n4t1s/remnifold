@@ -52,12 +52,12 @@ For an existing `remnifold@personal` installation, use the native executable's `
 Run these commands from the extracted plugin folder, using the same published version and work root for all three steps:
 
 ```sh
-./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Claude/remnifold/plugin-update --check-published
-./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Claude/remnifold/plugin-update --apply
-./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Claude/remnifold/plugin-update --verify-only
+./bin/remnifold.exe plugin-update --version <published-version> --work-root "$LOCALAPPDATA/remnifold/plugin-update" --check-published
+./bin/remnifold.exe plugin-update --version <published-version> --work-root "$LOCALAPPDATA/remnifold/plugin-update" --apply
+./bin/remnifold.exe plugin-update --version <published-version> --work-root "$LOCALAPPDATA/remnifold/plugin-update" --verify-only
 ```
 
-On macOS and Linux, use `./bin/remnifold` and an absolute external work directory. On every platform, keep the work root outside the repository, plugin source, and Codex home, with no linked ancestors; Windows requires a child of `D:/Claude/remnifold`. Keep the `verified-<commit>-<target>.json` receipt in that work root for later verification. Connection and capture state are preserved; a new task is still required to load the updated plugin.
+On macOS and Linux, use `./bin/remnifold` and an absolute external work directory. On every platform, keep the work root outside the repository, plugin source, and Codex home, with no linked ancestors. Any such absolute directory works; on Windows the default is `%LOCALAPPDATA%\remnifold`. Keep the `verified-<commit>-<target>.json` receipt in that work root for later verification. Connection and capture state are preserved; a new task is still required to load the updated plugin.
 
 An older client cannot discover the R2 distribution itself. Windows uses the native `plugin-bootstrap` command. Choose a published release that includes both this command and the `remnifold-bootstrap-x86_64-pc-windows-msvc.exe` GitHub Release asset. Releases predating that asset can still be reached from a trusted Rust source build; an unverified executable downloaded from R2 is not a bootstrap trust root.
 
@@ -71,7 +71,7 @@ bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
 gh release verify "$tag" --repo "$repo" &&
 gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
 gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" plugin-bootstrap --version "$version" --work-root D:/Claude/remnifold/bootstrap
+"$bootstrap" plugin-bootstrap --version "$version"
 ```
 
 The release and local asset must both pass GitHub's signature verification before execution. Do not substitute an unverified R2 helper or bypass a failed verification. The bootstrap then independently checks the exact GitHub CI publisher-log witness, R2 manifest, release commit, archive size and digest. It does not require an installed plugin for publication checking or download-only mode. The default checks publication; add `--apply` only to migrate an existing registered installation, followed by receipt verification. For an unregistered installation, use `--download-only` and the official registration procedure below. Legacy `-Version`, `-WorkRoot`, `-Apply`, and `-DownloadOnly` argument names remain readable by the native command.

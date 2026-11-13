@@ -73,16 +73,16 @@ jobs:
       - name: Configure isolated output directories
         run: |
           set -euo pipefail
-          # Windows の updater fixture は D:/Claude/remnifold 配下の作業ルートだけを受け付ける
-          # （dev/src/updater_e2e.rs の validate_work_root）。$RUNNER_TEMP（D:/a/_temp）では拒否されるため、
-          # Windows だけ同じ D: ドライブ上の固定接頭辞へ run/attempt/target 別に置く。Unix は $RUNNER_TEMP のまま。
+          # 全 OS で $RUNNER_TEMP 配下に run/attempt/target 別の作業ルートを置く。特定のドライブやフォルダは前提にしない。
+          # Windows は後段のパス比較と揃えるため、cygpath -m で区切りを / にした絶対パスへ変える。
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            root="D:/Claude/remnifold/ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+            temp="$(cygpath -m "$RUNNER_TEMP")"
             executable=.exe
           else
-            root="$RUNNER_TEMP/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+            temp="$RUNNER_TEMP"
             executable=
           fi
+          root="$temp/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
           export CI_ROOT="$root"
           rustup run 1.100.0 rustc --edition 2024 dev/src/ci_runner.rs -o "$RUNNER_TEMP/remnifold-ci-paths.exe"
           "$RUNNER_TEMP/remnifold-ci-paths.exe" ensure-directory "$root"

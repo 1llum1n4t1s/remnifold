@@ -2147,17 +2147,16 @@ fn run_suite(
     Ok(())
 }
 
+// 作業ルートは絶対パスで、リポジトリ・プラグイン・Codex home の外にあればよい。
+// 特定のドライブやフォルダ構成を前提にせず、どの利用者・CI ランナーでも同じ条件で検証する。
 pub fn validate_work_root(repo: &Path, work: &Path) -> Result<()> {
+    // Windows のパス比較用キー（区切りを / に揃え、大小文字と `\\?\` 接頭辞の違いを無視する）。
     #[cfg(windows)]
     fn key(path: &Path) -> String {
         let value = path.to_string_lossy().replace('\\', "/").to_lowercase();
         value.strip_prefix("//?/").unwrap_or(&value).to_owned()
     }
-    #[cfg(windows)]
-    ensure!(
-        work.is_absolute() && key(work).starts_with("d:/claude/remnifold/"),
-        "Windows updater fixture root must be under D:/Claude/remnifold"
-    );
+    ensure!(work.is_absolute(), "updater fixture root must be absolute");
     safe_path(work)?;
     let normalized = |path: &Path| -> Result<PathBuf> {
         let absolute = std::path::absolute(path)?;

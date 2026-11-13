@@ -335,14 +335,16 @@ fn build_native(
     }
     run_command(&mut command, "native build")
 }
+// 検証出力の既定は OS の一時フォルダ。特定のドライブやフォルダ構成を前提にしない。
+// Windows は canonicalize すると `\\?\` 付きになり後段のパス検査と相性が悪いため、temp_dir をそのまま使う。
 fn default_work() -> Result<PathBuf> {
+    let temp = std::env::temp_dir();
     Ok(if cfg!(windows) {
-        PathBuf::from("D:/Claude/remnifold/validation")
+        temp
     } else {
-        std::env::temp_dir()
-            .canonicalize()?
-            .join("remnifold-validation")
-    })
+        temp.canonicalize()?
+    }
+    .join("remnifold-validation"))
 }
 fn native_tests(repo: &Path, tools: &tools::Toolchain, work: &Path) -> Result<()> {
     let isolated = work.join(format!("n-{}", uuid::Uuid::new_v4().simple()));
