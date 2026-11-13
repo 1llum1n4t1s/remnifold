@@ -260,7 +260,7 @@ fn install(argv: &[String]) -> Result<Value> {
         &receipt_path,
         &serde_json::to_vec_pretty(&published.receipt)?,
     )?;
-    let replaced = place_executable(
+    let placement = place_executable(
         &executable_path,
         published
             .files
@@ -273,7 +273,7 @@ fn install(argv: &[String]) -> Result<Value> {
         &serde_json::to_vec_pretty(&current)?,
     )?;
     let mut result = published.evidence;
-    result["status"] = json!(if fresh || replaced {
+    result["status"] = json!(if fresh || placement != Placement::Unchanged {
         "installed"
     } else {
         "already-current"
@@ -281,7 +281,9 @@ fn install(argv: &[String]) -> Result<Value> {
     result["files"] = json!(wanted.len());
     result["installRoot"] = json!(app);
     result["executable"] = json!(executable_path);
-    result["restartRequired"] = json!(replaced);
+    // 起動中のプロセスが旧版を使い続けるのは、既存の実行ファイルを置き換えたときだけ。
+    // 初回の配置では古い実行ファイルが無いので、再起動は不要。
+    result["restartRequired"] = json!(placement == Placement::Replaced);
     Ok(result)
 }
 
@@ -305,8 +307,19 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 固定の実行ファイルを、検証済みの内容へ置き換える。同じ内容なら何もしない（false）。
-fn place_executable(target: &Path, bytes: &[u8]) -> Result<bool> {
+/// 固定の実行ファイルの配置結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    /// 既に同じ内容で、何もしていない。
+    Unchanged,
+    /// 実行ファイルが無かったので新しく置いた（起動中の旧版は存在しない）。
+    Created,
+    /// 既存の実行ファイルを置き換えた（起動中のプロセスは再起動まで旧版のまま）。
+    Replaced,
+}
+
+/// 固定の実行ファイルを、検証済みの内容へ置き換える。
+fn place_executable(target: &Path, bytes: &[u8]) -> Result<Placement> {
     let directory = target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("INVALID_INSTALL_ROOT"))?;
@@ -314,7 +327,7 @@ fn place_executable(target: &Path, bytes: &[u8]) -> Result<bool> {
     no_links(target, true)?;
     if fs::read(target).is_ok_and(|current| current == bytes) {
         cleanup_retired(directory);
-        return Ok(false);
+        return Ok(Placement::Unchanged);
     }
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let incoming = directory.join(format!(".remnifold-{suffix}.new"));
@@ -336,7 +349,8 @@ fn place_executable(target: &Path, bytes: &[u8]) -> Result<bool> {
         fs::read(&incoming)? == bytes,
         "INSTALL_COPY_VERIFICATION_FAILED"
     );
-    if target.exists() {
+    let existed = target.exists();
+    if existed {
         // 起動中でも名前の変更はできる。退避名へ移してから新しいファイルを置く。
         let retired = directory.join(format!(".remnifold-{suffix}.old"));
         fs::rename(target, &retired)?;
@@ -348,7 +362,11 @@ fn place_executable(target: &Path, bytes: &[u8]) -> Result<bool> {
         fs::rename(&incoming, target)?;
     }
     cleanup_retired(directory);
-    Ok(true)
+    Ok(if existed {
+        Placement::Replaced
+    } else {
+        Placement::Created
+    })
 }
 
 /// 退避した旧実行ファイルを、使われていないものだけ片付ける（起動中なら次回に回す）。
@@ -387,11 +405,21 @@ mod tests {
     fn executable_placement_is_idempotent_and_replaces_by_rename() {
         let root = env::temp_dir().join(format!("remnifold-install-{}", uuid::Uuid::new_v4()));
         let target = root.join("bin").join("remnifold.bin");
-        assert!(place_executable(&target, b"one").unwrap());
-        assert!(!place_executable(&target, b"one").unwrap());
+        // 初回の配置は再起動不要の Created、同じ内容なら Unchanged。
+        assert_eq!(
+            place_executable(&target, b"one").unwrap(),
+            Placement::Created
+        );
+        assert_eq!(
+            place_executable(&target, b"one").unwrap(),
+            Placement::Unchanged
+        );
         // 置き換え中のファイルを開いたままでも（Windows で起動中の実行ファイルと同じく）置き換えられる。
         let held = fs::File::open(&target).unwrap();
-        assert!(place_executable(&target, b"two").unwrap());
+        assert_eq!(
+            place_executable(&target, b"two").unwrap(),
+            Placement::Replaced
+        );
         assert_eq!(fs::read(&target).unwrap(), b"two");
         drop(held);
         cleanup_retired(&root.join("bin"));

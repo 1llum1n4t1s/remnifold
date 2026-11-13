@@ -629,7 +629,9 @@ fn bootstrap_case(f: &Fixture, fault: &str, scenarios: &mut Vec<&'static str>) -
         }
         let applied = f.bootstrap(&["--apply"], None)?;
         ensure!(
-            applied["exitCode"] == 0 && applied["status"] == "installed",
+            applied["exitCode"] == 0
+                && applied["status"] == "installed"
+                && applied["restartRequired"] == false,
             "bootstrap apply failed: {applied}"
         );
         f.installed()?;
@@ -1114,7 +1116,14 @@ fn r2_cases(
                 fs::create_dir_all(f.app().join("bin"))?;
                 fs::write(f.app().join("bin/.remnifold-interrupted.old"), b"old")?;
             }
-            f.success("--apply", "installed")?;
+            let first = f.run("--apply", None, false)?;
+            // 初回の導入では置き換える実行ファイルが無いので、再起動は不要と返す。
+            ensure!(
+                first["exitCode"] == 0
+                    && first["status"] == "installed"
+                    && first["restartRequired"] == false,
+                "first install result: {first}"
+            );
             f.installed()?;
             if fault == "recovery" {
                 ensure!(
