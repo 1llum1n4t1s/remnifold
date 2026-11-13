@@ -331,8 +331,12 @@ impl RecallState {
             .unwrap_or(0);
         for entry in buffer[..complete].split(|&b| b == b'\n') {
             if let Ok(row) = serde_json::from_slice::<Value>(entry) {
+                // Codex の圧縮行に加え、Claude Code の圧縮境界・要約行でも注入済み記録を忘れ、
+                // 圧縮で消えた索引を次の依頼で再注入できるようにする。
                 if row["type"] == "compacted"
                     || row["type"] == "event_msg" && row["payload"]["type"] == "context_compacted"
+                    || row["type"] == "system" && row["subtype"] == "compact_boundary"
+                    || row["type"] == "user" && row["isCompactSummary"] == true
                 {
                     state["documents"] = json!({});
                 }

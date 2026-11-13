@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod claude_transcript;
 pub mod common;
 pub mod embedded;
 pub mod hooks;

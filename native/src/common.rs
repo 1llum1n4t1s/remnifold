@@ -256,14 +256,24 @@ fn normalize_remote(raw: &str) -> String {
     normalized.to_lowercase()
 }
 
-pub fn get_project_context(cwd: &Path) -> Result<Value> {
+// 作業ディレクトリが属するリポジトリの最上位。Git 管理外なら作業ディレクトリ自身の絶対パス。
+fn project_root(cwd: &Path) -> Result<PathBuf> {
     let git_root = git(&["rev-parse", "--show-toplevel"], cwd);
-    let root = if git_root.is_empty() {
+    Ok(if git_root.is_empty() {
         absolute_path(cwd)?
     } else {
         PathBuf::from(git_root)
-    };
-    let remote = normalize_remote(&git(&["remote", "get-url", "origin"], &root));
+    })
+}
+
+pub fn get_project_context(cwd: &Path) -> Result<Value> {
+    Ok(project_context_at(&project_root(cwd)?))
+}
+
+// 解決済みの最上位からプロジェクト名と containerTag を求める。
+// 読み取り文脈でも同じ最上位を使うため、git の子プロセスを重ねて起動しないよう分けている。
+fn project_context_at(root: &Path) -> Value {
+    let remote = normalize_remote(&git(&["remote", "get-url", "origin"], root));
     let name_source = if remote.is_empty() {
         root.to_string_lossy().into_owned()
     } else {
@@ -315,19 +325,12 @@ pub fn get_project_context(cwd: &Path) -> Result<Value> {
     } else {
         project
     };
-    Ok(
-        json!({"projectName":display,"containerTag":format!("repo_{provenance}__{}",&sha256(identity)[..16])}),
-    )
+    json!({"projectName":display,"containerTag":format!("repo_{provenance}__{}",&sha256(identity)[..16])})
 }
 
 pub fn get_read_context(cwd: &Path, settings: &Value) -> Result<Value> {
-    let mut project = get_project_context(cwd)?;
-    let git_root = git(&["rev-parse", "--show-toplevel"], cwd);
-    let root = if git_root.is_empty() {
-        absolute_path(cwd)?
-    } else {
-        PathBuf::from(git_root)
-    };
+    let root = project_root(cwd)?;
+    let mut project = project_context_at(&root);
     let hash = &sha256(root.to_string_lossy().as_bytes())[..16];
     let mut identity = git(&["config", "user.email"], &root);
     if identity.is_empty() {

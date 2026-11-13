@@ -1897,7 +1897,10 @@ mod tests {
                 "version":version,"title":"OrganizationNative final conclusion","description":"はい",
                 "sections":["はい"],"sourceKind":kind,"recallable":stored}}});
             let index = document_index(&document, "memories", &[]);
-            assert_eq!(index["recallable"], expected, "version={version}, kind={kind}, stored={stored}");
+            assert_eq!(
+                index["recallable"], expected,
+                "version={version}, kind={kind}, stored={stored}"
+            );
             if version == 1 {
                 assert_eq!(index["description"], "はい");
                 assert_eq!(index["sections"], json!(["はい"]));

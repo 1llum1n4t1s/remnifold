@@ -592,12 +592,20 @@ pub fn build_turn_documents(
     max_chars: usize,
     container: Option<&str>,
 ) -> Result<Vec<Value>> {
+    // Claude Code 由来の記録は出所を区別する。捕捉キーと customId の形式は共通のまま保つ
+    // （サーバーは codex-turn-v2:<captureKey> の対応を検証するため）。
+    let claude = candidate.meta["format"] == "claude";
+    let (source, client, fallback) = if claude {
+        ("claude-code", "claude-code-remnifold", "Claude Code task")
+    } else {
+        ("codex", "codex-kagayoi-memory", "Codex task")
+    };
     let title = if title.is_empty() {
         transcript
             .turns
             .first()
-            .map(|t| t.user.lines().next().unwrap_or("Codex task"))
-            .unwrap_or("Codex task")
+            .map(|t| t.user.lines().next().unwrap_or(fallback))
+            .unwrap_or(fallback)
     } else {
         title
     };
@@ -606,7 +614,7 @@ pub fn build_turn_documents(
     let projected = project_request_text(&title, false).trim().to_string();
     let safe_title = truncate_utf16(
         if projected.is_empty() {
-            "Codex task"
+            fallback
         } else {
             &projected
         },
@@ -681,7 +689,7 @@ pub fn build_turn_documents(
                 index["recallable"] = json!(false);
                 index["sections"] = json!([])
             }
-            let mut metadata = json!({"type":"conversation","title":safe_title,"sm_scope":if provenance{"project"}else{"shared"},"sm_source":"codex","sm_client":"codex-kagayoi-memory","sessionId":id,"rootSessionId":candidate.meta["rootSessionId"],"sessionKind":if candidate.meta["isSubagent"]==true{"subagent"}else{"root"},"turn":i+1,"part":p+1,"parts":parts.len(),"captureVersion":2,"captureKey":key,"memoryIndex":index});
+            let mut metadata = json!({"type":"conversation","title":safe_title,"sm_scope":if provenance{"project"}else{"shared"},"sm_source":source,"sm_client":client,"sessionId":id,"rootSessionId":candidate.meta["rootSessionId"],"sessionKind":if candidate.meta["isSubagent"]==true{"subagent"}else{"root"},"turn":i+1,"part":p+1,"parts":parts.len(),"captureVersion":2,"captureKey":key,"memoryIndex":index});
             if !text(&project["projectName"]).is_empty() {
                 metadata["project"] = project["projectName"].clone()
             }
@@ -772,9 +780,13 @@ fn find_transcript(payload: &Value, home: &Path) -> Result<Candidate> {
     }
     let explicit = PathBuf::from(text(&payload["transcript_path"]));
     if !explicit.as_os_str().is_empty() && explicit.exists() {
-        let meta = read_session_meta(&explicit)?
-            .filter(|m| m["id"] == id)
-            .ok_or_else(|| anyhow::anyhow!("Transcript session ID mismatch."))?;
+        // Codex の session_meta を持つ記録はその ID だけを信頼する。持たない記録は
+        // Claude Code 形式として、同じ sessionId の本会話行があるときだけ受け付ける。
+        let meta = match read_session_meta(&explicit)? {
+            Some(meta) => Some(meta).filter(|m| m["id"] == id),
+            None => crate::claude_transcript::read_meta(&explicit, id)?,
+        }
+        .ok_or_else(|| anyhow::anyhow!("Transcript session ID mismatch."))?;
         return Ok(Candidate {
             file_path: explicit,
             meta,
@@ -804,22 +816,35 @@ pub fn capture(payload: &Value, config: &Config) -> Result<Value> {
         return Err(CaptureFailure("transcript").into());
     }
     let project = stage("transcript", get_project_context(Path::new(cwd)))?;
-    let transcript = stage(
-        "transcript",
-        parse_task_transcript(&candidate.file_path, &[&config.api_key]),
-    )?;
-    let titles = stage(
-        "transcript",
-        titles(&config.codex_home, Some(text(&candidate.meta["id"]))),
-    )?;
-    let title = sanitize_text(
-        titles
-            .get(text(&candidate.meta["id"]))
-            .map(String::as_str)
-            .unwrap_or(""),
-        &[&config.api_key],
-        &mut 0,
-    );
+    let (transcript, title) = if candidate.meta["format"] == "claude" {
+        // Claude Code はタイトルを記録内の custom-title 行に持つ。
+        stage(
+            "transcript",
+            crate::claude_transcript::parse(
+                &candidate.file_path,
+                text(&candidate.meta["id"]),
+                &[&config.api_key],
+            ),
+        )?
+    } else {
+        let transcript = stage(
+            "transcript",
+            parse_task_transcript(&candidate.file_path, &[&config.api_key]),
+        )?;
+        let titles = stage(
+            "transcript",
+            titles(&config.codex_home, Some(text(&candidate.meta["id"]))),
+        )?;
+        let title = sanitize_text(
+            titles
+                .get(text(&candidate.meta["id"]))
+                .map(String::as_str)
+                .unwrap_or(""),
+            &[&config.api_key],
+            &mut 0,
+        );
+        (transcript, title)
+    };
     let documents = stage(
         "transcript",
         build_turn_documents(&candidate, &transcript, &project, &title, 120_000, None),
