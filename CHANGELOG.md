@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.25 - 2026-11-14
+
+### 変更
+
+- Remnifoldを単独アプリとしてインストールするようにしました。`remnifold install --version <版> --apply`で公開物を検証して利用者ごとのアプリフォルダ（Windowsは`%LOCALAPPDATA%\Programs\Remnifold`）へ導入し、`remnifold connect claude-code --apply`でClaude CodeのMCPとフックを登録します。Codexプラグインとしての`plugin-update`・`plugin-bootstrap`は廃止しました。
+- 接続設定とcapture/recallの状態・サーバー設定を、Codexのhomeではなく各OS標準の設定フォルダ（Windowsは`%APPDATA%\Remnifold`）に置くようにしました。旧来の`~/.codex`にだけある接続は初回に自動で移し、旧ファイルは残します。
+
 ## 1.0.24 - 2026-11-13
 
 ### 修正
