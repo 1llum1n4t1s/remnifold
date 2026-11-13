@@ -26,6 +26,12 @@ For ChatGPT, follow the [private plugin setup](https://developers.openai.com/plu
 
 The server asks the AI to search for relevant context, open full records when needed, and save durable outcomes. Tool use is chosen by the client and model, so automatic searches or saves are not guaranteed. Ask the AI to search or save explicitly when needed. This remote integration does not replace the existing Codex stdio server or hooks; avoid registering a duplicate remote server under the same Codex integration.
 
+## Use with Claude Code
+
+The installed native executable also works as a local Claude Code integration on the same connection (`~/.codex/remnifold.json`). Register its stdio MCP server at user scope and add command hooks for `SessionStart` and `UserPromptSubmit` (recall) and an asynchronous `Stop` hook (capture), each running `remnifold hook <event>`. Claude Code runs hook commands through Git Bash on Windows and passes the event JSON on stdin. Because the Codex plugin cache path contains the version, point both registrations at a launcher that selects the newest installed `remnifold/<version>/bin/remnifold.exe`. Inside this repository, the source `.mcp.json` (`cargo run`) takes precedence over the user registration; add `"disabledMcpjsonServers": ["remnifold"]` to the untracked `.claude/settings.local.json` to use the installed executable instead.
+
+`Stop` capture reads Claude Code transcripts as well as Codex rollouts. It stores only each human request and the final assistant text, skipping thinking, tool calls and results, request copies and other sessions' rows. A reply after a background notification is stored as a separate continuation turn so that already saved turns keep their capture keys. Claude Code records carry `sm_source: "claude-code"`. To avoid two memory systems, disable Claude Code's built-in auto memory with `"autoMemoryEnabled": false`; Remnifold does not read or import those files.
+
 ## Connect an existing server
 
 Starting with 1.0.16, published native packages are served from [Remnifold updates](https://remnifold-updates.kagayoi.com). Earlier releases retain their existing distribution path. The version index is `releases/<version>/index.json`; its manifest selects a hash-named archive for each target below. Authenticate publication through GitHub before running a downloaded executable; an R2 URL or a commit-status link alone does not establish its origin.
@@ -46,12 +52,12 @@ For an existing `remnifold@personal` installation, use the native executable's `
 Run these commands from the extracted plugin folder, using the same published version and work root for all three steps:
 
 ```sh
-./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Codex/remnifold/plugin-update --check-published
-./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Codex/remnifold/plugin-update --apply
-./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Codex/remnifold/plugin-update --verify-only
+./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Claude/remnifold/plugin-update --check-published
+./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Claude/remnifold/plugin-update --apply
+./bin/remnifold.exe plugin-update --version <published-version> --work-root D:/Claude/remnifold/plugin-update --verify-only
 ```
 
-On macOS and Linux, use `./bin/remnifold` and an absolute external work directory. On every platform, keep the work root outside the repository, plugin source, and Codex home, with no linked ancestors; Windows requires a child of `D:/Codex/remnifold`. Keep the `verified-<commit>-<target>.json` receipt in that work root for later verification. Connection and capture state are preserved; a new task is still required to load the updated plugin.
+On macOS and Linux, use `./bin/remnifold` and an absolute external work directory. On every platform, keep the work root outside the repository, plugin source, and Codex home, with no linked ancestors; Windows requires a child of `D:/Claude/remnifold`. Keep the `verified-<commit>-<target>.json` receipt in that work root for later verification. Connection and capture state are preserved; a new task is still required to load the updated plugin.
 
 An older client cannot discover the R2 distribution itself. Windows uses the native `plugin-bootstrap` command. Choose a published release that includes both this command and the `remnifold-bootstrap-x86_64-pc-windows-msvc.exe` GitHub Release asset. Releases predating that asset can still be reached from a trusted Rust source build; an unverified executable downloaded from R2 is not a bootstrap trust root.
 
@@ -65,7 +71,7 @@ bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
 gh release verify "$tag" --repo "$repo" &&
 gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
 gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" plugin-bootstrap --version "$version" --work-root D:/Codex/remnifold/bootstrap
+"$bootstrap" plugin-bootstrap --version "$version" --work-root D:/Claude/remnifold/bootstrap
 ```
 
 The release and local asset must both pass GitHub's signature verification before execution. Do not substitute an unverified R2 helper or bypass a failed verification. The bootstrap then independently checks the exact GitHub CI publisher-log witness, R2 manifest, release commit, archive size and digest. It does not require an installed plugin for publication checking or download-only mode. The default checks publication; add `--apply` only to migrate an existing registered installation, followed by receipt verification. For an unregistered installation, use `--download-only` and the official registration procedure below. Legacy `-Version`, `-WorkRoot`, `-Apply`, and `-DownloadOnly` argument names remain readable by the native command.
@@ -116,6 +122,8 @@ Use the same configuration and names as the preview. `--apply` creates missing r
 
 Apply the server update and migrations before connecting or updating clients. Setup stores resumable configuration outside the repository and plugin in `<CODEX_HOME>/remnifold/server/config.json` (default `~/.codex/remnifold/server/config.json`); `--state <absolute-json-path>` selects another external location. Keep this state for updates, never commit generated IDs or credentials, and rerun the same command after correcting a failed step. Use `--base-url` for an existing custom endpoint and `--help` for all options. Cloudflare usage is billed to the account hosting the server.
 
+For 1.0.22, update the server with that release's `server-setup --apply` before updating clients. Migration `0013_memory_created_index.sql` adds an index for day-ranged organization; it changes no stored records or IDs.
+
 For 1.0.21, update the server with that release's `server-setup --apply` before updating clients. Migrations `0010_capture_variants.sql`, `0011_consolidation_recall_opt_out.sql`, and `0012_organization_retry_fairness.sql` add verified capture variants, invalidate historical checkpoints containing recall-excluded sources, and shorten future legacy deferrals to one hour. Original records and IDs are retained; affected checkpoints can regenerate from eligible sources.
 
 ## Memory behavior
@@ -154,20 +162,20 @@ The API key grants access to the records in one server installation. Use separat
 
 ## Codex memory organization
 
-After installing a compatible plugin and applying the [current server migrations](#create-or-update-a-server), including the organization schema in `0009_memory_organization.sql`, use [setup-remnifold](skills/setup-remnifold/SKILL.md) to enable, pause or change scheduled organization. Choose daily (standard) or another frequency such as weekly, and at most one batch per run (standard) or two. Registration uses Codex's official local automation controls and requires an explicit choice; the Codex app and PC must be running. Tasks follow the current Codex home/environment connection. Incompatible or unverified installations remain paused until readiness is established. Existing paused tasks are not silently replaced or activated; start a new chat after plugin delivery if the organization skill is unavailable.
+After installing a compatible plugin and applying the [current server migrations](#create-or-update-a-server), including the organization schema in `0009_memory_organization.sql` and the ranged-organization index in `0013_memory_created_index.sql`, organize memory on demand with the [organize-memory skill](skills/organize-memory/SKILL.md), for example `$organize-memory 7` or "organize the last 7 days of memory". The day count (1–3650) selects memories created in the last N days by server time; the run repeats batches until that range has no due work or an optional batch cap (default 3, at most 20) is reached. Without a day count, one batch is taken from the global queue. Organization is no longer registered as a Codex scheduled task; [setup-remnifold](skills/setup-remnifold/SKILL.md) only pauses tasks left by earlier versions.
 
-Each run follows the [organize-memory skill](skills/organize-memory/SKILL.md) using the currently installed executable. One batch processes at most twenty target records and 48,000 UTF-16 source units; two allow at most forty and 96,000, including partial or deferred work. These are not completed-record counts or total reading/token guarantees: candidate summaries and targeted evidence reads are additional. Lookup is limited to two calls per run. Unresolved work is deferred rather than expanding into bulk exploration.
+Each run uses the currently installed executable. One batch processes at most twenty target records and 48,000 UTF-16 source units, including partial or deferred work. These are not completed-record counts or total reading/token guarantees: candidate summaries and targeted evidence reads are additional. Lookup is limited to two calls per batch. Unresolved work is deferred rather than expanding into bulk exploration; a ranged run stopped by its cap can simply be run again.
 
 For direct CLI use, run the platform executable from the extracted plugin folder (`./bin/remnifold` on macOS/Linux):
 
 ```text
-./bin/remnifold.exe memory-organize prepare
+./bin/remnifold.exe memory-organize prepare [--days N]
 ./bin/remnifold.exe memory-organize lookup --line
 ./bin/remnifold.exe memory-organize commit --line
 ./bin/remnifold.exe memory-organize sources <summary-document-id> [cursor]
 ```
 
-These commands use the existing owner API-key connection; remote MCP OAuth credentials cannot authorize organization. They neither schedule Codex nor deploy/migrate a server. `prepare` creates a thirty-minute lease and returns source IDs/revisions/chunks, continuation notes and candidate summaries; it is not a read-only connectivity check. `lookup` reads `{"query":"a concise topic"}` from stdin. `commit` reads a JSON object containing `batchId`, `summaries`, and `coverage`. Follow the execution skill's exact field limits, partition rules and multipart `groupProgress` procedure. Declare `complete` only when every chunk and important topic is represented, preserving conclusions, reasons, evidence and uncertainty; use partial continuation or deferral when that cannot be done. Codex makes this judgment. Check the commit receipt and distinguish published summaries from unfinished progress.
+These commands use the existing owner API-key connection; remote MCP OAuth credentials cannot authorize organization. They neither schedule Codex nor deploy/migrate a server. `prepare` creates a thirty-minute lease; `--days N` limits it to memories created in the last N days without moving the global discovery queue; each ranged response returns `range.cursor`/`range.exhausted`, and the next call passes a non-null cursor as `--range-cursor <cursor>`, and an older server rejects it rather than falling back. It returns source IDs/revisions/chunks, continuation notes and candidate summaries; it is not a read-only connectivity check. `lookup` reads `{"query":"a concise topic"}` from stdin. `commit` reads a JSON object containing `batchId`, `summaries`, and `coverage`. Follow the execution skill's exact field limits, partition rules and multipart `groupProgress` procedure. Declare `complete` only when every chunk and important topic is represented, preserving conclusions, reasons, evidence and uncertainty; use partial continuation or deferral when that cannot be done. Codex makes this judgment. Check the commit receipt and distinguish published summaries from unfinished progress.
 
 Before `prepare`, establish a safe stdin path and a way to retain and page its complete response; on Windows, follow the execution skill's local synthetic PTY probe before acquiring a lease. Read every source chunk, continuation memo and summary candidate from the same retained response. A truncated display is recovered from that invocation, not by preparing another batch. Before commit, validate the exact JSON in memory: every coverage entry needs its prepared ID/revision and an explicit `summaries` array, including `summaries:[]` for partial or deferred entries. Follow the [execution skill](skills/organize-memory/SKILL.md#one-batch) for paging, preflight and recovery after an interrupted run.
 
