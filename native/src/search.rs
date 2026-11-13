@@ -1,4 +1,5 @@
 use crate::common::{Config, api, read_settings, text, truncate_utf16};
+use crate::locale::pick;
 use anyhow::{Context, Result, bail};
 use chrono::TimeZone;
 use regex::Regex;
@@ -467,23 +468,29 @@ pub fn public_index(item: &Value) -> Value {
     }
     v
 }
+// 索引項目の見出し語は、索引を書き込む環境の言語（crate::locale）に合わせる。
+// 記録の本文・題名・話題は保存時の言語のまま出し、翻訳しない。
 pub fn format_index_item(v: &Value) -> String {
     let title = prompt(text(&v["title"]), 100);
     let mut result = format!("- ◪ {title}");
     if !text(&v["description"]).is_empty() && v["description"] != v["title"] {
-        result += &format!(" — 参照する場面: {}", prompt(text(&v["description"]), 180))
+        result += &format!(
+            " — {}: {}",
+            pick("参照する場面", "Use when"),
+            prompt(text(&v["description"]), 180)
+        )
     }
     let sections = strings(&v["sections"]);
     if !sections.is_empty() {
-        result += &format!(
-            "（収録: {}）",
-            sections
-                .iter()
-                .take(2)
-                .map(|s| prompt(s, 60))
-                .collect::<Vec<_>>()
-                .join("、")
-        )
+        let joined = sections
+            .iter()
+            .take(2)
+            .map(|s| prompt(s, 60))
+            .collect::<Vec<_>>();
+        result += &match crate::locale::current() {
+            crate::locale::Language::Japanese => format!("（収録: {}）", joined.join("、")),
+            crate::locale::Language::English => format!(" (covers: {})", joined.join("; ")),
+        }
     }
     result += &format!("\n  id={}", prompt(text(&v["id"]), 80));
     let topics = strings(&v["topics"]);
@@ -529,7 +536,7 @@ pub fn format_index_item(v: &Value) -> String {
                 &v["sourceUpdatedAt"],
                 &v["updatedAt"],
                 &v["createdAt"],
-                &json!("日時不明")
+                &json!(pick("日時不明", "unknown date"))
             ]),
             40
         )
@@ -542,7 +549,8 @@ pub fn format_index_item(v: &Value) -> String {
     }
     if !text(&v["searchExcerpt"]).is_empty() {
         result += &format!(
-            "\n  原文の該当箇所: {}",
+            "\n  {}: {}",
+            pick("原文の該当箇所", "Matching source excerpt"),
             prompt(text(&v["searchExcerpt"]), 240)
         )
     }
@@ -577,7 +585,7 @@ pub fn format_recent_task(v: &Value) -> String {
                 &v["sourceUpdatedAt"],
                 &v["createdAt"],
                 &v["updatedAt"],
-                &json!("日時不明")
+                &json!(pick("日時不明", "unknown date"))
             ]),
             40
         )
@@ -1313,7 +1321,11 @@ fn encode(s: &str) -> String {
 pub fn format_search_result(result: &Value) -> String {
     let rows = result["results"].as_array().cloned().unwrap_or_default();
     let mut output = if rows.is_empty() {
-        "No matching memory index entries found.".to_owned()
+        pick(
+            "一致する記憶の索引はありませんでした。",
+            "No matching memory index entries found.",
+        )
+        .to_owned()
     } else {
         rows.iter()
             .map(format_index_item)
@@ -1329,12 +1341,20 @@ pub fn format_search_result(result: &Value) -> String {
         .map(Vec::len)
         .unwrap_or(0);
     if spaces + documents > 0 {
-        output += &format!(
-            "\nIncomplete search: {spaces} spaces and {documents} document indexes were unavailable."
-        )
+        output += &match crate::locale::current() {
+            crate::locale::Language::Japanese => format!(
+                "\n検索は不完全です: {spaces} 件の保存先と {documents} 件の文書索引を取得できませんでした。"
+            ),
+            crate::locale::Language::English => format!(
+                "\nIncomplete search: {spaces} spaces and {documents} document indexes were unavailable."
+            ),
+        }
     }
     if result["spaceDiscoveryComplete"] == false {
-        output += "\nIncomplete space discovery: the API returned its 100-space limit, so additional spaces may exist."
+        output += pick(
+            "\n保存先の一覧は不完全です: API が上限の100件を返したため、ほかの保存先がある可能性があります。",
+            "\nIncomplete space discovery: the API returned its 100-space limit, so additional spaces may exist.",
+        )
     }
     output += "\nWhen an entry appears applicable, read the original with getDocument(documentId), validate it against the current implementation, and reuse the parts that still fit.";
     output
@@ -1470,8 +1490,12 @@ pub fn read_document_page(config: &Config, id: &str, source_cursor: Option<&str>
         }
     }
     let mut output = format!(
-        "{}\n\nこれは過去の記録です。現在の状態と照合して利用してください。\n\n{content}",
-        format_index_item(&index)
+        "{}\n\n{}\n\n{content}",
+        format_index_item(&index),
+        pick(
+            "これは過去の記録です。現在の状態と照合して利用してください。",
+            "This is a historical record. Check it against the current state before relying on it."
+        )
     );
     let mut v = json!({"id":text(&document["id"]),"content":content,"topics":index["topics"],"index":public_index(&index)});
     if let Some(page) = document.get("organizationSources") {

@@ -5,6 +5,7 @@ pub mod embedded;
 pub mod hooks;
 pub mod live_test;
 pub mod local;
+pub mod locale;
 pub mod mcp;
 pub mod organization;
 pub mod provision;

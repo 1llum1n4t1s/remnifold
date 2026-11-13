@@ -164,10 +164,19 @@ impl Drop for Fixture {
 }
 
 fn hook(root: &Path, url: &str, event: &str, input: &[u8]) -> Value {
+    // 索引の文言は環境の言語で変わるため、既存の検証は日本語環境として固定する。
+    hook_in("ja_JP.UTF-8", root, url, event, input)
+}
+fn hook_in(language: &str, root: &Path, url: &str, event: &str, input: &[u8]) -> Value {
     let mut command = Command::new(env!("CARGO_BIN_EXE_remnifold"));
     support::isolate(&mut command);
     command
         .args(["hook", event])
+        // 明示の上書きを外し、POSIX の LANG から言語を決める経路を通す。
+        .env_remove("REMNIFOLD_LANGUAGE")
+        .env_remove("LC_ALL")
+        .env_remove("LC_MESSAGES")
+        .env("LANG", language)
         .env("CODEX_HOME", root)
         .env("REMNIFOLD_API_URL", url)
         .env("REMNIFOLD_API_KEY", "fixture-secret")
@@ -224,6 +233,67 @@ fn loopback_fixture_waits_for_request_bytes_after_accept() {
         "delayed request response={output:?}; received requests={:?}",
         fixture.requests.lock().unwrap()
     );
+}
+
+// 索引の案内文と見出しは、索引を書き込む環境の言語設定で切り替わる。
+// 記録の本文（題名・id）は言語によらずそのまま出る。
+#[test]
+fn recall_index_follows_environment_language() {
+    let fixture = Fixture::new();
+    for (language, expected, unexpected) in [
+        (
+            "ja_JP.UTF-8",
+            [
+                "過去の文書の索引です",
+                "直近の作業（話題との一致は未判定）",
+                "getDocument は、",
+            ],
+            ["Historical document indexes", "Recent tasks (not matched"],
+        ),
+        (
+            "en_US.UTF-8",
+            [
+                "Historical document indexes",
+                "Recent tasks (not matched to the current topic)",
+                "Use getDocument only",
+            ],
+            ["過去の文書の索引です", "直近の作業"],
+        ),
+    ] {
+        let root = root();
+        let transcript = root.join("session.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture-session\"}}\n",
+        )
+        .unwrap();
+        let payload = json!({"session_id":"fixture-session","transcript_path":transcript,"prompt":"Repair Unicode transcript boundaries"});
+        let output = hook_in(
+            language,
+            &root,
+            &fixture.url,
+            "UserPromptSubmit",
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        let context = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{language}: {output}"));
+        assert!(context.starts_with("<remnifold-index>\n"), "{context}");
+        assert!(context.ends_with("</remnifold-index>"), "{context}");
+        assert!(context.contains("id=topic-doc") && context.contains("id=recent-doc"));
+        for text in expected {
+            assert!(
+                context.contains(text),
+                "{language}: missing {text:?} in {context}"
+            );
+        }
+        for text in unexpected {
+            assert!(
+                !context.contains(text),
+                "{language}: unexpected {text:?} in {context}"
+            );
+        }
+    }
 }
 
 #[test]
