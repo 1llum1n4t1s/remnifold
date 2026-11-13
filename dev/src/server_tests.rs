@@ -168,11 +168,32 @@ pub fn start_fixture(repo: &Path, tools: &Toolchain, work: &Path) -> Result<Work
         };
         observed.insert_str(brace, &format!(" fixtureCounts.{counter}++;\n"));
     }
-    observed=observed.replace("text.toLowerCase()","(fixtureCounts.candidateLower++, text.toLowerCase())")
-  .replace("rowsById.get(vector.id)","(fixtureCounts.rowLookups++, rowsById.get(vector.id))")
-  .replace("result.results.find((candidate) => candidate.id === vector.id)","result.results.find((candidate) => (fixtureCounts.rowComparisons++, candidate.id === vector.id))")
-  .replace("ranked.sort((left, right) => right.coverage - left.coverage ||\n    right.indexCoverage - left.indexCoverage || right.checkpoint - left.checkpoint);","ranked.sort((left, right) => { fixtureCounts.comparisons++; return right.coverage - left.coverage ||\n    right.indexCoverage - left.indexCoverage || right.checkpoint - left.checkpoint; });")
-  .replace("const text = truncateUtf16(content.slice(start), 236);","fixtureCounts.excerptWindows++; const text = truncateUtf16(content.slice(start), 236);");
+    // 計数の差し込み先が実装から消えると、その計数は常に0のままになり検査が黙って無効化される。
+    // 以前は消えた比較ループの計数（rowComparisons）が失敗し得ない検査として残っていたため、
+    // 差し込み先が見つからなければハーネスの準備段階で失敗させる。
+    for (anchor, instrumented) in [
+        (
+            "text.toLowerCase()",
+            "(fixtureCounts.candidateLower++, text.toLowerCase())",
+        ),
+        (
+            "rowsById.get(vector.id)",
+            "(fixtureCounts.rowLookups++, rowsById.get(vector.id))",
+        ),
+        (
+            "ranked.sort((left, right) => right.coverage - left.coverage ||\n    right.indexCoverage - left.indexCoverage || right.checkpoint - left.checkpoint);",
+            "ranked.sort((left, right) => { fixtureCounts.comparisons++; return right.coverage - left.coverage ||\n    right.indexCoverage - left.indexCoverage || right.checkpoint - left.checkpoint; });",
+        ),
+        (
+            "const text = truncateUtf16(content.slice(start), 236);",
+            "fixtureCounts.excerptWindows++; const text = truncateUtf16(content.slice(start), 236);",
+        ),
+    ] {
+        if !observed.contains(anchor) {
+            bail!("server observation anchor is missing from index.ts: {anchor}");
+        }
+        observed = observed.replace(anchor, instrumented);
+    }
     observed = observed.replace(
         "from \"../package.json\"",
         &format!(
@@ -181,7 +202,7 @@ pub fn start_fixture(repo: &Path, tools: &Toolchain, work: &Path) -> Result<Work
         ),
     );
     let prefix = r#"let fixtureSequence=0;
-const fixtureCounts={excerpt:0,indexQueryPatterns:0,candidateLower:0,rowComparisons:0,rowLookups:0,digests:0,coverage:0,metadataParses:0,excerptWindows:0,comparisons:0};
+const fixtureCounts={excerpt:0,indexQueryPatterns:0,candidateLower:0,rowLookups:0,digests:0,coverage:0,metadataParses:0,excerptWindows:0,comparisons:0};
 export function resetCounts(){for(const key of Object.keys(fixtureCounts))fixtureCounts[key]=0;}
 export function counts(){return {...fixtureCounts};}
 export function resetFixture(){fixtureSequence=0;resetCounts();}

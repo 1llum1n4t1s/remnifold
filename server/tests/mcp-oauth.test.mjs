@@ -14,7 +14,10 @@ function fixture() {
       first: async () => db.prepare(sql).get(...values) ?? null,
       all: async () => ({ results: db.prepare(sql).all(...values) }),
       run: async () => ({ meta: { changes: Number(db.prepare(sql).run(...values).changes) } }),
-      execute: () => ({ meta: { changes: Number(db.prepare(sql).run(...values).changes) } }),
+      // D1 の batch と同じく、読取り文は位置どおりに行を返す（保存経路は batch 末尾の SELECT を読む）。
+      execute: () => /^\s*(SELECT|WITH|PRAGMA)\b/iu.test(sql)
+        ? { results: db.prepare(sql).all(...values), meta: { changes: 0 } }
+        : { results: [], meta: { changes: Number(db.prepare(sql).run(...values).changes) } },
     };
   }
   const env = { MEMORY_API_KEY: "owner-secret", AI_ENRICHMENT_MODE: "off", DB: { prepare, batch: async (ops) => {

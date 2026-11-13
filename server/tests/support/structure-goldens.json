@@ -22446,127 +22446,18 @@
       },
       {
         "operation": "sql",
-        "sql": "SELECT m.id, m.container_tag, CASE WHEN (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1)\n               THEN '' ELSE m.content END AS content, m.metadata_json, m.created_at, m.updated_at, m.topic_revision\n     FROM memories AS m WHERE m.is_forgotten = 0 AND NOT EXISTS(SELECT 1 FROM memory_organization_complete h WHERE h.memory_id=m.id) AND EXISTS (SELECT 1 FROM json_each(?) AS term WHERE (replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '')), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')\n       OR EXISTS (SELECT 1 FROM memory_topics AS topic\n                  WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision\n                    AND replace(lower(topic.topic), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern'))))\n     ORDER BY (SELECT COALESCE(SUM(json_extract(term.value, '$.weight')), 0) FROM json_each(?) AS term\n               WHERE (replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '')), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')\n       OR EXISTS (SELECT 1 FROM memory_topics AS topic\n                  WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision\n                    AND replace(lower(topic.topic), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')))) DESC,\n              m.updated_at DESC LIMIT ?",
+        "sql": "SELECT m.id, m.container_tag, CASE WHEN (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1)\n               THEN '' ELSE m.content END AS content, m.metadata_json, m.created_at, m.updated_at, m.topic_revision\n     FROM (\n       SELECT candidate.row_order, candidate.updated_at, CASE WHEN candidate.index_text GLOB ? THEN 8 ELSE 0 END + CASE WHEN candidate.index_text GLOB ? THEN 4 ELSE 0 END + CASE WHEN candidate.index_text GLOB ? THEN 2 ELSE 0 END + CASE WHEN candidate.index_text GLOB ? THEN 5 ELSE 0 END AS weight\n       FROM (\n         SELECT m.rowid AS row_order, m.updated_at, replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '') || char(10) ||\n                      COALESCE((SELECT group_concat(topic.topic, char(10)) FROM memory_topics AS topic\n                                WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision), '')), 'İ', 'i̇') AS index_text\n         FROM memories AS m WHERE m.is_forgotten = 0 AND NOT EXISTS(SELECT 1 FROM memory_organization_complete h WHERE h.memory_id=m.id)\n         LIMIT -1 OFFSET 0\n       ) AS candidate\n       LIMIT -1 OFFSET 0\n     ) AS ranked\n     CROSS JOIN memories AS m ON m.rowid = ranked.row_order\n     WHERE ranked.weight > 0\n     ORDER BY ranked.weight DESC, ranked.updated_at DESC, ranked.row_order LIMIT ?",
         "values": [
-          {
-            "$json": [
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    8
-                  ],
-                  [
-                    "pattern",
-                    "*evidence*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    4
-                  ],
-                  [
-                    "pattern",
-                    "*caf[éÉ]*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    2
-                  ],
-                  [
-                    "pattern",
-                    "*東京*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    5
-                  ],
-                  [
-                    "pattern",
-                    "*alpha*"
-                  ]
-                ]
-              }
-            ]
-          },
-          {
-            "$json": [
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    8
-                  ],
-                  [
-                    "pattern",
-                    "*evidence*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    4
-                  ],
-                  [
-                    "pattern",
-                    "*caf[éÉ]*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    2
-                  ],
-                  [
-                    "pattern",
-                    "*東京*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    5
-                  ],
-                  [
-                    "pattern",
-                    "*alpha*"
-                  ]
-                ]
-              }
-            ]
-          },
+          "*evidence*",
+          "*caf[éÉ]*",
+          "*東京*",
+          "*alpha*",
           50
         ]
       },
       {
         "operation": "sql",
         "sql": "SELECT id, container_tag, content, metadata_json, created_at, updated_at, topic_revision\n       FROM memories WHERE id IN (?, ?, ?) AND is_forgotten = 0",
-        "values": [
-          "search-0",
-          "search-1",
-          "search-2"
-        ]
-      },
-      {
-        "operation": "sql",
-        "sql": "SELECT mt.memory_id AS memoryId, mt.topic\n       FROM memory_topics AS mt\n       JOIN memories AS m ON m.id = mt.memory_id AND m.topic_revision = mt.source_revision\n       WHERE mt.memory_id IN (?, ?, ?) AND m.is_forgotten = 0\n       ORDER BY mt.topic_key",
         "values": [
           "search-0",
           "search-1",
@@ -22688,172 +22579,24 @@
     "events": [
       {
         "operation": "sql",
-        "sql": "SELECT m.id, m.container_tag, CASE WHEN (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1)\n               THEN '' ELSE m.content END AS content, m.metadata_json, m.created_at, m.updated_at,\n                  m.topic_revision, bm25(memories_fts) AS rank\n           FROM memories_fts\n           JOIN memories AS m ON m.rowid = memories_fts.rowid\n           WHERE memories_fts MATCH ? AND m.is_forgotten = 0 AND NOT EXISTS(SELECT 1 FROM memory_organization_complete h WHERE h.memory_id=m.id) AND json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0 AND NOT (json_extract(m.metadata_json, '$.sm_organization_manual_only') IS 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id))\n           ORDER BY CASE WHEN NOT (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1) OR EXISTS (SELECT 1 FROM json_each(?) AS term WHERE (replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '')), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')\n       OR EXISTS (SELECT 1 FROM memory_topics AS topic\n                  WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision\n                    AND replace(lower(topic.topic), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')))) THEN 0 ELSE 1 END, rank LIMIT ?",
+        "sql": "SELECT id, container_tag, content, metadata_json, created_at, updated_at, topic_revision, rank\n           FROM (\n             SELECT m.id, m.container_tag, CASE WHEN (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1)\n               THEN '' ELSE m.content END AS content, m.metadata_json, m.created_at, m.updated_at,\n                    m.topic_revision, bm25(memories_fts) AS rank,\n                    (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1) AS index_v1,\n                    CASE WHEN (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1) IS NOT 0 THEN replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '') || char(10) ||\n                      COALESCE((SELECT group_concat(topic.topic, char(10)) FROM memory_topics AS topic\n                                WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision), '')), 'İ', 'i̇') END AS index_text\n             FROM memories_fts\n             JOIN memories AS m ON m.rowid = memories_fts.rowid\n             WHERE memories_fts MATCH ? AND m.is_forgotten = 0 AND NOT EXISTS(SELECT 1 FROM memory_organization_complete h WHERE h.memory_id=m.id) AND json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0 AND NOT (json_extract(m.metadata_json, '$.sm_organization_manual_only') IS 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id))\n             LIMIT -1 OFFSET 0\n           ) AS fts\n           ORDER BY CASE WHEN NOT fts.index_v1 OR fts.index_text GLOB ? OR fts.index_text GLOB ? OR fts.index_text GLOB ? OR fts.index_text GLOB ? THEN 0 ELSE 1 END, fts.rank LIMIT ?",
         "values": [
           "\"evidence\" OR \"café\" OR \"alpha\"",
-          {
-            "$json": [
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    8
-                  ],
-                  [
-                    "pattern",
-                    "*evidence*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    4
-                  ],
-                  [
-                    "pattern",
-                    "*caf[éÉ]*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    2
-                  ],
-                  [
-                    "pattern",
-                    "*東京*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    5
-                  ],
-                  [
-                    "pattern",
-                    "*alpha*"
-                  ]
-                ]
-              }
-            ]
-          },
+          "*evidence*",
+          "*caf[éÉ]*",
+          "*東京*",
+          "*alpha*",
           10
         ]
       },
       {
         "operation": "sql",
-        "sql": "SELECT m.id, m.container_tag, CASE WHEN (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1)\n               THEN '' ELSE m.content END AS content, m.metadata_json, m.created_at, m.updated_at, m.topic_revision\n     FROM memories AS m WHERE m.is_forgotten = 0 AND NOT EXISTS(SELECT 1 FROM memory_organization_complete h WHERE h.memory_id=m.id) AND json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0 AND NOT (json_extract(m.metadata_json, '$.sm_organization_manual_only') IS 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id)) AND EXISTS (SELECT 1 FROM json_each(?) AS term WHERE (replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '')), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')\n       OR EXISTS (SELECT 1 FROM memory_topics AS topic\n                  WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision\n                    AND replace(lower(topic.topic), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern'))))\n     ORDER BY (SELECT COALESCE(SUM(json_extract(term.value, '$.weight')), 0) FROM json_each(?) AS term\n               WHERE (replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '')), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')\n       OR EXISTS (SELECT 1 FROM memory_topics AS topic\n                  WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision\n                    AND replace(lower(topic.topic), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')))) DESC,\n              m.updated_at DESC LIMIT ?",
+        "sql": "SELECT m.id, m.container_tag, CASE WHEN (json_type(m.metadata_json, '$.memoryIndex.version') = 'integer' AND\n           json_extract(m.metadata_json, '$.memoryIndex.version') = 1)\n               THEN '' ELSE m.content END AS content, m.metadata_json, m.created_at, m.updated_at, m.topic_revision\n     FROM (\n       SELECT candidate.row_order, candidate.updated_at, CASE WHEN candidate.index_text GLOB ? THEN 8 ELSE 0 END + CASE WHEN candidate.index_text GLOB ? THEN 4 ELSE 0 END + CASE WHEN candidate.index_text GLOB ? THEN 2 ELSE 0 END + CASE WHEN candidate.index_text GLOB ? THEN 5 ELSE 0 END AS weight\n       FROM (\n         SELECT m.rowid AS row_order, m.updated_at, replace(lower(COALESCE(json_extract(m.metadata_json, '$.memoryIndex.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.title'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.description'), '') || ' ' ||\n                      COALESCE(json_extract(m.metadata_json, '$.memoryIndex.sections'), '') || char(10) ||\n                      COALESCE((SELECT group_concat(topic.topic, char(10)) FROM memory_topics AS topic\n                                WHERE topic.memory_id = m.id AND topic.source_revision = m.topic_revision), '')), 'İ', 'i̇') AS index_text\n         FROM memories AS m WHERE m.is_forgotten = 0 AND NOT EXISTS(SELECT 1 FROM memory_organization_complete h WHERE h.memory_id=m.id) AND json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0 AND NOT (json_extract(m.metadata_json, '$.sm_organization_manual_only') IS 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=m.id))\n         LIMIT -1 OFFSET 0\n       ) AS candidate\n       LIMIT -1 OFFSET 0\n     ) AS ranked\n     CROSS JOIN memories AS m ON m.rowid = ranked.row_order\n     WHERE ranked.weight > 0\n     ORDER BY ranked.weight DESC, ranked.updated_at DESC, ranked.row_order LIMIT ?",
         "values": [
-          {
-            "$json": [
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    8
-                  ],
-                  [
-                    "pattern",
-                    "*evidence*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    4
-                  ],
-                  [
-                    "pattern",
-                    "*caf[éÉ]*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    2
-                  ],
-                  [
-                    "pattern",
-                    "*東京*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    5
-                  ],
-                  [
-                    "pattern",
-                    "*alpha*"
-                  ]
-                ]
-              }
-            ]
-          },
-          {
-            "$json": [
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    8
-                  ],
-                  [
-                    "pattern",
-                    "*evidence*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    4
-                  ],
-                  [
-                    "pattern",
-                    "*caf[éÉ]*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    2
-                  ],
-                  [
-                    "pattern",
-                    "*東京*"
-                  ]
-                ]
-              },
-              {
-                "$pairs": [
-                  [
-                    "weight",
-                    5
-                  ],
-                  [
-                    "pattern",
-                    "*alpha*"
-                  ]
-                ]
-              }
-            ]
-          },
+          "*evidence*",
+          "*caf[éÉ]*",
+          "*東京*",
+          "*alpha*",
           50
         ]
       },
@@ -22889,15 +22632,6 @@
           "search-0",
           "search-1",
           "search-2",
-          "search-0",
-          "search-1",
-          "search-2"
-        ]
-      },
-      {
-        "operation": "sql",
-        "sql": "SELECT mt.memory_id AS memoryId, mt.topic\n       FROM memory_topics AS mt\n       JOIN memories AS m ON m.id = mt.memory_id AND m.topic_revision = mt.source_revision\n       WHERE mt.memory_id IN (?, ?, ?) AND m.is_forgotten = 0\n       ORDER BY mt.topic_key",
-        "values": [
           "search-0",
           "search-1",
           "search-2"

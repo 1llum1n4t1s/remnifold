@@ -216,6 +216,12 @@ function isDocumentIndexRow(value: unknown): value is DocumentIndexRow {
     typeof value.content_preview === "string";
 }
 
+// 省略可能な真偽値オプションの検証。undefined（省略）だけを許し、null を含む他の値は 400 にする。
+// 値の利用側は従来どおり `=== true` で判定する。
+function assertOptionalBoolean(body: JsonObject, name: string): void {
+  if (body[name] !== undefined && typeof body[name] !== "boolean") throw new HttpError(400, `${name} must be a boolean`);
+}
+
 function stringValue(value: unknown, name: string, maxLength: number): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new HttpError(400, `${name} is required`);
@@ -557,15 +563,17 @@ function memoryIndexV1(metadata: JsonObject): JsonObject | null {
   return isObject(metadata.memoryIndex) && metadata.memoryIndex.version === 1 ? metadata.memoryIndex : null;
 }
 
+// 索引を持つ行だけ分類を読み、検索語に一致しない索引行を除く。
+// 読んだ分類は呼び出し元へ返し、同じ行の分類を同じ段階で読み直さないようにする。
 async function filterIndexLexicalRows(
   rows: RankedMemoryRow[],
   terms: string[],
   env: Env,
-): Promise<RankedMemoryRow[]> {
+): Promise<{ rows: RankedMemoryRow[]; topics: Map<string, string[]> }> {
   const indexedRows = rows.filter((row) => memoryIndexV1(parseMetadata(row.metadata_json)) !== null);
-  if (indexedRows.length === 0) return rows;
+  if (indexedRows.length === 0) return { rows, topics: new Map() };
   const topics = await topicsByMemory(indexedRows, env);
-  return rows.filter((row) => {
+  return { topics, rows: rows.filter((row) => {
     const index = memoryIndexV1(parseMetadata(row.metadata_json));
     if (!index) return true;
     if (terms.length === 0) return false;
@@ -576,7 +584,7 @@ async function filterIndexLexicalRows(
       ...(topics.get(row.id) ?? []),
     ].join(" ").toLowerCase();
     return terms.some((term) => text.includes(term));
-  });
+  }) };
 }
 
 function excerpt(content: string, query: string, maxLength: number): string {
@@ -610,12 +618,20 @@ function provenance(row: Pick<MemoryRow, "container_tag">, metadata: JsonObject)
   };
 }
 
-async function topicsByMemory(rows: Array<Pick<MemoryRow, "id">>, env: Env): Promise<Map<string, string[]>> {
-  const byMemory = new Map(rows.map((row) => [row.id, [] as string[]]));
-  if (rows.length === 0) return byMemory;
+// known には同じ段階で既に読んだ分類を渡せる。known にある行（分類なしの空配列も「読み取り済み」）は
+// 読み直さず、無い行だけを D1 から読む。読み取り時点の違いで分類が変わらないよう、
+// 本文の再読込（indexSearchRows）をまたいで渡さないこと。
+async function topicsByMemory(
+  rows: Array<Pick<MemoryRow, "id">>,
+  env: Env,
+  known?: Map<string, string[]>,
+): Promise<Map<string, string[]>> {
+  const byMemory = new Map(rows.map((row) => [row.id, known?.has(row.id) ? [...known.get(row.id)!] : [] as string[]]));
+  const missing = known ? rows.filter((row) => !known.has(row.id)) : rows;
+  if (missing.length === 0) return byMemory;
   // Cloudflare D1 accepts at most 100 bound parameters per statement.
-  for (let offset = 0; offset < rows.length; offset += 90) {
-    const chunk = rows.slice(offset, offset + 90);
+  for (let offset = 0; offset < missing.length; offset += 90) {
+    const chunk = missing.slice(offset, offset + 90);
     const placeholders = chunk.map(() => "?").join(", ");
     const result = await env.DB.prepare(
       `SELECT mt.memory_id AS memoryId, mt.topic
@@ -935,9 +951,21 @@ const CONSOLIDATION_PROJECT_KEY_SQL = `CASE
   ELSE 'container:' || m.container_tag
 END`;
 
-async function consolidationTargets(env: Env, now: Date, projectKey?: string): Promise<ConsolidationTarget[]> {
+// 統合の実行時期の判定。未完了の初回バックフィル、未統合20件以上、または前回成功（なければ最古の未統合）から
+// 3日経過のいずれかで due とする。集計結果の行に対する純関数なので、集計を取り直さずに再利用できる。
+// initialBackfillCompleted は厳密に 0 のときだけ真（プロジェクト行が無い null は対象外）、
+// 解釈できない日時は経過条件を満たさない、という既存の扱いを保つ。
+function isConsolidationDue(target: ConsolidationTarget, now: Date): boolean {
   const CONSOLIDATION_AFTER_MS = 3 * 24 * 60 * 60 * 1_000;
   const CONSOLIDATION_MIN_MEMORIES = 20;
+  const reference = target.lastSuccessAt ?? target.oldestUnconsolidatedAt;
+  const referenceTime = Date.parse(reference);
+  return target.initialBackfillCompleted === 0 ||
+    target.unconsolidatedCount >= CONSOLIDATION_MIN_MEMORIES ||
+    (Number.isFinite(referenceTime) && referenceTime <= now.getTime() - CONSOLIDATION_AFTER_MS);
+}
+
+async function consolidationTargets(env: Env, now: Date, projectKey?: string): Promise<ConsolidationTarget[]> {
   const result = await env.DB.prepare(
     `WITH raw AS (
        SELECT m.id, m.container_tag, m.created_at,
@@ -971,14 +999,7 @@ async function consolidationTargets(env: Env, now: Date, projectKey?: string): P
      GROUP BY u.project_key, project.last_success_at, project.initial_backfill_completed
      ORDER BY oldestUnconsolidatedAt ASC`,
   ).bind(...(projectKey === undefined ? [] : [projectKey])).all<ConsolidationTarget>();
-  const cutoff = now.getTime() - CONSOLIDATION_AFTER_MS;
-  return result.results.filter((target) => {
-    const reference = target.lastSuccessAt ?? target.oldestUnconsolidatedAt;
-    const referenceTime = Date.parse(reference);
-    return target.initialBackfillCompleted === 0 ||
-      target.unconsolidatedCount >= CONSOLIDATION_MIN_MEMORIES ||
-      (Number.isFinite(referenceTime) && referenceTime <= cutoff);
-  });
+  return result.results.filter((target) => isConsolidationDue(target, now));
 }
 
 async function completeInitialBackfill(projectKey: string, env: Env): Promise<void> {
@@ -1358,16 +1379,13 @@ async function consolidateMemoryProject(
   if (!enrichmentEnabled(env)) throw new HttpError(409, "AI consolidation is disabled");
   const body = await readJson(request);
   const projectId = stringValue(body.projectId, "projectId", MAX_CONTAINER_TAG_LENGTH);
-  if (body.force !== undefined && typeof body.force !== "boolean") {
-    throw new HttpError(400, "force must be a boolean");
-  }
+  assertOptionalBoolean(body, "force");
   const target = await unconsolidatedTarget(env, projectId);
   if (!target) return json({ status: "no_unconsolidated_memories", projectId });
-  if (body.force !== true) {
-    const due = await consolidationTargets(env, new Date(), target.projectKey);
-    if (!due.some((candidate) => candidate.projectKey === target.projectKey)) {
-      return json({ status: "not_due", projectId });
-    }
+  // target は同じ集計（遠い未来の now で全件 due 扱い）から得た行なので、現在時刻で判定し直すだけでよい。
+  // 以前は同じ集計を現在時刻でもう一度実行していた。
+  if (body.force !== true && !isConsolidationDue(target, new Date())) {
+    return json({ status: "not_due", projectId });
   }
   const outcome = await consolidateTarget(target, env, ctx);
   if (outcome.status === "consolidated" && target.initialBackfillCompleted !== 1 &&
@@ -1458,7 +1476,17 @@ async function cleanupInvalidatedConsolidations(
          WHERE source.consolidation_id = consolidation.id AND source.memory_id = ?
        ))`,
   ).bind(now, sourceMemoryId, sourceMemoryId).all<{ memoryId: string; containerTag: string }>();
-  for (const row of invalidated.results) await removeDerivedMemory(row.memoryId, row.containerTag, env, ctx);
+  await removeInvalidatedConsolidations(invalidated.results, env, ctx);
+}
+
+// 無効化済みチェックポイントの派生記憶を片付ける。addMemory は対象行を書込み batch 内で読むため、
+// 行の取得方法とは分けてこの後処理だけを共有する。
+async function removeInvalidatedConsolidations(
+  rows: readonly { memoryId: string; containerTag: string }[],
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<void> {
+  for (const row of rows) await removeDerivedMemory(row.memoryId, row.containerTag, env, ctx);
 }
 
 async function invalidateDependentConsolidations(
@@ -2015,24 +2043,51 @@ function searchConditions(containerTag: string | undefined, scope: string | unde
   return { clause: conditions.join(" AND "), parameters };
 }
 
-function indexLexicalPriority(alias = ""): string {
-  return `CASE WHEN NOT ${memoryIndexV1Sql(`${alias ? `${alias}.` : ""}metadata_json`)} OR ${indexTermMatch(alias)} THEN 0 ELSE 1 END`;
+type IndexPattern = { weight: number; pattern: string };
+
+// indexQueryPatterns の JSON を、文ごとに個別の束縛値へ展開できる形に戻す。
+// 重みは語長由来の小さな整数だけなので、SQL へ数値リテラルとして埋め込んでも注入にならない。
+function indexPatternList(json: string): IndexPattern[] {
+  const patterns = JSON.parse(json) as IndexPattern[];
+  for (const { weight, pattern } of patterns) {
+    if (!Number.isSafeInteger(weight) || weight < 0 || typeof pattern !== "string") throw new Error("invalid index pattern");
+  }
+  return patterns;
 }
 
-function indexTermMatch(alias = ""): string {
-  return `EXISTS (SELECT 1 FROM json_each(?) AS term WHERE ${indexTermPredicate(alias)})`;
+// 索引テキストと現行改訂の分類を、1行につき1回だけ連結した照合対象を作る。
+// 旧実装は検索語ごと（最大30語）に JSON 抽出と memory_topics の索引探索を繰り返し、
+// 並べ替えでも同じ評価をやり直していたため、本番 D1 で1文あたり百万行規模の読み取りになっていた。
+// 分類は改行で区切る。検索語は Intl.Segmenter の語要素から作るため改行を含まず、
+// `*語*` 形式の GLOB が区切りをまたいで一致することはない。よって「索引一致 OR いずれかの分類一致」と同値になる。
+function indexHaystackSql(alias: string): string {
+  return `replace(lower(COALESCE(json_extract(${alias}.metadata_json, '$.memoryIndex.title'), '') || ' ' ||
+                      COALESCE(json_extract(${alias}.metadata_json, '$.title'), '') || ' ' ||
+                      COALESCE(json_extract(${alias}.metadata_json, '$.memoryIndex.description'), '') || ' ' ||
+                      COALESCE(json_extract(${alias}.metadata_json, '$.memoryIndex.sections'), '') || char(10) ||
+                      COALESCE((SELECT group_concat(topic.topic, char(10)) FROM memory_topics AS topic
+                                WHERE topic.memory_id = ${alias}.id AND topic.source_revision = ${alias}.topic_revision), '')), 'İ', 'i̇')`;
 }
 
-function indexTermPredicate(alias = ""): string {
-  const prefix = alias ? `${alias}.` : "";
-  // 本文だけの大量一致が、索引や分類に一致する入口を候補上限から押し出さない。
-  return `(replace(lower(COALESCE(json_extract(${prefix}metadata_json, '$.memoryIndex.title'), '') || ' ' ||
-                      COALESCE(json_extract(${prefix}metadata_json, '$.title'), '') || ' ' ||
-                      COALESCE(json_extract(${prefix}metadata_json, '$.memoryIndex.description'), '') || ' ' ||
-                      COALESCE(json_extract(${prefix}metadata_json, '$.memoryIndex.sections'), '')), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')
-       OR EXISTS (SELECT 1 FROM memory_topics AS topic
-                  WHERE topic.memory_id = ${prefix}id AND topic.source_revision = ${prefix}topic_revision
-                    AND replace(lower(topic.topic), 'İ', 'i̇') GLOB json_extract(term.value, '$.pattern')))`;
+// 一致した検索語の重みの合計。照合対象は外側の列を参照するだけで再計算しない。
+function indexWeightSql(haystack: string, patterns: IndexPattern[]): string {
+  if (patterns.length === 0) return "0";
+  return patterns.map(({ weight }) => `CASE WHEN ${haystack} GLOB ? THEN ${weight} ELSE 0 END`).join(" + ");
+}
+
+// 索引を持つ行は、いずれかの検索語が索引または分類に一致したときだけ優先する。
+// 本文だけの大量一致が、索引や分類に一致する入口を候補上限から押し出さない。
+// 旧実装の3値論理をそのまま保つ: 版が整数1以外と確定した行（index_v1=0）は常に優先し、
+// memoryIndex.version が無い行（index_v1=NULL）は索引版の行と同じく検索語の一致で決まる。
+function indexLexicalPrioritySql(indexV1: string, indexText: string, patterns: IndexPattern[]): string {
+  const matches = patterns.map(() => ` OR ${indexText} GLOB ?`).join("");
+  return `CASE WHEN NOT ${indexV1}${matches} THEN 0 ELSE 1 END`;
+}
+
+// 優先度判定用の列。版が確定的に1以外の行では照合対象を作らない（判定に不要なため）。
+function indexPriorityColumnsSql(alias: string): string {
+  return `${memoryIndexV1Sql(`${alias}.metadata_json`)} AS index_v1,
+                    CASE WHEN ${memoryIndexV1Sql(`${alias}.metadata_json`)} IS NOT 0 THEN ${indexHaystackSql(alias)} END AS index_text`;
 }
 
 // Node.js 24のUnicode小文字変換で、通常のupper逆写像では戻せない単文字の対応。
@@ -2059,15 +2114,27 @@ function indexQueryPatterns(terms: string[]): string {
 
 async function indexedMemories(getPattern: () => string, containerTag: string | undefined, scope: string | undefined, env: Env, indexOnly: boolean, manualContext = false): Promise<RankedMemoryRow[]> {
   const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
-  const patterns = getPattern();
+  const patterns = indexPatternList(getPattern());
   // 分類・索引だけの一致はVectorize topKや本文FTSの順位に依存させない。
+  // `LIMIT -1 OFFSET 0` は SQLite のサブクエリ平坦化を止める境界で、照合対象と重みを1行1回だけ計算させる。
+  // 同点は走査順（rowid昇順）と同じ順にするため row_order を最後の並べ替えキーに置き、
+  // 上限内の行だけを rowid で読み直して本文・metadata の一時保持を避ける。
   const result = await env.DB.prepare(
     `SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at, m.topic_revision
-     FROM memories AS m WHERE ${clause} AND ${indexTermMatch("m")}
-     ORDER BY (SELECT COALESCE(SUM(json_extract(term.value, '$.weight')), 0) FROM json_each(?) AS term
-               WHERE ${indexTermPredicate("m")}) DESC,
-              m.updated_at DESC LIMIT ?`,
-  ).bind(...parameters, patterns, patterns, MAX_LIMIT).all<RankedMemoryRow>();
+     FROM (
+       SELECT candidate.row_order, candidate.updated_at, ${indexWeightSql("candidate.index_text", patterns)} AS weight
+       FROM (
+         SELECT m.rowid AS row_order, m.updated_at, ${indexHaystackSql("m")} AS index_text
+         FROM memories AS m WHERE ${clause}
+         LIMIT -1 OFFSET 0
+       ) AS candidate
+       LIMIT -1 OFFSET 0
+     ) AS ranked
+     CROSS JOIN memories AS m ON m.rowid = ranked.row_order
+     WHERE ranked.weight > 0
+     ORDER BY ranked.weight DESC, ranked.updated_at DESC, ranked.row_order LIMIT ?`,
+  // 重みの GLOB は文中で検索条件より前に現れるため、束縛値も検索語、条件、上限の順に渡す。
+  ).bind(...patterns.map(({ pattern }) => pattern), ...parameters, MAX_LIMIT).all<RankedMemoryRow>();
   return result.results.map((row) => ({ ...row, lexicalMatch: true }));
 }
 
@@ -2087,15 +2154,29 @@ async function lexicalMemories(
   if (ftsQuery) {
     const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
     try {
-      const result = await env.DB.prepare(
-          `SELECT m.id, m.container_tag, ${searchContentColumn(indexOnly, "m")}, m.metadata_json, m.created_at, m.updated_at,
+      // 索引優先の判定は一致行ごとに1回だけ照合対象を作る（平坦化を止める境界は indexedMemories と同じ）。
+      // 同点はFTSの走査順のまま残す。全文検索だけの経路は従来の文をそのまま使う。
+      const patterns = indexOnly ? indexPatternList(getPattern()) : [];
+      const result = await env.DB.prepare(indexOnly
+        ? `SELECT id, container_tag, content, metadata_json, created_at, updated_at, topic_revision, rank
+           FROM (
+             SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at,
+                    m.topic_revision, bm25(memories_fts) AS rank,
+                    ${indexPriorityColumnsSql("m")}
+             FROM memories_fts
+             JOIN memories AS m ON m.rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ? AND ${clause}
+             LIMIT -1 OFFSET 0
+           ) AS fts
+           ORDER BY ${indexLexicalPrioritySql("fts.index_v1", "fts.index_text", patterns)}, fts.rank LIMIT ?`
+        : `SELECT m.id, m.container_tag, ${searchContentColumn(indexOnly, "m")}, m.metadata_json, m.created_at, m.updated_at,
                   m.topic_revision, bm25(memories_fts) AS rank
            FROM memories_fts
            JOIN memories AS m ON m.rowid = memories_fts.rowid
            WHERE memories_fts MATCH ? AND ${clause}
-           ORDER BY ${indexOnly ? `${indexLexicalPriority("m")}, ` : ""}rank LIMIT ?`,
+           ORDER BY rank LIMIT ?`,
         )
-          .bind(ftsQuery, ...parameters, ...(indexOnly ? [getPattern()] : []), candidateLimit)
+          .bind(ftsQuery, ...parameters, ...patterns.map(({ pattern }) => pattern), candidateLimit)
           .all<RankedMemoryRow>();
       if (result.results.length > 0) {
         if (!indexOnly || query.normalize("NFKC") === query) return result.results;
@@ -2109,13 +2190,24 @@ async function lexicalMemories(
 
   if (query.length > 0 && query.length <= 1_000) {
     const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
-    const result = await env.DB.prepare(
-        `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at, topic_revision
+    const patterns = indexOnly ? indexPatternList(getPattern()) : [];
+    // 索引優先の判定は FTS と同じく、一致行ごとに1回だけ照合対象を作る。
+    const result = await env.DB.prepare(indexOnly
+        ? `SELECT id, container_tag, content, metadata_json, created_at, updated_at, topic_revision
+           FROM (
+             SELECT id, container_tag, ${searchContentColumn(true)}, metadata_json, created_at, updated_at, topic_revision,
+                    ${indexPriorityColumnsSql("memories")}
+             FROM memories
+             WHERE ${clause} AND instr(lower(content), lower(?)) > 0
+             LIMIT -1 OFFSET 0
+           ) AS lexical
+           ORDER BY ${indexLexicalPrioritySql("lexical.index_v1", "lexical.index_text", patterns)}, lexical.updated_at DESC LIMIT ?`
+        : `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at, topic_revision
          FROM memories
          WHERE ${clause} AND instr(lower(content), lower(?)) > 0
-         ORDER BY ${indexOnly ? `${indexLexicalPriority()}, ` : ""}updated_at DESC LIMIT ?`,
+         ORDER BY updated_at DESC LIMIT ?`,
       )
-        .bind(...parameters, query, ...(indexOnly ? [getPattern()] : []), candidateLimit)
+        .bind(...parameters, query, ...patterns.map(({ pattern }) => pattern), candidateLimit)
         .all<RankedMemoryRow>();
     return result.results.length > 0 ? result.results : normalizedFtsRows;
   }
@@ -2391,20 +2483,16 @@ function sortByQueryCoverage(
 async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & { results: JsonObject[]; timing: number }> {
   const MAX_INDEX_LEXICAL_SCAN = 1_000;
   const startedAt = performance.now();
-  if (body.indexOnly !== undefined && typeof body.indexOnly !== "boolean") {
-    throw new HttpError(400, "indexOnly must be a boolean");
-  }
+  assertOptionalBoolean(body, "indexOnly");
   const indexOnly = body.indexOnly === true;
-  if (body.manualContext !== undefined && typeof body.manualContext !== "boolean") throw new HttpError(400, "manualContext must be a boolean");
+  assertOptionalBoolean(body, "manualContext");
   const manualContext = indexOnly && body.manualContext === true;
   const query = typeof body.q === "string" ? truncateUtf16(body.q.trim(), 1_000) : "";
   let terms: string[] | undefined;
   let pattern: string | undefined;
   const getTerms = () => terms ??= searchQueryTerms(query);
   const getPattern = () => pattern ??= indexQueryPatterns(getTerms());
-  if (body.allContainers !== undefined && typeof body.allContainers !== "boolean") {
-    throw new HttpError(400, "allContainers must be a boolean");
-  }
+  assertOptionalBoolean(body, "allContainers");
   const allContainers = body.allContainers === true;
   if (allContainers && body.containerTag !== undefined) throw new HttpError(400, "allContainers cannot be combined with containerTag");
   const containerTag = allContainers ? undefined : stringValue(body.containerTag, "containerTag", MAX_CONTAINER_TAG_LENGTH);
@@ -2412,6 +2500,7 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
   const scope = scopeFilter(body);
 
   let rows: RankedMemoryRow[];
+  let rankedTopics: Map<string, string[]> | undefined;
   if (!query) {
     rows = await recentMemories(env, containerTag, limit, scope, indexOnly, manualContext);
   } else {
@@ -2438,8 +2527,10 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
        WHERE consolidation.status = 'active' AND ${clause}
        ORDER BY consolidation.updated_at DESC LIMIT ?`,
     ).bind(...parameters).all<RankedMemoryRow>();
-    const relevant = query ? await filterIndexLexicalRows(active.results, getTerms(), env) : active.results;
-    const activeTopics = await topicsByMemory(relevant, env);
+    // 絞り込みで読んだ索引行の分類はそのまま使い、索引を持たない行の分類だけを追加で読む。
+    const filtered = query ? await filterIndexLexicalRows(active.results, getTerms(), env) : { rows: active.results, topics: undefined };
+    const relevant = filtered.rows;
+    const activeTopics = await topicsByMemory(relevant, env, filtered.topics);
     const terms = getTerms();
     const sortedRelevant = sortByQueryCoverage(relevant, activeTopics, terms);
     const candidates = new Map(rows.map((row) => [row.id, row]));
@@ -2448,6 +2539,7 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
 
     rows = await indexSearchRows(rows, getTerms, env);
     const candidateTopics = await topicsByMemory(rows, env);
+    rankedTopics = candidateTopics;
     rows = sortByQueryCoverage(rows, candidateTopics, terms, true, true);
     rows = rows.slice(0, limit);
     if (rows.length > 0) {
@@ -2482,6 +2574,7 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
   if (allContainers && !indexOnly) {
     rows = await indexSearchRows(rows, getTerms, env, false);
     const candidateTopics = await topicsByMemory(rows, env);
+    rankedTopics = candidateTopics;
     const terms = getTerms();
     rows = sortByQueryCoverage(rows, candidateTopics, terms, true);
     rows = rows.slice(0, limit);
@@ -2490,7 +2583,8 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
     const manualOnly=await registeredManualOnlyIds(rows,env);
     rows=rows.map(row=>manualOnly.has(row.id)?{...row,metadata_json:JSON.stringify(manualOnlyMetadata(parseMetadata(row.metadata_json),true))}:row);
   }
-  const topics = await topicsByMemory(rows, env);
+  // 本文の再読込後に読んだ分類（rankedTopics）があれば、絞り込み後の行はその部分集合なので読み直さない。
+  const topics = await topicsByMemory(rows, env, rankedTopics);
   const containers = allContainers ? await env.DB.prepare(
     "SELECT DISTINCT container_tag AS tag FROM memories WHERE is_forgotten = 0 ORDER BY container_tag",
   ).all<{ tag: string }>() : null;
@@ -2511,9 +2605,7 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
   const metadataObject = metadataValue as JsonObject;
   const explicitTopics = explicitTopicsFromMetadata(metadataObject);
   const shouldEnrich = enrichmentEnabled(env) && automaticEnrichmentAllowed(metadataObject);
-  if (body.reuseExistingCapture !== undefined && typeof body.reuseExistingCapture !== "boolean") {
-    throw new HttpError(400, "reuseExistingCapture must be a boolean");
-  }
+  assertOptionalBoolean(body, "reuseExistingCapture");
   if (body.reuseExistingCapture === true) {
     const captureKey = metadataObject.captureKey;
     const projectId = metadataObject.sm_project_id;
@@ -2551,16 +2643,21 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
   }
   const generatedId = crypto.randomUUID();
   const customId = requestedCustomId ?? generatedId;
-  if (requestedCustomId && await env.DB.prepare(
-    `SELECT s.summary_id FROM memory_organization_versions s JOIN memories m ON m.id=s.memory_id
-     WHERE m.container_tag=? AND m.custom_id=?`,
-  ).bind(containerTag, customId).first()) throw new HttpError(409, "Generated summaries cannot be edited");
-  if (requestedCustomId && await env.DB.prepare(
-    `SELECT consolidation.id FROM memory_consolidations AS consolidation
-     JOIN memories AS memory ON memory.id = consolidation.memory_id
-     WHERE memory.container_tag = ? AND memory.custom_id = ?`,
-  ).bind(containerTag, customId).first()) {
-    throw new HttpError(409, "Generated checkpoints cannot be edited; update their source documents instead");
+  if (requestedCustomId) {
+    // 生成要約と生成チェックポイントの事前確認を1往復にまとめる。EXISTS は常に1行返すため列値で判定し、
+    // 従来どおり要約の拒否を優先する。公開後の競合は下の upsert の NOT EXISTS 条件が最終的に拒否する。
+    const generated = await env.DB.prepare(
+      `SELECT
+         EXISTS(SELECT 1 FROM memory_organization_versions s JOIN memories m ON m.id=s.memory_id
+                WHERE m.container_tag=? AND m.custom_id=?) AS summary,
+         EXISTS(SELECT 1 FROM memory_consolidations AS consolidation
+                JOIN memories AS memory ON memory.id = consolidation.memory_id
+                WHERE memory.container_tag = ? AND memory.custom_id = ?) AS checkpoint`,
+    ).bind(containerTag, customId, containerTag, customId).first<{ summary: number; checkpoint: number }>();
+    if (generated?.summary === 1) throw new HttpError(409, "Generated summaries cannot be edited");
+    if (generated?.checkpoint === 1) {
+      throw new HttpError(409, "Generated checkpoints cannot be edited; update their source documents instead");
+    }
   }
   const entityContext = optionalString(body.entityContext, "entityContext", 32_000) ?? null;
   const now = new Date().toISOString();
@@ -2571,7 +2668,9 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
     : shouldEnrich ? "pending" : "disabled";
   const topicRevision = crypto.randomUUID();
 
-  const [, memoryWrite] = await env.DB.batch([
+  // 先頭2文の位置は固定（memoryWrite と競合テストの割込み条件が依存する）。保存行の ID と、この保存で
+  // 無効化したチェックポイントは、batch 末尾の SELECT で同じトランザクションの確定状態から読む。
+  const writeResults = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO container_tags(tag, name, created_at, updated_at) VALUES (?, ?, ?, ?)
        ON CONFLICT(tag) DO UPDATE SET updated_at = excluded.updated_at`,
@@ -2652,19 +2751,37 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
       [containerTag, customId, topicRevision],
       now,
     ),
+    env.DB.prepare(
+      "SELECT id FROM memories WHERE container_tag = ? AND custom_id = ?",
+    ).bind(containerTag, customId),
+    // cleanupInvalidatedConsolidations と同じ条件。原文 ID は上の行と同じ (container_tag, custom_id) で引く。
+    env.DB.prepare(
+      `SELECT consolidation.memory_id AS memoryId, memory.container_tag AS containerTag
+       FROM memory_consolidations AS consolidation
+       JOIN memories AS memory ON memory.id = consolidation.memory_id
+       WHERE consolidation.status = 'invalid' AND consolidation.updated_at = ?
+         AND (consolidation.memory_id = (SELECT id FROM memories WHERE container_tag = ? AND custom_id = ?)
+           OR EXISTS (
+             SELECT 1 FROM memory_consolidation_sources AS source
+             WHERE source.consolidation_id = consolidation.id
+               AND source.memory_id = (SELECT id FROM memories WHERE container_tag = ? AND custom_id = ?)
+           ))`,
+    ).bind(now, containerTag, customId, containerTag, customId),
   ]);
+  const memoryWrite = writeResults[1];
 
   // 事前確認の後に公開されたcheckpointも、同じ書込みSQLの正本条件で拒否する。
   if ((memoryWrite?.meta.changes ?? 0) === 0) {
     throw new HttpError(409, "Generated checkpoints cannot be edited; update their source documents instead");
   }
-  const stored = await env.DB.prepare(
-    "SELECT id FROM memories WHERE container_tag = ? AND custom_id = ?",
-  )
-    .bind(containerTag, customId)
-    .first<{ id: string }>();
-  const memoryId = stored?.id ?? generatedId;
-  await cleanupInvalidatedConsolidations(memoryId, now, env, ctx);
+  // 同一トランザクションで upsert が成功していれば行は必ずあるため、欠落は応答不備として扱う。
+  const storedId = (writeResults.at(-2)?.results?.[0] as { id?: unknown } | undefined)?.id;
+  const invalidated = writeResults.at(-1)?.results as { memoryId: string; containerTag: string }[] | undefined;
+  if (typeof storedId !== "string" || !invalidated) {
+    throw new HttpError(500, "D1 returned an incomplete batch response");
+  }
+  const memoryId = storedId;
+  await removeInvalidatedConsolidations(invalidated, env, ctx);
   const memory: EnrichmentMemory = {
     id: memoryId,
     containerTag,
@@ -3278,13 +3395,9 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   )) {
     throw new HttpError(400, "projection must be full, index, ids, or capture");
   }
-  if (body.enrichmentEligible !== undefined && typeof body.enrichmentEligible !== "boolean") {
-    throw new HttpError(400, "enrichmentEligible must be a boolean");
-  }
+  assertOptionalBoolean(body, "enrichmentEligible");
   const projection = (body.projection ?? "full") as DocumentProjection;
-  if (body.recentTasks !== undefined && typeof body.recentTasks !== "boolean") {
-    throw new HttpError(400, "recentTasks must be a boolean");
-  }
+  assertOptionalBoolean(body, "recentTasks");
   const recentTasks = body.recentTasks === true;
   if (recentTasks && (projection !== "index" || containerTag || requestedTopic)) {
     throw new HttpError(400, "recentTasks requires index projection without containerTag or topic");
@@ -3377,26 +3490,41 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
         created_at DESC, updated_at DESC, id DESC
     ) AS task_rank FROM candidates
   ), recent AS (
-    SELECT id, source_date FROM ranked WHERE task_rank = 1
+    SELECT id, source_date, COUNT(*) OVER () AS recent_total FROM ranked WHERE task_rank = 1
     ORDER BY source_date DESC, id DESC LIMIT ? OFFSET ?
   ) ` : "";
   const table = "memories";
   const selection = recentTasks ? "1 = 1" : where;
-  const [countResult, rowsResult] = await env.DB.batch([
-    env.DB.prepare(recentTasks
-      ? `SELECT COUNT(*) AS total FROM (SELECT 1 FROM memories AS m WHERE ${where} GROUP BY ${taskProject}, ${taskSession})`
-      : `SELECT COUNT(*) AS total FROM ${table} AS m WHERE ${selection}`).bind(...parameters),
-    env.DB.prepare(
-      `${recentPrefix}SELECT ${columns} FROM ${table} AS m ${recentTasks ? "JOIN recent ON recent.id = m.id" : ""} WHERE ${selection}
+  // 直近タスクの総数は、グループ化済みの同じ走査から窓関数で求める（LIMIT/OFFSET より前に評価される）。
+  // 以前は同じ全件走査を件数用にもう一度行っており、プロンプトごとの D1 負荷が2倍になっていた。
+  // D1 は1データベースを単一スレッドで処理するため、同時セッションが重なると過負荷で失敗しやすい。
+  const countStatement = env.DB.prepare(recentTasks
+    ? `SELECT COUNT(*) AS total FROM (SELECT 1 FROM memories AS m WHERE ${where} GROUP BY ${taskProject}, ${taskSession})`
+    : `SELECT COUNT(*) AS total FROM ${table} AS m WHERE ${selection}`).bind(...parameters);
+  const rowsStatement = env.DB.prepare(
+    `${recentPrefix}SELECT ${columns}${recentTasks ? ", recent.recent_total" : ""} FROM ${table} AS m ${recentTasks ? "JOIN recent ON recent.id = m.id" : ""} WHERE ${selection}
        ORDER BY ${recentTasks ? "recent.source_date DESC, m.id DESC" : "m.updated_at DESC LIMIT ? OFFSET ?"}`,
-    ).bind(...parameters, limit, offset),
-  ]);
-  if (!countResult || !rowsResult) {
-    throw new HttpError(500, "D1 returned an incomplete batch response");
+  ).bind(...parameters, limit, offset);
+  const readTotal = (row: unknown, key: string): number => {
+    const value = isObject(row) ? row[key] : 0;
+    return typeof value === "number" ? value : Number(value ?? 0);
+  };
+  let total: number;
+  let rowsResult: D1Result<Record<string, unknown>>;
+  if (recentTasks) {
+    rowsResult = await rowsStatement.all();
+    // 範囲外のページでは行が無く総数を得られないため、そのときだけ従来の件数文で補う。
+    total = rowsResult.results.length
+      ? readTotal(rowsResult.results[0], "recent_total")
+      : readTotal((await countStatement.all()).results[0], "total");
+  } else {
+    const [countResult, pageResult] = await env.DB.batch([countStatement, rowsStatement]);
+    if (!countResult || !pageResult) {
+      throw new HttpError(500, "D1 returned an incomplete batch response");
+    }
+    rowsResult = pageResult as D1Result<Record<string, unknown>>;
+    total = readTotal(countResult.results[0], "total");
   }
-  const countRow = countResult.results[0];
-  const totalValue = isObject(countRow) ? countRow.total : 0;
-  const total = typeof totalValue === "number" ? totalValue : Number(totalValue ?? 0);
   let documents: JsonObject[];
   if (projection === "ids") {
     documents = rowsResult.results.flatMap((row) =>
@@ -3888,11 +4016,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return addMemory(request, env, ctx);
   }
   if (url.pathname === "/v3/documents/list" && request.method === "POST") return listDocuments(request, env);
-  if (url.pathname === "/v3/search" && request.method === "POST") {
-    const result = await searchMemories(await readJson(request), env);
-    return json({ ...result, total: result.results.length });
-  }
-  if (url.pathname === "/v4/search" && request.method === "POST") {
+  // /v3/search は旧クライアント互換の別名で、/v4/search と同じ処理・応答を返す。
+  if ((url.pathname === "/v3/search" || url.pathname === "/v4/search") && request.method === "POST") {
     const result = await searchMemories(await readJson(request), env);
     return json({ ...result, total: result.results.length });
   }
@@ -3926,19 +4051,38 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   throw new HttpError(404, "Not found");
 }
 
+// D1 の過負荷（キュー滞留・10秒窓の資源超過など）を示す公式エラー文言だけを判定する。
+// 出典: https://developers.cloudflare.com/d1/observability/debug-d1/
+// 例外の cause に包まれて届く場合もあるため、たどれる範囲の message を確認する。
+function isD1Overload(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 4; depth++) {
+    const message = current instanceof Error ? current.message : typeof current === "string" ? current : "";
+    if (message.includes("D1 DB is overloaded")) return true;
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return false;
+}
+
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       return await route(request, env, ctx);
     } catch (error) {
       if (error instanceof HttpError) return json({ error: { message: error.message } }, error.status);
+      const overloaded = isD1Overload(error);
       console.error(
         JSON.stringify({
-          event: "request_failed",
+          event: overloaded ? "request_overloaded" : "request_failed",
           path: new URL(request.url).pathname,
           error: diagnosticError(error, env),
         }),
       );
+      if (overloaded) {
+        // D1 の過負荷は一時的なため、再試行可能な 503 と待ち時間を返す。本文は固定文言にする。
+        const response = json({ error: { message: "Memory database is temporarily overloaded; retry later" } }, 503);
+        response.headers.set("Retry-After", "10");
+        return response;
+      }
       return json({ error: { message: "Internal server error" } }, 500);
     }
   },

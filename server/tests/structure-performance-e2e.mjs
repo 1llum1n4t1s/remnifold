@@ -119,7 +119,6 @@ function scenario(name,run,verify){test(name,async()=>{const f=fixture(observed)
 }, (current) => {
   const count = invalid ? 99 : 100;
   assert.equal(current.counts.digests, tags);
-  assert.equal(current.counts.rowComparisons, 0);
   assert.equal(current.counts.rowLookups, count);
 });
 

@@ -13,6 +13,11 @@ import "../organization-core.test.mjs";
 import "../organization-core-queues.test.mjs";
 import "../organization-core-recovery.test.mjs";
 import "../organization-core-conflicts.test.mjs";
+import "../organization-days.test.mjs";
+import "../recent-tasks-load.test.mjs";
+import "../search-load.test.mjs";
+import "../consolidation-due.test.mjs";
+import "../add-memory-load.test.mjs";
 class TestDatabase {
   constructor(ctx) {
     this.ctx = ctx;
