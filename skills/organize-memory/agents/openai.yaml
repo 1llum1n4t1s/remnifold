@@ -1,0 +1,4 @@
+interface:
+  display_name: "Organize Remnifold memory"
+  short_description: "Organize recent memories on demand, e.g. the last 7 days"
+  default_prompt: "Use $organize-memory to organize my Remnifold memories from the last 7 days."

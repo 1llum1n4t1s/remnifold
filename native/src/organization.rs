@@ -183,24 +183,60 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let mut line = false;
     let mut private_stdin = false;
-    for arg in args.iter().skip(1) {
+    // prepare --days N: 直近N日に作成された記憶だけを整理対象にする手動実行用の範囲指定。
+    // 範囲の基準時刻はサーバーのDB時刻で決まるため、ここでは整数範囲だけを検証する。
+    let mut days: Option<u16> = None;
+    // --range-cursor はサーバーが返した走査位置トークン(range.cursor)を次の prepare へ渡す。
+    // base64url の英数字・'-'・'_' だけを許し、記憶本文を引数へ載せる経路にはしない。
+    let mut range_cursor: Option<String> = None;
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--line" if !line => line = true,
             "--private-stdin" if !private_stdin => private_stdin = true,
+            "--range-cursor" if range_cursor.is_none() => {
+                range_cursor = Some(
+                    rest.next()
+                        .filter(|value| {
+                            !value.is_empty()
+                                && value.len() <= 1024
+                                && value
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "--range-cursor requires the token returned by a ranged prepare."
+                            )
+                        })?,
+                )
+            }
+            "--days" if days.is_none() => {
+                days = Some(
+                    rest.next()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .filter(|value| (1..=MAX_DAYS).contains(value))
+                        .ok_or_else(|| {
+                            anyhow!("--days requires a whole number from 1 to {MAX_DAYS}.")
+                        })?,
+                )
+            }
             _ => bail!(
-                "Use memory-organize prepare, commit, lookup, or sources. commit/lookup accept optional --line and --private-stdin."
+                "Use memory-organize prepare [--days N [--range-cursor TOKEN]], commit, lookup, or sources. commit/lookup accept optional --line and --private-stdin."
             ),
         }
     }
     if args.is_empty() {
         bail!(
-            "Use memory-organize prepare, commit, lookup, or sources. commit/lookup accept optional --line and --private-stdin."
+            "Use memory-organize prepare [--days N [--range-cursor TOKEN]], commit, lookup, or sources. commit/lookup accept optional --line and --private-stdin."
         );
     }
     let action = args[0].as_str();
     if matches!(action, "--help" | "-h") {
         println!(
-            "Usage: remnifold memory-organize <prepare|commit|lookup> [--line [--private-stdin]]\n       remnifold memory-organize sources <summary-document-id> [cursor]\nprepare acquires a bounded thirty-minute lease. commit/lookup read JSON from stdin\nwithin thirty seconds (128,000 bytes maximum). --line accepts one compact JSON\nline terminated by a newline without requiring EOF. --private-stdin requires --line\nand a dedicated Windows PTY, never a shared console. Echo is disabled before\nREMNIFOLD_STDIN_READY on stderr. Send one final newline and no bytes afterward.\nUnterminated failure keeps echo disabled; stop sending and close the PTY on failure.\nUses the existing owner connection. No model generation, fallback, remote deployment,\nor plugin installation occurs."
+            "Usage: remnifold memory-organize prepare [--days N]\n       remnifold memory-organize <commit|lookup> [--line [--private-stdin]]\n       remnifold memory-organize sources <summary-document-id> [cursor]\nprepare acquires a bounded thirty-minute lease. --days N (1-{MAX_DAYS}) limits the\nbatch to memories created in the last N days by server time without moving the\nglobal discovery queue. Pass the returned range.cursor as --range-cursor to continue.
+commit/lookup read JSON from stdin\nwithin thirty seconds (128,000 bytes maximum). --line accepts one compact JSON\nline terminated by a newline without requiring EOF. --private-stdin requires --line\nand a dedicated Windows PTY, never a shared console. Echo is disabled before\nREMNIFOLD_STDIN_READY on stderr. Send one final newline and no bytes afterward.\nUnterminated failure keeps echo disabled; stop sending and close the PTY on failure.\nUses the existing owner connection. No model generation, fallback, remote deployment,\nor plugin installation occurs."
         );
         return Ok(());
     }
@@ -210,18 +246,34 @@ pub fn run(args: &[String]) -> Result<()> {
     if (line || private_stdin) && action == "prepare" {
         bail!("prepare does not accept --line or --private-stdin.");
     }
+    if days.is_some() && action != "prepare" {
+        bail!("--days is accepted only by prepare.");
+    }
+    if range_cursor.is_some() && days.is_none() {
+        bail!("--range-cursor requires prepare --days.");
+    }
     if private_stdin && !line {
         bail!("--private-stdin requires --line.");
     }
-    let payload = if action == "prepare" {
-        json!({})
-    } else {
-        input(line, private_stdin)?
+    let payload = match (action, days) {
+        ("prepare", Some(days)) => match range_cursor {
+            Some(cursor) => json!({ "days": days, "rangeCursor": cursor }),
+            None => json!({ "days": days }),
+        },
+        ("prepare", None) => json!({}),
+        _ => input(line, private_stdin)?,
     };
-    request(action, payload)
+    request_with(action, payload, days.is_some())
 }
 
+/// 手動整理の日数指定の上限。サーバー側の検証値と一致させる。
+const MAX_DAYS: u16 = 3650;
+
 fn request(action: &str, payload: Value) -> Result<()> {
+    request_with(action, payload, false)
+}
+
+fn request_with(action: &str, payload: Value, ranged: bool) -> Result<()> {
     let config = common::load_config(None)
         .map_err(|_| anyhow!("Memory organization connection is unavailable."))?;
     let result = common::api_bounded(
@@ -230,7 +282,7 @@ fn request(action: &str, payload: Value) -> Result<()> {
         &payload,
         2 * 1024 * 1024,
     )
-    .map_err(|error| request_error(action, error))?;
+    .map_err(|error| request_error(action, ranged, error))?;
     if result["protocol"] != 1 {
         bail!("Unsupported memory organization response.");
     }
@@ -243,11 +295,15 @@ fn request(action: &str, payload: Value) -> Result<()> {
     Ok(())
 }
 
-fn request_error(action: &str, error: anyhow::Error) -> anyhow::Error {
+fn request_error(action: &str, ranged: bool, error: anyhow::Error) -> anyhow::Error {
     match error
         .downcast_ref::<common::ApiError>()
         .and_then(|error| error.status)
     {
+        // 日数指定を知らない旧サーバーは未知フィールドとして400を返す。
+        Some(400) if ranged => anyhow!(
+            "The server rejected the --days range. Update the server to a version that supports ranged organization; no fallback was attempted."
+        ),
         Some(404) if action == "sources" => anyhow!(
             "The source listing is unavailable. Check the current summary document ID and server support for source listings; no fallback was attempted."
         ),
@@ -327,6 +383,71 @@ mod tests {
     }
 
     #[test]
+    fn days_is_a_bounded_prepare_only_option_rejected_before_requesting() {
+        // 接続設定を読む前に引数だけで拒否されることを確認する。
+        let range = "--days requires a whole number from 1 to 3650.";
+        for value in ["0", "3651", "-1", "1.5", "7d", ""] {
+            assert_eq!(
+                run(&["prepare".into(), "--days".into(), value.into()])
+                    .unwrap_err()
+                    .to_string(),
+                range
+            );
+        }
+        assert_eq!(
+            run(&["prepare".into(), "--days".into()])
+                .unwrap_err()
+                .to_string(),
+            range
+        );
+        for action in ["commit", "lookup"] {
+            assert_eq!(
+                run(&[action.into(), "--days".into(), "7".into()])
+                    .unwrap_err()
+                    .to_string(),
+                "--days is accepted only by prepare."
+            );
+        }
+        assert!(
+            run(&[
+                "prepare".into(),
+                "--days".into(),
+                "7".into(),
+                "--days".into(),
+                "7".into()
+            ])
+            .is_err()
+        );
+        for args in [
+            vec!["prepare", "--range-cursor", "abc"],
+            vec!["prepare", "--days", "7", "--range-cursor", "a b"],
+            vec!["prepare", "--days", "7", "--range-cursor", "a'b"],
+            vec!["prepare", "--days", "7", "--range-cursor"],
+            vec!["commit", "--days", "7", "--range-cursor", "abc"],
+        ] {
+            assert!(run(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+        }
+        assert_eq!(
+            run(&["prepare".into(), "--range-cursor".into(), "abc".into()])
+                .unwrap_err()
+                .to_string(),
+            "--range-cursor requires prepare --days."
+        );
+        assert!(
+            request_error(
+                "prepare",
+                true,
+                anyhow::Error::new(common::ApiError {
+                    status: Some(400),
+                    unsupported_global_search: false
+                })
+            )
+            .to_string()
+            .contains("--days")
+        );
+    }
+
+    #[test]
     fn private_stdin_requires_line_before_reading_or_requesting() {
         for action in ["commit", "lookup"] {
             assert_eq!(
@@ -379,13 +500,13 @@ mod tests {
             }
             .into()
         };
-        let source_error = request_error("sources", missing()).to_string();
+        let source_error = request_error("sources", false, missing()).to_string();
         assert_eq!(
             source_error,
             "The source listing is unavailable. Check the current summary document ID and server support for source listings; no fallback was attempted."
         );
         assert!(
-            request_error("lookup", missing())
+            request_error("lookup", false, missing())
                 .to_string()
                 .starts_with("The server does not support memory organization.")
         );
