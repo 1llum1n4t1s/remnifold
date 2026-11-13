@@ -4,7 +4,9 @@ use super::path_safety::no_links;
 use super::process as acl_process;
 use anyhow::{Result, bail, ensure};
 use std::{fs, path::Path};
-#[cfg(test)]
+// Windows 専用テスト（windows::tests の junction fixture）だけが使う複製なので、
+// Unix のテストビルドで dead_code 警告にならないよう Windows に限定する。
+#[cfg(all(test, windows))]
 #[path = "../test_links.rs"]
 mod test_links;
 #[cfg(all(test, windows))]

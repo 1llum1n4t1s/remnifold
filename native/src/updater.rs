@@ -30,20 +30,15 @@ pub(crate) mod test_links;
 
 type Files = BTreeMap<String, Vec<u8>>;
 const LIMIT: u64 = crate::release_manifest::MAX_ARCHIVE;
-fn sha(bytes: &[u8]) -> String {
-    crate::common::encode_hex(&Sha256::digest(bytes))
-}
+// SHA-256 の小文字16進表記と、固定長の小文字16進判定は共通実装を使う。
+// 同じ判定を複数箇所で持つと、配布物検証の規則がずれたときに追跡しにくくなるため。
+use crate::common::sha256 as sha;
+use crate::release_manifest::hex;
 fn blob(bytes: &[u8]) -> String {
     let mut hash = Sha1::new();
     hash.update(format!("blob {}\0", bytes.len()));
     hash.update(bytes);
     crate::common::encode_hex(&hash.finalize())
-}
-fn hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn target() -> Result<&'static str> {
     Ok(match (env::consts::OS, env::consts::ARCH) {
@@ -1351,7 +1346,7 @@ fn update(argv: &[String]) -> Result<Value> {
     )?;
     let codex_home = absolute(&env::var("CODEX_HOME").unwrap_or_else(|_| "~/.codex".into()))?;
     let default_work = if cfg!(windows) {
-        format!("D:/Codex/remnifold/plugin-auto-update-{version}")
+        format!("D:/Claude/remnifold/plugin-auto-update-{version}")
     } else {
         format!("~/.cache/remnifold/plugin-auto-update-{version}")
     };
@@ -1372,7 +1367,7 @@ fn update(argv: &[String]) -> Result<Value> {
     );
     #[cfg(windows)]
     ensure!(
-        within(&absolute("D:/Codex/remnifold")?, &work),
+        within(&absolute("D:/Claude/remnifold")?, &work),
         "INVALID_WORK_ROOT"
     );
     no_links(&work, true)?;

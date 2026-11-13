@@ -306,7 +306,7 @@ pub fn smoke(args: &[String]) -> Result<()> {
     );
     #[cfg(windows)]
     ensure!(
-        root.starts_with("D:/Codex/remnifold"),
+        root.starts_with("D:/Claude/remnifold"),
         "Smoke work root outside allowed directory"
     );
     fs::create_dir_all(&root)?;
@@ -1314,7 +1314,7 @@ pub fn publish(args: &[String]) -> Result<()> {
     );
     #[cfg(windows)]
     ensure!(
-        root.starts_with("D:/Codex/remnifold"),
+        root.starts_with("D:/Claude/remnifold"),
         "Publication work root outside allowed directory"
     );
     fs::create_dir_all(&root)?;

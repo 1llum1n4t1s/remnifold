@@ -281,7 +281,13 @@ impl Fixture {
         );
         #[cfg(not(windows))]
         command.env("PATH", "");
-        let output = crate::client_e2e::process_output(command, b"")?;
+        // bootstrap は検証対象バイナリ自身で R2 アーカイブ取得・SHA-256 検証・展開・インストール・
+        // 受領証検証を行い、同じ実行ファイル（debug ビルドでは約 124MB）を何度も読み直す。
+        // `cargo xtask check` は最適化なしの debug バイナリを渡すため、遅い GitHub 提供 x64 ランナーでは
+        // 既定の 30 秒を超えて正常な実行でも打ち切られていた。待ち時間の上限は残したまま、
+        // bootstrap だけ余裕のある上限にする（ハングは引き続きこの上限で失敗として検出される）。
+        let output =
+            crate::client_e2e::process_output_with_timeout(command, b"", Duration::from_secs(180))?;
         ensure!(
             output.stderr.is_empty()
                 || String::from_utf8_lossy(&output.stderr).trim() == "PLUGIN_BOOTSTRAP_FAILED",
@@ -2149,8 +2155,8 @@ pub fn validate_work_root(repo: &Path, work: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     ensure!(
-        work.is_absolute() && key(work).starts_with("d:/codex/remnifold/"),
-        "Windows updater fixture root must be under D:/Codex/remnifold"
+        work.is_absolute() && key(work).starts_with("d:/claude/remnifold/"),
+        "Windows updater fixture root must be under D:/Claude/remnifold"
     );
     safe_path(work)?;
     let normalized = |path: &Path| -> Result<PathBuf> {

@@ -75,7 +75,7 @@ fn arguments(argv: &[String]) -> Result<BTreeMap<String, String>> {
 
 fn default_work_root() -> Result<PathBuf> {
     #[cfg(windows)]
-    let path = PathBuf::from("D:/Codex/remnifold/bootstrap");
+    let path = PathBuf::from("D:/Claude/remnifold/bootstrap");
     #[cfg(not(windows))]
     let path = fs::canonicalize(env::temp_dir())?.join("remnifold-bootstrap");
     ensure!(path.is_absolute(), "INVALID_WORK_ROOT");
@@ -118,7 +118,7 @@ fn bootstrap(argv: &[String]) -> Result<Value> {
     let work = absolute(&args["--work-root"])?;
     #[cfg(windows)]
     ensure!(
-        within(&absolute("D:/Codex/remnifold")?, &work),
+        within(&absolute("D:/Claude/remnifold")?, &work),
         "INVALID_WORK_ROOT"
     );
     let config: Value = if let Some(path) = args.get("--config") {
@@ -357,7 +357,7 @@ mod tests {
         let path = default_work_root().unwrap();
         assert!(path.is_absolute());
         #[cfg(windows)]
-        assert_eq!(path, PathBuf::from("D:/Codex/remnifold/bootstrap"));
+        assert_eq!(path, PathBuf::from("D:/Claude/remnifold/bootstrap"));
         #[cfg(not(windows))]
         {
             assert_eq!(

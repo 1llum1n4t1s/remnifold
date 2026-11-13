@@ -369,7 +369,7 @@ fn packaged_windows_fixture(binary: &Path, work: &Path) -> Result<std::path::Pat
 pub(crate) fn process_output(command: Command, input: &[u8]) -> Result<std::process::Output> {
     process_output_with_timeout(command, input, Duration::from_secs(30))
 }
-fn process_output_with_timeout(
+pub(crate) fn process_output_with_timeout(
     mut command: Command,
     input: &[u8],
     timeout: Duration,
@@ -883,6 +883,117 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
         "capture disclosed secrets/commentary"
     );
     checks.push("native Stop captures final-only Unicode/NUL content, sanitizes keys, suppresses acknowledged retries");
+    // Claude Code 形式の会話記録でも、同じ Stop フックが依頼と最終回答だけを保存し、
+    // 思考・ツール入出力・API要求の写しを除外して、受領済みの再送を抑止することを確認する。
+    let claude_session = "native-claude-capture-session";
+    let claude_dir = home.join("claude-projects");
+    fs::create_dir_all(&claude_dir)?;
+    let claude_transcript = claude_dir.join(format!("{claude_session}.jsonl"));
+    let claude_rows = [
+        json!({"type":"queue-operation","operation":"enqueue","sessionId":claude_session,"content":"VegaClaude queued duplicate"}),
+        json!({"type":"user","sessionId":claude_session,"cwd":project,"timestamp":"2026-01-02T00:00:00Z","origin":{"kind":"human"},"message":{"role":"user","content":format!("VegaClaude capture request {API_KEY} 😀")}}),
+        json!({"type":"assistant","sessionId":claude_session,"timestamp":"2026-01-02T00:00:01Z","message":{"id":"msg-1","role":"assistant","content":[{"type":"thinking","thinking":"VegaClaude private thinking"}]}}),
+        json!({"type":"assistant","sessionId":claude_session,"timestamp":"2026-01-02T00:00:01Z","message":{"id":"msg-1","role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"VegaClaude tool input"}}]}}),
+        json!({"type":"user","sessionId":claude_session,"message":{"role":"user","content":[{"type":"tool_result","content":"VegaClaude tool output"}]}}),
+        json!({"type":"api-request-blob","sessionId":claude_session,"message":{"role":"assistant","content":[{"type":"text","text":"VegaClaude request copy"}]}}),
+        json!({"type":"assistant","sessionId":claude_session,"timestamp":"2026-01-02T00:00:02Z","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"VegaClaude final answer 😀"}]}}),
+        json!({"type":"custom-title","customTitle":"VegaClaude capture title","sessionId":claude_session}),
+    ];
+    fs::write(
+        &claude_transcript,
+        claude_rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )?;
+    let claude_payload = json!({"session_id":claude_session,"transcript_path":claude_transcript,"cwd":project,"hook_event_name":"Stop","stop_hook_active":false});
+    let claude_captured = hook(
+        binary,
+        &home,
+        &project,
+        endpoint,
+        "Stop",
+        claude_payload.clone(),
+    )?;
+    ensure!(
+        claude_captured["systemMessage"]
+            .as_str()
+            .unwrap_or("")
+            .contains("saved 1 documents; pending 0"),
+        "Claude capture failed: {claude_captured}"
+    );
+    let claude_posts = count_posts(
+        &client
+            .get(format!("{endpoint}/__state"))
+            .send()?
+            .error_for_status()?
+            .json()?,
+    );
+    hook(binary, &home, &project, endpoint, "Stop", claude_payload)?;
+    ensure!(
+        count_posts(
+            &client
+                .get(format!("{endpoint}/__state"))
+                .send()?
+                .error_for_status()?
+                .json()?
+        ) == claude_posts,
+        "acknowledged Claude capture resent"
+    );
+    let claude_docs = mcp.tool("listDocuments", json!({"limit":50}))?;
+    let claude_doc = claude_docs["documents"]
+        .as_array()
+        .context("Claude captured documents")?
+        .iter()
+        .find(|v| v.to_string().contains("VegaClaude capture title"))
+        .context("Claude capture document missing")?;
+    let claude_read = mcp.tool(
+        "getDocument",
+        json!({"documentId":claude_doc["id"].as_str().context("Claude capture id")?}),
+    )?;
+    let claude_content = claude_read.to_string();
+    ensure!(
+        claude_content.contains("VegaClaude capture request")
+            && claude_content.contains("VegaClaude final answer"),
+        "Claude capture content: {claude_read}"
+    );
+    // 出所メタデータは MCP の投影に含まれないため、Worker の REST 応答で直接確認する。
+    let claude_raw: Value = client
+        .get(format!(
+            "{endpoint}/v3/documents/{}",
+            claude_doc["id"].as_str().context("Claude capture id")?
+        ))
+        .bearer_auth(API_KEY)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    ensure!(
+        claude_raw["metadata"]["sm_source"] == "claude-code"
+            && claude_raw["metadata"]["sessionId"] == claude_session
+            && claude_raw["metadata"]["turn"] == 1
+            // サーバーは保存時に customId=codex-turn-v2:<captureKey> を検証済み。
+            && claude_raw["metadata"]["captureKey"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("native-claude-capture-session:1:")),
+        "Claude capture provenance/identity: {}",
+        claude_raw["metadata"]
+    );
+    ensure!(
+        [
+            "private thinking",
+            "tool input",
+            "tool output",
+            "request copy",
+            "queued duplicate",
+            API_KEY
+        ]
+        .iter()
+        .all(|leak| !claude_content.contains(leak)),
+        "Claude capture disclosed internal rows or secrets"
+    );
+    checks.push("native Stop captures Claude Code transcripts final-only with claude-code provenance and suppresses acknowledged retries");
     #[cfg(windows)]
     let recall = packaged_windows_hook(
         &home,
@@ -1015,17 +1126,31 @@ fn organization_contracts(
         );
         serde_json::from_slice(&output.stdout).context("organization JSON output")
     };
-    let batch = invoke("prepare", json!({}))?;
+    // 手動整理の日数指定(prepare --days)が実Workerまで渡り、直近の記録を選ぶことを確認する。
+    // 従来の {} prepare は後続の別シナリオで引き続き検証する。
+    let batch: Value = {
+        let mut cmd = command(binary, home, project, endpoint);
+        cmd.args(["memory-organize", "prepare", "--days", "7"]);
+        let output = process_output(cmd, b"")?;
+        ensure!(
+            output.status.success(),
+            "organization ranged CLI failed (redacted)"
+        );
+        serde_json::from_slice(&output.stdout).context("organization ranged JSON output")?
+    };
     ensure!(
         batch["sources"]
             .as_array()
             .is_some_and(|rows| rows.len() == 7),
-        "organization bounded prepare"
+        "organization bounded ranged prepare"
     );
     let selected = batch["sources"]
         .as_array()
         .context("organization sources")?;
-    ensure!(selected.iter().all(|s| s["recallClass"] == "automatic"), "organization automatic source partition");
+    ensure!(
+        selected.iter().all(|s| s["recallClass"] == "automatic"),
+        "organization automatic source partition"
+    );
     let commit = json!({"batchId":batch["batchId"],"summaries":[{"ref":"final","title":"OrganizationNative final conclusion","topic":"OrganizationNative","content":"はい","sources":selected.iter().map(|s| s["id"].clone()).collect::<Vec<_>>()}],
         "coverage":selected.iter().map(|s| json!({"id":s["id"],"revision":s["revision"],"status":"complete","summaries":["final"]})).collect::<Vec<_>>()});
     let published = invoke("commit", commit.clone())?;
@@ -1065,19 +1190,35 @@ fn organization_contracts(
         json!({"name":"getDocument","arguments":{"documentId":summary_id}}),
     )?;
     ensure!(preview["isError"] != true, "organization summary retrieval");
-    ensure!(preview["structuredContent"]["document"]["index"]["recallable"] == true
-        && preview["structuredContent"]["document"]["content"] == "はい",
-        "organization authored summary retains its index and body");
+    ensure!(
+        preview["structuredContent"]["document"]["index"]["recallable"] == true
+            && preview["structuredContent"]["document"]["content"] == "はい",
+        "organization authored summary retains its index and body"
+    );
     let recall_home = home.join("organization-authored-recall");
     fs::create_dir_all(&recall_home)?;
-    fs::write(recall_home.join("remnifold.json"), serde_json::to_vec(
-        &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"maxMemories":5,"minimumSimilarity":0.7}),
-    )?)?;
-    let recalled = hook(binary, &recall_home, project, endpoint, "UserPromptSubmit",
-        json!({"session_id":"organization-authored-new-task","cwd":project,"prompt":"OrganizationNative"}))?;
-    let context = recalled["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
-    ensure!(context.contains(summary_id) && !context.contains(source["id"].as_str().context("source ID")?),
-        "organization authored summary survives real automatic recall while its original is hidden");
+    fs::write(
+        recall_home.join("remnifold.json"),
+        serde_json::to_vec(
+            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"maxMemories":5,"minimumSimilarity":0.7}),
+        )?,
+    )?;
+    let recalled = hook(
+        binary,
+        &recall_home,
+        project,
+        endpoint,
+        "UserPromptSubmit",
+        json!({"session_id":"organization-authored-new-task","cwd":project,"prompt":"OrganizationNative"}),
+    )?;
+    let context = recalled["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    ensure!(
+        context.contains(summary_id)
+            && !context.contains(source["id"].as_str().context("source ID")?),
+        "organization authored summary survives real automatic recall while its original is hidden"
+    );
     let first = &preview["structuredContent"]["document"]["organizationSources"];
     ensure!(
         first["sources"].as_array().is_some_and(|s| s.len() == 5) && first["hasMore"] == true,

@@ -8,6 +8,9 @@ mod client_e2e;
 mod fake_cli;
 mod package;
 mod r2;
+// native と同じ配布形式の実装を共有する。native 側でだけ使う項目（R2 updater 用の設定解析など）は
+// xtask では未使用になるため、このモジュールに限り未使用警告を抑える。
+#[allow(dead_code)]
 #[path = "../../native/src/release_manifest.rs"]
 mod release_manifest;
 mod server_tests;
@@ -334,7 +337,7 @@ fn build_native(
 }
 fn default_work() -> Result<PathBuf> {
     Ok(if cfg!(windows) {
-        PathBuf::from("D:/Codex/remnifold/validation")
+        PathBuf::from("D:/Claude/remnifold/validation")
     } else {
         std::env::temp_dir()
             .canonicalize()?

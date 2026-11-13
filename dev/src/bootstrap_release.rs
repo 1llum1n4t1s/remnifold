@@ -10,8 +10,12 @@ use std::{
     process::Command,
     time::Duration,
 };
+// native updater と同じ経路安全性・私用作業領域の実装を共有する。
+// updater 本体や bootstrap だけが使う項目は xtask では未使用になるため、この2モジュールに限り未使用警告を抑える。
+#[allow(dead_code)]
 #[path = "../../native/src/updater/path_safety.rs"]
 mod path_safety;
+#[allow(dead_code)]
 #[path = "../../native/src/updater/private_work.rs"]
 mod private_work;
 #[path = "../../native/src/updater/process.rs"]
@@ -409,8 +413,8 @@ pub fn run(repo: &Path, args: &[String]) -> Result<()> {
     publication_roots(repo, &root, &codex_home)?;
     #[cfg(windows)]
     ensure!(
-        root.starts_with("D:/Codex/remnifold"),
-        "Bootstrap work root must be under D:/Codex/remnifold"
+        root.starts_with("D:/Claude/remnifold"),
+        "Bootstrap work root must be under D:/Claude/remnifold"
     );
     let _root_guard = private_work::PrivateWorkGuard::open(&root)?;
     publication_roots(repo, &root, &codex_home)?;
