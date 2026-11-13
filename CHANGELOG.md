@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.24 - 2026-11-13
+
+### 修正
+
+- Windowsの`plugin-update`・`plugin-bootstrap`が作業フォルダを特定のドライブ配下に限っていた制約をなくしました。既定の作業フォルダは利用者ごとの`%LOCALAPPDATA%\remnifold`になり、リポジトリ・プラグイン・Codex homeの外にある任意の絶対パスを指定できます。
+
 ## 1.0.23 - 2026-11-13
 
 ### 変更
