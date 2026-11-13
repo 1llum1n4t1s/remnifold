@@ -41,6 +41,9 @@ pub(crate) fn command(binary: &Path, home: &Path, project: &Path, endpoint: &str
     command
         .env("REMNIFOLD_API_URL", endpoint)
         .env("REMNIFOLD_API_KEY", API_KEY)
+        // Remnifold 自身の設定・状態も同じフォルダに隔離する（実環境の設定フォルダへ書かない）。
+        // 親プロセスの REMNIFOLD_* を外した後に設定する。
+        .env("REMNIFOLD_HOME", home)
         .env("NO_PROXY", "*")
         .env("LOCALAPPDATA", home.join("local-app-data"));
     // PATHをOS付属ツールだけに制限し、成功した子プロセスからNodeを起動できなくする。
@@ -1684,7 +1687,8 @@ fn diagnostic_contracts(
                         cmd.env_remove("REMNIFOLD_API_KEY");
                         let invalid = root.join(format!("{caller}-empty-config"));
                         fs::create_dir_all(&invalid)?;
-                        cmd.env("CODEX_HOME", invalid);
+                        cmd.env("CODEX_HOME", &invalid);
+                        cmd.env("REMNIFOLD_HOME", invalid);
                     }
                     process_output(cmd, &serde_json::to_vec(&payload)?)
                 };

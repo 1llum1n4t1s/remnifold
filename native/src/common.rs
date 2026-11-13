@@ -9,7 +9,10 @@ pub struct Config {
     pub base_url: String,
     pub api_key: String,
     pub raw: Value,
+    /// Codex の会話記録（sessions）と旧来の設定・状態を読む場所。Remnifold の新しい書込み先ではない。
     pub codex_home: PathBuf,
+    /// Remnifold 自身の設定・状態の置き場所（crate::paths を参照）。
+    pub roots: crate::paths::Roots,
 }
 
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {
@@ -51,7 +54,7 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
-const CONFIG_NAMES: [&str; 3] = ["remnifold.json", "kagayoi-memory.json", "supermemory.json"];
+use crate::paths::CONFIG_NAMES;
 fn env_first(names: &[&str]) -> String {
     names
         .iter()
@@ -90,8 +93,11 @@ pub fn normalize_endpoint(value: &str) -> Result<String> {
     Ok(endpoint.to_string().trim_end_matches('/').to_owned())
 }
 
+// 接続設定を読む。`home` は旧来の Codex home（--codex-home の明示指定）で、
+// 新しい場所に設定が無いときの移行元と、Codex の会話記録の場所として使う。
 pub fn load_config(home: Option<&Path>) -> Result<Config> {
     let home = home.map(Path::to_path_buf).unwrap_or_else(codex_home);
+    let roots = crate::paths::Roots::current();
     let env_url = env_first(&[
         "REMNIFOLD_API_URL",
         "KAGAYOI_MEMORY_API_URL",
@@ -104,11 +110,15 @@ pub fn load_config(home: Option<&Path>) -> Result<Config> {
         "CLOUDFLARE_MEMORY_API_KEY",
     ]);
     let mut raw = json!({});
-    if let Some(path) = CONFIG_NAMES
-        .iter()
-        .map(|name| home.join(name))
-        .find(|p| p.exists())
-    {
+    // 移行元は既定の Codex home だけにする（--codex-home で明示した会話記録の場所からは移さない）。
+    // 新旧どちらにも無い場合だけ、明示した場所の旧設定を（コピーせずに）読む。
+    let explicit = || {
+        CONFIG_NAMES
+            .iter()
+            .map(|name| home.join(name))
+            .find(|path| path.exists())
+    };
+    if let Some(path) = crate::paths::config_file(&roots, &codex_home())?.or_else(explicit) {
         match fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -144,15 +154,18 @@ pub fn load_config(home: Option<&Path>) -> Result<Config> {
         api_key,
         raw,
         codex_home: home,
+        roots,
     })
 }
 
 pub fn read_settings(config: &Config) -> Value {
     // 接続ファイルが壊れ環境変数で接続できる場合も、設定は旧ファイルから回復する。
+    // 新しい場所を先に、旧来の Codex home を後に見る。
     let raw = CONFIG_NAMES
         .iter()
-        .find_map(|name| {
-            fs::read(config.codex_home.join(name))
+        .flat_map(|name| [config.roots.config.join(name), config.codex_home.join(name)])
+        .find_map(|path| {
+            fs::read(path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .filter(Value::is_object)
@@ -177,6 +190,7 @@ pub fn read_settings(config: &Config) -> Value {
     };
     json!({
         "codexHome": config.codex_home.to_string_lossy(),
+        "configHome": config.roots.config.to_string_lossy(),
         "recallMode": raw.get("recallMode").filter(|v| !v.is_null() && *v != "" && *v != false).cloned().unwrap_or(json!("direct")),
         "maxMemories": memories,
         "maxRecentTasks": raw["maxRecentTasks"].as_f64().filter(|n| n.is_finite() && n.fract()==0.0).map(|n| n.clamp(0.0,3.0) as i64).unwrap_or(2),
@@ -637,6 +651,10 @@ mod tests {
             api_key: String::new(),
             raw: json!({}),
             codex_home: home.clone(),
+            roots: crate::paths::Roots {
+                config: home.join("unused-new-root"),
+                state: home.join("unused-new-root"),
+            },
         };
         let settings = read_settings(&config);
         assert_eq!(settings["maxMemories"].as_u64(), Some(4));

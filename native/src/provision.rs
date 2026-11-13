@@ -1051,14 +1051,12 @@ fn state_path(o: &Options) -> Result<PathBuf> {
     if let Some(p) = &o.state {
         return Ok(p.clone());
     }
-    let home = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                .map(|p| PathBuf::from(p).join(".codex"))
-        })
-        .ok_or_else(|| anyhow!("CODEX_HOME or home directory is required."))?;
-    Ok(home.join("remnifold/server/config.json"))
+    // 既定は Remnifold 自身の設定フォルダ（crate::paths）。旧来の Codex home にだけある状態は一度だけ移す。
+    crate::paths::server_state_file(
+        &crate::paths::Roots::current(),
+        &crate::common::codex_home(),
+        o.apply,
+    )
 }
 fn validate_state(path: &Path) -> Result<()> {
     // State is user-owned, never the plugin source or cache. Reject links before writing.

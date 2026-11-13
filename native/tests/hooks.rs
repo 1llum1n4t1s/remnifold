@@ -178,6 +178,8 @@ fn hook_in(language: &str, root: &Path, url: &str, event: &str, input: &[u8]) ->
         .env_remove("LC_MESSAGES")
         .env("LANG", language)
         .env("CODEX_HOME", root)
+        // Remnifold 自身の設定・状態も同じフォルダに隔離する（実環境の設定フォルダへ書かない）。
+        .env("REMNIFOLD_HOME", root)
         .env("REMNIFOLD_API_URL", url)
         .env("REMNIFOLD_API_KEY", "fixture-secret")
         .stdin(Stdio::piped())
@@ -233,6 +235,70 @@ fn loopback_fixture_waits_for_request_bytes_after_accept() {
         "delayed request response={output:?}; received requests={:?}",
         fixture.requests.lock().unwrap()
     );
+}
+
+// 旧来の Codex home にだけ接続設定がある利用者は、初回の実行で Remnifold 自身の設定フォルダへ
+// 移行される。旧ファイルは残し、以後の状態は新しい場所だけに書く。
+#[test]
+fn legacy_codex_home_configuration_migrates_to_remnifold_home() {
+    let fixture = Fixture::new();
+    let root = root();
+    let codex = root.join("codex");
+    let remnifold = root.join("remnifold-home");
+    fs::create_dir_all(&codex).unwrap();
+    let legacy = serde_json::to_vec(
+        &json!({"baseUrl":fixture.url,"apiKey":"fixture-secret","recallMode":"direct"}),
+    )
+    .unwrap();
+    fs::write(codex.join("remnifold.json"), &legacy).unwrap();
+    let transcript = root.join("session.jsonl");
+    fs::write(
+        &transcript,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture-session\"}}\n",
+    )
+    .unwrap();
+    let payload = json!({"session_id":"fixture-session","transcript_path":transcript,"prompt":"Repair Unicode transcript boundaries"});
+    let mut command = Command::new(env!("CARGO_BIN_EXE_remnifold"));
+    support::isolate(&mut command);
+    command
+        .args(["hook", "UserPromptSubmit"])
+        .env("CODEX_HOME", &codex)
+        .env("REMNIFOLD_HOME", &remnifold)
+        .env("LANG", "en_US.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in [
+        "REMNIFOLD_API_URL",
+        "REMNIFOLD_API_KEY",
+        "LC_ALL",
+        "LC_MESSAGES",
+    ] {
+        command.env_remove(name);
+    }
+    let output = support::run(
+        &mut command,
+        &serde_json::to_vec(&payload).unwrap(),
+        Duration::from_secs(15),
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        result["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|context| context.contains("id=topic-doc")),
+        "{result}"
+    );
+    assert_eq!(fs::read(remnifold.join("remnifold.json")).unwrap(), legacy);
+    assert_eq!(fs::read(codex.join("remnifold.json")).unwrap(), legacy);
+    let state = |base: &Path| fs::read_dir(base.join("recall-state")).map_or(0, |dir| dir.count());
+    assert_eq!(state(&remnifold.join("remnifold")), 1);
+    assert_eq!(state(&codex.join("remnifold")), 0);
 }
 
 // 索引の案内文と見出しは、索引を書き込む環境の言語設定で切り替わる。

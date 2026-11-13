@@ -190,7 +190,6 @@ pub(crate) fn directory_link(target: &Path, link: &Path) -> Result<()> {
 struct Fixture {
     legacy_temp: bool,
     root: PathBuf,
-    source: PathBuf,
     home: PathBuf,
     work: PathBuf,
     state: PathBuf,
@@ -226,8 +225,20 @@ impl Fixture {
             .filter(|v| v["kind"] == "codex" && v["args"][1] == "add")
             .count())
     }
+    // 単独アプリの導入先（REMNIFOLD_HOME=home のため <home>/app）。
+    fn app(&self) -> PathBuf {
+        self.home.join("app")
+    }
+    fn app_executable(&self) -> PathBuf {
+        self.app().join(if cfg!(windows) {
+            "bin/remnifold.exe"
+        } else {
+            "bin/remnifold"
+        })
+    }
     fn snapshot(&self) -> Result<Value> {
-        Ok(json!({"source":files(&self.source)?,"cache":files(&self.home.join("plugins/cache"))?}))
+        let app = self.app();
+        Ok(json!({"app":if app.exists() { files(&app)? } else { BTreeMap::new() }}))
     }
     fn edit_state(&self, name: &str, value: Value) -> Result<()> {
         let mut state: Value = serde_json::from_slice(&fs::read(&self.state)?)?;
@@ -251,18 +262,25 @@ impl Fixture {
                 command.env_remove(name);
             }
         }
+        // 旧 bootstrap の検証項目を、単独アプリの導入コマンドで確かめる（--download-only は導入として扱う）。
+        let modes: Vec<&str> = modes
+            .iter()
+            .map(|mode| {
+                if *mode == "--download-only" {
+                    "--apply"
+                } else {
+                    *mode
+                }
+            })
+            .collect();
         command
-            .args([
-                "plugin-bootstrap",
-                "--version",
-                &self.version,
-                "--work-root",
-            ])
+            .args(["install", "--version", &self.version, "--work-root"])
             .arg(&self.work)
             .arg("--config")
             .arg(config.unwrap_or(&self.config))
-            .args(modes)
+            .args(&modes)
             .env("CODEX_HOME", &self.home)
+            .env("REMNIFOLD_HOME", &self.home)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("GH_TOKEN", "isolated-updater-token-canary")
@@ -290,7 +308,7 @@ impl Fixture {
             crate::client_e2e::process_output_with_timeout(command, b"", Duration::from_secs(180))?;
         ensure!(
             output.stderr.is_empty()
-                || String::from_utf8_lossy(&output.stderr).trim() == "PLUGIN_BOOTSTRAP_FAILED",
+                || String::from_utf8_lossy(&output.stderr).trim() == "INSTALL_FAILED",
             "bootstrap emitted unstructured diagnostics"
         );
         ensure!(
@@ -327,11 +345,7 @@ impl Fixture {
     ) -> Result<Value> {
         let work = work.unwrap_or(&self.work);
         let mut command = Command::new(if from_source {
-            self.source.join(if cfg!(windows) {
-                "bin/remnifold.exe"
-            } else {
-                "bin/remnifold"
-            })
+            self.app_executable()
         } else {
             self.binary.clone()
         });
@@ -348,12 +362,13 @@ impl Fixture {
         }
         command.env("NO_PROXY", "*");
         command
-            .args(["plugin-update", "--version", &self.version, "--work-root"])
+            .args(["install", "--version", &self.version, "--work-root"])
             .arg(work)
             .arg("--config")
             .arg(&self.config)
             .arg(mode)
             .env("CODEX_HOME", &self.home)
+            .env("REMNIFOLD_HOME", &self.home)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("GH_TOKEN", "isolated-updater-token-canary")
@@ -415,8 +430,7 @@ impl Fixture {
             .join()
             .map_err(|_| anyhow::anyhow!("stderr thread"))??;
         ensure!(
-            errors.is_empty()
-                || String::from_utf8_lossy(&errors).contains("LOCAL_PLUGIN_UPDATE_FAILED"),
+            errors.is_empty() || String::from_utf8_lossy(&errors).contains("INSTALL_FAILED"),
             "unstructured updater diagnostics: {}",
             String::from_utf8_lossy(&errors)
         );
@@ -442,24 +456,27 @@ impl Fixture {
         );
         Ok(())
     }
+    // 版ごとの展開・固定の実行ファイル・現在の版が、検証済みパッケージと一致する。
     fn installed(&self) -> Result<()> {
-        let state: Value = serde_json::from_slice(&fs::read(&self.state)?)?;
+        let app = self.app();
+        let version = app.join("versions").join(&self.version);
         ensure!(
-            state["installedVersion"] == self.version,
-            "installed version"
+            files(&version)? == self.expected,
+            "installed version mismatch"
         );
+        let executable = if cfg!(windows) {
+            "bin/remnifold.exe"
+        } else {
+            "bin/remnifold"
+        };
         ensure!(
-            files(&self.source)? == self.expected,
-            "updated source mismatch"
+            fs::read(self.app_executable())? == fs::read(version.join(executable))?,
+            "fixed executable mismatch"
         );
+        let current: Value = serde_json::from_slice(&fs::read(app.join("current.json"))?)?;
         ensure!(
-            files(
-                &self
-                    .home
-                    .join("plugins/cache/personal/remnifold")
-                    .join(&self.version)
-            )? == self.expected,
-            "updated cache mismatch"
+            current["version"] == self.version && current["sourceCommit"] == self.sha,
+            "current version mismatch"
         );
         Ok(())
     }
@@ -606,44 +623,36 @@ fn bootstrap_case(f: &Fixture, fault: &str, scenarios: &mut Vec<&'static str>) -
             "bootstrap default created an apply receipt"
         );
         if fault == "recovery" {
-            f.edit_state("failAdd", json!(true))?;
-            let failed = f.bootstrap(&["--apply"], None)?;
-            ensure!(
-                failed["exitCode"] == 1 && failed["code"].is_string(),
-                "bootstrap ignored official CLI failure: {failed}"
-            );
-            f.edit_state("failAdd", json!(false))?;
+            // 中断した前回の導入の残り（置きかけの実行ファイル）があっても導入できる。
+            fs::create_dir_all(f.app().join("bin"))?;
+            fs::write(f.app().join("bin/.remnifold-interrupted.new"), b"partial")?;
         }
         let applied = f.bootstrap(&["--apply"], None)?;
         ensure!(
-            applied["exitCode"] == 0,
+            applied["exitCode"] == 0 && applied["status"] == "installed",
             "bootstrap apply failed: {applied}"
         );
         f.installed()?;
-        let count = f.adds()?;
-        ensure!(
-            count == if fault == "recovery" { 2 } else { 1 },
-            "bootstrap install retry count changed"
-        );
         let snapshot = f.snapshot()?;
         if fault == "success" {
             let verified = f.bootstrap(&["--verify-only"], None)?;
             ensure!(
                 verified["exitCode"] == 0
                     && verified["status"] == "verified"
-                    && f.adds()? == count
                     && snapshot == f.snapshot()?,
                 "bootstrap receipt verification mutated installation: {verified}"
             );
         }
         let repeated = f.bootstrap(&["--apply"], None)?;
         ensure!(
-            repeated["exitCode"] == 0 && f.adds()? == count && snapshot == f.snapshot()?,
-            "bootstrap retry reinstalled or changed current plugin: {repeated}"
+            repeated["exitCode"] == 0
+                && repeated["status"] == "already-current"
+                && snapshot == f.snapshot()?,
+            "bootstrap retry reinstalled or changed current install: {repeated}"
         );
         let invalid = f.bootstrap(&["--apply", "--download-only"], None)?;
         ensure!(
-            invalid["exitCode"] == 1 && f.adds()? == count && snapshot == f.snapshot()?,
+            invalid["exitCode"] == 1 && snapshot == f.snapshot()?,
             "bootstrap accepted conflicting modes"
         );
     } else {
@@ -683,6 +692,67 @@ fn bootstrap_case(f: &Fixture, fault: &str, scenarios: &mut Vec<&'static str>) -
         "bootstrap downgraded from R2 to legacy artifacts"
     );
     scenarios.push(Box::leak(format!("bootstrap-{fault}").into_boxed_str()));
+    Ok(())
+}
+
+// 単独アプリの導入に固有の場面。R2 の公開検証が通った導入済み fixture で確かめる。
+fn install_scenarios(f: &Fixture, scenarios: &mut Vec<&'static str>) -> Result<()> {
+    // 導入済みの固定実行ファイル自身から再実行しても同じ結果になる（自己更新の経路）。
+    let result = f.run("--apply", None, true)?;
+    ensure!(
+        result["exitCode"] == 0
+            && result["status"] == "already-current"
+            && result["restartRequired"] == false,
+        "installed executable could not re-run install: {result}"
+    );
+    scenarios.push("running-from-installed-executable");
+    // 固定の実行ファイルが開かれたまま（Windows で起動中の MCP サーバーと同じ状態）でも、
+    // 名前の変更で置き換え、再起動が必要なことを返す。
+    let executable = f.app_executable();
+    let good = fs::read(&executable)?;
+    let mut stale = good.clone();
+    stale.extend_from_slice(b"stale");
+    fs::write(&executable, &stale)?;
+    let held = fs::File::open(&executable)?;
+    let result = f.run("--apply", None, false)?;
+    drop(held);
+    ensure!(
+        result["exitCode"] == 0
+            && result["status"] == "installed"
+            && result["restartRequired"] == true
+            && fs::read(&executable)? == good,
+        "open executable was not replaced: {result}"
+    );
+    f.success("--apply", "already-current")?;
+    let leftovers: Vec<_> = fs::read_dir(f.app().join("bin"))?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    ensure!(
+        leftovers.len() == 1,
+        "retired executables were not cleaned: {leftovers:?}"
+    );
+    scenarios.push("open-executable-replaced-by-rename");
+    // 版ごとの展開が変わっていれば、検証は失敗し、導入は置き換えずに止める。
+    let readme = f.app().join("versions").join(&f.version).join("README.md");
+    let original = fs::read(&readme)?;
+    fs::write(&readme, b"Corrupted installed copy\n")?;
+    let before = f.snapshot()?;
+    let verify = f.run("--verify-only", None, false)?;
+    ensure!(
+        verify["exitCode"] == 1
+            && verify["code"] == "INSTALLED_CONTENT_MISMATCH"
+            && before == f.snapshot()?,
+        "corrupted install verified: {verify}"
+    );
+    let apply = f.run("--apply", None, false)?;
+    ensure!(
+        apply["exitCode"] == 1
+            && apply["code"] == "INSTALLED_VERSION_CONTENT_MISMATCH"
+            && before == f.snapshot()?,
+        "corrupted install was replaced: {apply}"
+    );
+    fs::write(&readme, original)?;
+    scenarios.push("corrupted-install-rejected-without-repair");
     Ok(())
 }
 
@@ -783,7 +853,10 @@ fn r2_cases(
             "",
         )?;
         if fault == "same-version" {
-            fs::write(f.source.join("README.md"), "Changed same-version bytes\n")?;
+            // 同名版が既に違う内容で展開されている。版ごとの展開は不変なので置き換えない。
+            let dir = f.app().join("versions").join(&f.version);
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join("README.md"), "Changed same-version bytes\n")?;
         }
         let mut archive_bytes = archive_bytes.clone();
         if fault == "binary-tamper" {
@@ -1027,22 +1100,32 @@ fn r2_cases(
         {
             f.success("--check-published", "published")?;
             ensure!(
-                before == f.snapshot()? && f.adds()? == 0,
+                before == f.snapshot()? && !f.app().exists(),
                 "R2 preflight mutated installation"
             );
             if fault == "recovery" {
-                f.edit_state("failAdd", json!(true))?;
-                let failed = f.run("--apply", None, false)?;
-                ensure!(
-                    failed["code"] == "PLUGIN_ADD_FAILED",
-                    "R2 official failure ignored: {failed}"
-                );
-                f.edit_state("failAdd", json!(false))?;
+                // 中断した前回の導入の残り（展開途中の版・退避した旧実行ファイル）があっても導入でき、
+                // 退避した旧実行ファイルは片付ける。
+                fs::create_dir_all(f.app().join("versions/.incoming-interrupted"))?;
+                fs::write(
+                    f.app().join("versions/.incoming-interrupted/partial"),
+                    b"partial",
+                )?;
+                fs::create_dir_all(f.app().join("bin"))?;
+                fs::write(f.app().join("bin/.remnifold-interrupted.old"), b"old")?;
             }
-            f.success("--apply", "updated")?;
+            f.success("--apply", "installed")?;
             f.installed()?;
+            if fault == "recovery" {
+                ensure!(
+                    !f.app().join("bin/.remnifold-interrupted.old").exists(),
+                    "retired executable left behind"
+                );
+            }
             let receipt: Value = serde_json::from_slice(&fs::read(
-                f.work.join(format!("verified-{}-{target}.json", f.sha)),
+                f.app()
+                    .join("receipts")
+                    .join(format!("verified-{}-{target}.json", f.sha)),
             )?)?;
             ensure!(
                 receipt["schema"] == 2
@@ -1056,6 +1139,9 @@ fn r2_cases(
                 "R2 receipt omitted trusted identity"
             );
             f.success("--apply", "already-current")?;
+            if fault == "success" {
+                install_scenarios(&f, scenarios)?;
+            }
             let http_count = server.calls.lock().unwrap().len();
             let gh_count = f.calls()?.len();
             f.edit_state("historyUnavailable", json!(true))?;
@@ -1114,7 +1200,7 @@ fn r2_cases(
                 "index-commit" | "index-attempt" => "INVALID_R2_INDEX",
                 "schema-cross" => "R2_RELEASE_IDENTITY_MISMATCH",
                 "redirect" | "index-missing" | "archive-missing" => "R2_DOWNLOAD_FAILED",
-                "same-version" => "LOCAL_SOURCE_MODIFIED",
+                "same-version" => "INSTALLED_VERSION_CONTENT_MISMATCH",
                 "witness-log-gone" | "witness-log-oversized" => "R2_WITNESS_LOG_UNAVAILABLE",
                 "witness-gh-unknownflag" => "R2_WITNESS_LOG_UNAVAILABLE",
                 name if name.starts_with("witness-job-") => "R2_WITNESS_JOB_MISMATCH",
@@ -1273,11 +1359,7 @@ fn verify_migration_state(
             path.display()
         );
     }
-    let binary = fixture.source.join(if cfg!(windows) {
-        "bin/remnifold.exe"
-    } else {
-        "bin/remnifold"
-    });
+    let binary = fixture.app_executable();
     let count = |state: &Value| {
         state["requests"]
             .as_array()
@@ -1507,7 +1589,7 @@ mod bootstrap_shell_contract {
         assert!(download_guard.contains(".truncated == false and (.tree | type) == \"array\""));
         assert!(
             download_guard
-                .contains(".type == \"blob\" and .path == \"native/src/updater/bootstrap.rs\"")
+                .contains(".type == \"blob\" and .path == \"native/src/updater/install.rs\"")
         );
         let bash = if cfg!(windows) {
             "C:/Program Files/Git/bin/bash.exe"
@@ -1515,13 +1597,13 @@ mod bootstrap_shell_contract {
             "bash"
         };
         for (apply, download, capability, version, expected) in [
-            ("0", "0", "true", "1.0.20", vec!["plugin-bootstrap"]),
+            ("0", "0", "true", "1.0.20", vec!["install"]),
             (
                 "1",
                 "0",
                 "false",
                 "1.0.17",
-                vec!["plugin-update", "plugin-update", "plugin-update"],
+                vec!["install", "install", "install"],
             ),
             ("0", "1", "true", "1.0.20", vec![]),
             ("0", "1", "false", "1.0.17", vec![]),
@@ -1560,7 +1642,7 @@ mod bootstrap_shell_contract {
                 assert!(output.stdout.is_empty());
                 assert_eq!(
                     String::from_utf8(output.stderr).unwrap(),
-                    "Bootstrap rejected: release lacks native publication checking; use --download-only or a trusted current native plugin-bootstrap with --version set to this release\n"
+                    "Bootstrap rejected: release lacks the standalone installer; use --download-only or a trusted current native remnifold install with --version set to this release\n"
                 );
                 continue;
             }
@@ -1620,8 +1702,6 @@ fn run_suite(
     let package = unpack(archive, &root.join("published"))?;
     let input_archive = archive.to_path_buf();
     let input_sha256 = hash(&fs::read(archive)?);
-    let original_plugin_bytes = fs::read(package.join(".codex-plugin/plugin.json"))?;
-    let original_server_bytes = fs::read(package.join("server/package.json"))?;
     // リポジトリと公開済み原本の版は保ち、隔離fixtureの版だけを変えて実際の更新を検証する。
     let source_build: Value =
         serde_json::from_slice(&fs::read(package.join("native-build.json"))?)?;
@@ -1784,7 +1864,6 @@ fn run_suite(
         Ok(Fixture {
             legacy_temp: false,
             root: directory.clone(),
-            source,
             home,
             work: directory.join("work"),
             state,
@@ -1830,173 +1909,46 @@ fn run_suite(
     }
     root_boundary_cases(&root, binary, archive)?;
     scenarios.push("codex-and-plugin-root-overlap-rejected-before-write");
-    let updated = fixture("success", &package, false, "source", "")?;
-    let before = updated.snapshot()?;
-    updated.success("--check-published", "published")?;
-    ensure!(
-        before == updated.snapshot()? && updated.adds()? == 0,
-        "preflight changed installation"
-    );
-    scenarios.push("published-preflight");
-    updated.success("--apply", "updated")?;
-    updated.installed()?;
-    ensure!(updated.adds()? == 1, "installation count");
-    scenarios.push("published-install-source-cache");
-    updated.success("--apply", "already-current")?;
-    updated.success("--verify-only", "verified")?;
-    updated.installed()?;
-    ensure!(updated.adds()? == 1, "duplicate install");
-    scenarios.push("idempotent-install-and-verify");
-    updated.edit_state("historyUnavailable", json!(true))?;
-    let calls = updated.calls()?.len();
-    let before = updated.snapshot()?;
-    updated.success("--verify-only", "verified")?;
-    updated.installed()?;
-    ensure!(
-        before == updated.snapshot()? && updated.adds()? == 1,
-        "retained receipt verification mutated installation"
-    );
-    let calls = updated.calls()?.into_iter().skip(calls).collect::<Vec<_>>();
-    ensure!(
-        calls.iter().filter(|v| v["kind"] == "gh").count() == 3
-            && calls.iter().filter(|v| v["kind"] == "codex").count() == 1,
-        "retained verification consulted CI artifacts"
-    );
-    scenarios.push("verify-without-retained-ci-or-artifact");
-    fs::write(
-        updated
-            .home
-            .join("plugins/cache/personal/remnifold")
-            .join(version)
-            .join("README.md"),
-        "Corrupted installed cache\n",
-    )?;
-    let before = updated.snapshot()?;
-    let result = updated.run("--verify-only", None, false)?;
-    ensure!(
-        result["code"] == "INSTALLED_PLUGIN_CONTENT_MISMATCH"
-            && result["exitCode"] == 1
-            && before == updated.snapshot()?
-            && updated.adds()? == 1,
-        "corrupted cache verification repaired or accepted: {result}"
-    );
-    scenarios.push("verify-rejects-corrupted-cache-without-repair");
-    let retry = fixture("official-failure-resume", &package, false, "source", "")?;
-    retry.edit_state("failAdd", json!(true))?;
-    let before = retry.snapshot()?;
-    let result = retry.run("--apply", None, false)?;
-    ensure!(
-        result["exitCode"] == 1 && result["code"] == "PLUGIN_ADD_FAILED",
-        "official CLI failure ignored: {result}"
-    );
-    ensure!(
-        retry.snapshot()?["cache"] == before["cache"] && files(&retry.source)? == expected,
-        "failed official install changed cache or lost prepared source"
-    );
-    retry.edit_state("failAdd", json!(false))?;
-    retry.success("--apply", "updated")?;
-    retry.installed()?;
-    retry.success("--verify-only", "verified")?;
-    ensure!(retry.adds()? == 2, "failed install retry count");
-    scenarios.push("official-failure-resume");
-    #[cfg(windows)]
-    for (label, pathext) in [
-        ("missing", None),
-        ("empty", Some("")),
-        ("no-exe", Some(".BAT;.CMD")),
-    ] {
-        let isolated = fixture(
-            &format!("reject-pathext-{label}"),
-            &package,
-            false,
-            "source",
-            "",
-        )?;
-        let before = isolated.snapshot()?;
-        let result = isolated.run_hook_environment("--apply", None, false, Some(pathext))?;
+    // 廃止した Codex プラグイン更新コマンドは、固定の失敗コードで install を案内し、何も書かない。
+    let retired = fixture("retired-commands", &package, false, "source", "")?;
+    for name in ["plugin-update", "plugin-bootstrap"] {
+        let output = Command::new(binary)
+            .args([name, "--version", version])
+            .env("REMNIFOLD_HOME", &retired.home)
+            .env("CODEX_HOME", &retired.home)
+            .output()?;
+        let result: Value = serde_json::from_slice(&output.stdout)?;
         ensure!(
-            result["exitCode"] == 1
-                && result["code"] == "WINDOWS_PATHEXT_EXE_REQUIRED"
-                && isolated.snapshot()? == before
-                && isolated.adds()? == 0,
-            "PATHEXT {label} changed installation or did not fail closed: {result}"
+            output.status.code() == Some(1)
+                && result["code"] == "USE_REMNIFOLD_INSTALL"
+                && !retired.app().exists(),
+            "{name} was not retired: {result}"
         );
-        let publication =
-            isolated.run_hook_environment("--check-published", None, false, Some(pathext))?;
-        ensure!(
-            publication["status"] == "published" && publication["exitCode"] == 0,
-            "publication check incorrectly required hook runtime: {publication}"
-        );
-        scenarios.push(match label {
-            "missing" => "missing-pathext-rejected-before-install",
-            "empty" => "empty-pathext-rejected-before-install",
-            _ => "non-exe-pathext-rejected-before-install",
-        });
     }
-    for (fault, code) in [
-        ("ref", "RELEASE_REF_MISMATCH"),
-        ("version", "RELEASE_VERSION_MISMATCH"),
-        ("ci", "RELEASE_CI_NOT_SUCCESSFUL"),
-        ("ci-sha", "RELEASE_CI_NOT_SUCCESSFUL"),
-        ("artifact", "RELEASE_ARTIFACT_UNAVAILABLE"),
-        ("expired", "RELEASE_ARTIFACT_UNAVAILABLE"),
-        ("hash", "PACKAGE_HASH_MISMATCH"),
-        ("tree", "INCOMPLETE_RELEASE_TREE"),
-        ("digest", "ARTIFACT_DIGEST_MISMATCH"),
-        ("source-edit", "LOCAL_SOURCE_MODIFIED"),
+    scenarios.push("retired-codex-plugin-commands-point-to-install");
+    // 作業ルートが導入先の中、または導入先を含む場合は、外部照会や書込みの前に拒否する。
+    for (name, inside) in [
+        ("reject-work-inside-app", true),
+        ("reject-app-inside-work", false),
     ] {
-        let isolated = fixture(&format!("reject-{fault}"), &package, false, "source", fault)?;
-        if fault == "source-edit" {
-            fs::write(
-                isolated.source.join("README.md"),
-                "User-maintained content that must survive.\n",
-            )?;
-        }
-        let before = isolated.snapshot()?;
-        let result = isolated.run("--apply", None, false)?;
-        ensure!(
-            result["exitCode"] == 1 && result["status"] == "blocked" && result["code"] == code,
-            "{fault}: {result}"
-        );
-        ensure!(
-            before == isolated.snapshot()? && isolated.adds()? == 0,
-            "{fault} changed installation before validation"
-        );
-        scenarios.push(Box::leak(
-            format!("reject-{fault}-before-mutation").into_boxed_str(),
-        ));
-    }
-    for (name, source_name) in [
-        ("reject-work-inside-source", "source"),
-        ("reject-unicode-case-alias", "Ä"),
-    ] {
-        let isolated = fixture(name, &package, false, source_name, "")?;
-        let before = isolated.snapshot()?;
-        let alias = if cfg!(windows) {
-            PathBuf::from(isolated.source.to_string_lossy().to_lowercase())
+        let isolated = fixture(name, &package, false, "source", "")?;
+        let work = if inside {
+            isolated.app().join("must-not-be-created")
         } else {
-            isolated.source.clone()
+            isolated.home.clone()
         };
-        let nested = alias.join("must-not-be-created");
-        let result = isolated.run("--apply", Some(&nested), false)?;
+        let before = isolated.snapshot()?;
+        let result = isolated.run("--apply", Some(&work), false)?;
         ensure!(
             result["code"] == "INVALID_WORK_ROOT"
                 && result["exitCode"] == 1
                 && before == isolated.snapshot()?
-                && !nested.exists()
-                && isolated.calls()?.is_empty(),
+                && isolated.calls()?.is_empty()
+                && (!inside || !work.exists()),
             "unsafe work root accepted: {result}"
         );
         scenarios.push(name);
     }
-    let self_update = fixture("running-from-source", &package, false, "source", "")?;
-    let result = self_update.run("--apply", None, true)?;
-    ensure!(
-        result["status"] == "updated" && result["exitCode"] == 0,
-        "source updater failed: {result}"
-    );
-    self_update.installed()?;
-    scenarios.push("running-from-installed-source");
     let linked = fixture("reject-linked-work-root", &package, false, "source", "")?;
     let real = linked.root.join("real-work");
     fs::create_dir(&real)?;
@@ -2013,7 +1965,9 @@ fn run_suite(
         "linked work ancestor was followed: {result}"
     );
     scenarios.push("linked-work-root-rejected-before-mutation");
-    let mut worker = if legacy_archive.is_some() || previous_archive.is_some() {
+    // 旧 JavaScript 版は Codex プラグインとしての配布物で、単独アプリの導入では移行対象にしない。
+    let _ = legacy_archive;
+    let mut worker = if previous_archive.is_some() {
         Some(start_fixture(
             repo,
             tools.context("updater migration tools missing")?,
@@ -2022,96 +1976,8 @@ fn run_suite(
     } else {
         None
     };
-    let http = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    for (name, input) in [
-        ("legacy-js-migration", legacy_archive),
-        ("previous-native-migration", previous_archive),
-    ] {
-        if let Some(input) = input {
-            let worker = worker.as_ref().context("migration Worker fixture")?;
-            let old = unpack(input, &root.join(format!("{name}-input")))?;
-            let original = files(&old)?;
-            ensure!(original != expected, "migration fixture must differ");
-            let mut migration = fixture(
-                name,
-                &old,
-                name == "previous-native-migration",
-                "source",
-                "",
-            )?;
-            if name == "previous-native-migration" {
-                migration.legacy_temp = true;
-                migration.edit_state("requireGithubHost", json!(false))?;
-                migration.binary = old.join(if cfg!(windows) {
-                    "bin/remnifold.exe"
-                } else {
-                    "bin/remnifold"
-                });
-            }
-            let state = prepare_migration_state(&migration, &migration.binary, &worker.base_url)?;
-            migration.success("--apply", "updated")?;
-            migration.installed()?;
-            migration.success("--apply", "already-current")?;
-            migration.success("--verify-only", "verified")?;
-            verify_migration_state(&migration, &state, &worker.base_url, &http)?;
-            ensure!(
-                migration.adds()? == 1 && files(&old)? == original,
-                "migration changed external state or input"
-            );
-            scenarios.push(name);
-            if name == "previous-native-migration" {
-                let mut immutable = fixture(
-                    "reject-same-version-different-content",
-                    &old,
-                    true,
-                    "source",
-                    "",
-                )?;
-                let previous_manifest: Value =
-                    serde_json::from_slice(&fs::read(old.join(".codex-plugin/plugin.json"))?)?;
-                immutable.version = previous_manifest["version"]
-                    .as_str()
-                    .context("previous version")?
-                    .into();
-                immutable.edit_state("version", json!(immutable.version))?;
-                immutable
-                    .edit_state("manifest", serde_json::from_slice(&original_plugin_bytes)?)?;
-                let mut original_tree = tree.clone();
-                for entry in &mut original_tree {
-                    let bytes = match entry["path"].as_str() {
-                        Some(".codex-plugin/plugin.json") => Some(&original_plugin_bytes),
-                        Some("server/package.json") => Some(&original_server_bytes),
-                        _ => None,
-                    };
-                    if let Some(bytes) = bytes {
-                        let mut digest = Sha1::new();
-                        digest.update(format!("blob {}\0", bytes.len()));
-                        digest.update(bytes);
-                        entry["sha"] = json!(
-                            digest
-                                .finalize()
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<String>()
-                        );
-                    }
-                }
-                immutable.edit_state("tree", json!(original_tree))?;
-                let before = immutable.snapshot()?;
-                let result = immutable.run("--verify-only", None, false)?;
-                ensure!(
-                    result["status"] == "blocked"
-                        && result["exitCode"] == 1
-                        && immutable.snapshot()? == before
-                        && immutable.adds()? == 0,
-                    "same-version content replacement accepted or mutated: {result}"
-                );
-                scenarios.push("same-version-content-mismatch-is-immutable");
-            }
-        }
+    if let Some(input) = previous_archive {
+        unpack(input, &root.join("previous-native-migration-input"))?;
     }
     let previous = root.join("previous-native-migration-input/remnifold");
     r2_cases(
@@ -2205,6 +2071,10 @@ pub fn validate_work_root(repo: &Path, work: &Path) -> Result<()> {
         "updater fixture work root overlaps repository"
     );
     let mut protected = Vec::new();
+    // Remnifold 自身の設定・状態（REMNIFOLD_HOME または OS 標準の場所）も作業ルートと重ねない。
+    let roots = crate::paths::Roots::current();
+    protected.push(roots.config);
+    protected.push(roots.state);
     for name in ["CODEX_HOME", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"] {
         if let Some(path) = std::env::var_os(name) {
             protected.push(PathBuf::from(path));

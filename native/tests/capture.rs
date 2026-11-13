@@ -266,6 +266,7 @@ impl Fixture {
         command
             .args(args)
             .env("CODEX_HOME", &self.home)
+            .env("REMNIFOLD_HOME", &self.home)
             .env("HOME", &self.root)
             .env("USERPROFILE", &self.root)
             .current_dir(self.root.join("project"))

@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -277,7 +277,8 @@ struct RecallState {
     path: PathBuf,
 }
 impl RecallState {
-    fn load(payload: &Value, home: &Path, event: &str) -> Option<Self> {
+    // 書込みは Remnifold 自身の状態フォルダ、読取りは旧来の Codex home 配下（旧名を含む）も見る。
+    fn load(payload: &Value, config: &Config, event: &str) -> Option<Self> {
         let session = payload["session_id"]
             .as_str()
             .filter(|s| !s.trim().is_empty())?;
@@ -285,10 +286,11 @@ impl RecallState {
             .as_str()
             .filter(|s| !s.trim().is_empty())?;
         let filename = format!("{}.json", sha256(session));
-        let path = home.join("remnifold/recall-state").join(&filename);
-        let read_path = ["remnifold", "kagayoi-memory", "cloudflare-memory"]
-            .into_iter()
-            .map(|name| home.join(name).join("recall-state").join(&filename))
+        let dirs = config.roots.state_dirs(&config.codex_home, "recall-state");
+        let path = dirs[0].join(&filename);
+        let read_path = dirs
+            .iter()
+            .map(|dir| dir.join(&filename))
             .find(|p| p.exists());
         let mut state = match read_path {
             Some(p) => serde_json::from_slice::<Value>(&fs::read(p).ok()?).ok()?,
@@ -423,6 +425,7 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
                 api_key: String::new(),
                 raw: json!({}),
                 codex_home: codex_home(),
+                roots: crate::paths::Roots::current(),
             },
         };
         &owned
@@ -442,7 +445,7 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
         return Ok(json!({}));
     }
     if event == "SessionStart" {
-        if let Some(state) = RecallState::load(payload, &config.codex_home, event) {
+        if let Some(state) = RecallState::load(payload, config, event) {
             state.save();
         }
         return Ok(json!({}));
@@ -538,7 +541,7 @@ fn render_recall(
     if items.is_empty() && recent.is_empty() {
         return response;
     }
-    let mut state = RecallState::load(payload, &config.codex_home, event);
+    let mut state = RecallState::load(payload, config, event);
     // 索引の案内文・見出しは、索引を書き込む環境の言語（crate::locale）で出す。
     // タグ名 <remnifold-index> は capture 側の除外判定が依存するため、言語によらず固定する。
     let japanese = crate::locale::current() == crate::locale::Language::Japanese;
@@ -656,6 +659,7 @@ fn render_recall(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     fn fixture() -> (PathBuf, Value) {
         let root = std::env::temp_dir().join(format!("hooks-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -693,6 +697,11 @@ mod tests {
             api_key: "fixture".into(),
             raw: json!({}),
             codex_home: home.to_path_buf(),
+            // 旧来の Codex home と同じ配置（REMNIFOLD_HOME で同じフォルダを指した場合）にする。
+            roots: crate::paths::Roots {
+                config: home.to_path_buf(),
+                state: home.join("remnifold"),
+            },
         }
     }
 
@@ -725,10 +734,10 @@ mod tests {
         let (root, payload) = fixture();
         append(&payload, &user("日本語 😀 UTF-8"));
         let item = json!({"containerTag":"a","id":"b","updatedAt":"one"});
-        let mut state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let mut state = RecallState::load(&payload, &config(&root), "UserPromptSubmit").unwrap();
         state.mark(&item, "index", "");
         state.save();
-        let state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let state = RecallState::load(&payload, &config(&root), "UserPromptSubmit").unwrap();
         assert!(state.has(&item, "index", ""));
         assert!(!state.has(&item, "index", "recent"));
         assert!(!state.has(
@@ -738,19 +747,19 @@ mod tests {
         ));
         let offset = state.state["offset"].as_u64().unwrap();
         append(&payload, b"{\"type\":\"compacted\"");
-        let state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let state = RecallState::load(&payload, &config(&root), "UserPromptSubmit").unwrap();
         assert_eq!(state.state["offset"], offset);
         assert!(!state.has(&item, "index", ""));
         state.save();
         append(&payload, b"}\n");
-        let mut state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let mut state = RecallState::load(&payload, &config(&root), "UserPromptSubmit").unwrap();
         assert!(!state.has(&item, "index", ""));
         state.mark(&item, "index", "");
         state.save();
         let mut compact = payload.clone();
         compact["source"] = json!("compact");
         assert!(
-            !RecallState::load(&compact, &root, "SessionStart")
+            !RecallState::load(&compact, &config(&root), "SessionStart")
                 .unwrap()
                 .has(&item, "index", "")
         );
@@ -760,7 +769,7 @@ mod tests {
     fn legacy_state_is_read_and_written_to_current_namespace() {
         let (root, payload) = fixture();
         let item = json!({"containerTag":"a","id":"b"});
-        let mut state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let mut state = RecallState::load(&payload, &config(&root), "UserPromptSubmit").unwrap();
         state.mark(&item, "index", "");
         let legacy = root.join("cloudflare-memory/recall-state");
         fs::create_dir_all(&legacy).unwrap();
@@ -769,7 +778,7 @@ mod tests {
             serde_json::to_vec(&state.state).unwrap(),
         )
         .unwrap();
-        let state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let state = RecallState::load(&payload, &config(&root), "UserPromptSubmit").unwrap();
         assert!(state.has(&item, "index", ""));
         state.save();
         assert!(state.path.exists());
@@ -946,7 +955,7 @@ mod tests {
             Ok(json!([small])),
         );
         assert!(units(text(&response["hookSpecificOutput"]["additionalContext"])) <= 3000);
-        let state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let state = RecallState::load(&payload, &config, "UserPromptSubmit").unwrap();
         assert!(state.has(&small, &search::format_recent_task(&small), "recent"));
         let again = render_recall(
             "UserPromptSubmit",
@@ -978,7 +987,7 @@ mod tests {
         assert!(context.contains("id=first"));
         assert!(!context.contains("id=second"));
         assert!(context.contains("id=short"));
-        let state = RecallState::load(&payload, &root, "UserPromptSubmit").unwrap();
+        let state = RecallState::load(&payload, &config, "UserPromptSubmit").unwrap();
         assert!(!state.has(&skipped, &search::format_index_item(&skipped), ""));
         assert!(state.has(&short, &search::format_index_item(&short), ""));
     }

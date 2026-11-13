@@ -1,5 +1,7 @@
 //! Windows の shell frontend に依存しない、固定 Git for Windows 起動文字列。
+// 開発ツール（dev）の Windows フック検証が使う。native 側では参照しない。
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) const WINDOWS_SH: &str = r"C:\Program Files\Git\usr\bin\sh.exe";
 
 pub(crate) fn windows_script(event: &str) -> Option<String> {

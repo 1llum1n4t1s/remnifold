@@ -20,9 +20,6 @@ fn absolute(value: &str) -> Result<std::path::PathBuf> {
 pub(crate) struct PrivateWorkGuard;
 #[cfg(not(windows))]
 impl PrivateWorkGuard {
-    pub(super) fn open_delivery(_work: &Path, _profile: &Path) -> Result<Self> {
-        bail!("WINDOWS_BOOTSTRAP_REQUIRED")
-    }
     pub(crate) fn open(work: &Path) -> Result<Self> {
         ensure!(work.is_absolute(), "INVALID_WORK_ROOT");
         #[cfg(unix)]
@@ -513,10 +510,6 @@ mod windows {
     impl PrivateWorkGuard {
         pub(crate) fn open(work: &Path) -> Result<Self> {
             Self::open_policy(work, None)
-        }
-        pub(crate) fn open_delivery(work: &Path, profile: &Path) -> Result<Self> {
-            ensure!(work.starts_with(profile), "INVALID_DELIVERY_ROOT");
-            Self::open_policy(work, Some(profile))
         }
         fn open_policy(work: &Path, delivery: Option<&Path>) -> Result<Self> {
             ensure!(work.is_absolute(), "INVALID_WORK_ROOT");

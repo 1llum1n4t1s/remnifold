@@ -1678,6 +1678,10 @@ mod tests {
                 api_key: "fixture-key".into(),
                 raw: json!({}),
                 codex_home: std::path::PathBuf::new(),
+                roots: crate::paths::Roots {
+                    config: std::path::PathBuf::new(),
+                    state: std::path::PathBuf::new(),
+                },
             },
             handle,
             requests,

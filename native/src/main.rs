@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use remnifold::{
-    capture, common, hooks, live_test, local, mcp, organization, provision, topics_setup, updater,
+    capture, common, connect, hooks, live_test, local, mcp, organization, provision, topics_setup,
+    updater,
 };
 use serde_json::Value;
 use std::io::{self, Read};
@@ -24,7 +25,7 @@ fn run() -> Result<()> {
     match args.first().map(String::as_str).unwrap_or("mcp") {
         "--version" | "-V" => println!("remnifold {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" | "help" => println!(
-            "Remnifold {}\n\nUsage: remnifold <command>\n  mcp                 Run the stdio MCP server (default)\n  hook <event>        Run a Codex lifecycle hook\n  capture             Capture completed turns from stdin JSON\n  import [options]    Import Codex history (dry run unless --apply)\n  setup [options]     Connect an existing self-hosted server\n  server-setup ...    Provision and deploy a Cloudflare server\n  topics-setup ...    Plan or queue finite unclassified enrichment\n  server-live-test    Explicitly verify configured remote server\n  status              Check connection and recall settings\n  plugin-update ...   Verify or update the local plugin\n  plugin-bootstrap ... Verify or download the first R2 package on Windows\n\nNormal client use requires no Node.js runtime.",
+            "Remnifold {}\n\nUsage: remnifold <command>\n  mcp                 Run the stdio MCP server (default)\n  hook <event>        Run a Claude Code or Codex lifecycle hook\n  capture             Capture completed turns from stdin JSON\n  import [options]    Import Codex history (dry run unless --apply)\n  setup [options]     Connect an existing self-hosted server\n  server-setup ...    Provision and deploy a Cloudflare server\n  topics-setup ...    Plan or queue finite unclassified enrichment\n  server-live-test    Explicitly verify configured remote server\n  status              Check connection and recall settings\n  install ...         Verify, install or update the standalone app\n  connect <tool> ...  Register the installed app with claude-code or codex\n\nNormal client use requires no Node.js runtime.",
             env!("CARGO_PKG_VERSION")
         ),
         "mcp" => mcp::start()?,
@@ -78,8 +79,10 @@ fn run() -> Result<()> {
         "memory-organize" => organization::run(&args[1..])?,
         "server-live-test" => live_test::run(&args[1..])?,
         "status" => local::status()?,
-        "plugin-update" => updater::run(&args[1..])?,
-        "plugin-bootstrap" => updater::run_bootstrap(&args[1..])?,
+        "install" => updater::run_install(&args[1..])?,
+        "connect" => connect::run(&args[1..])?,
+        // Codex プラグインとしての導入・更新は廃止した。固定の失敗コードで install を案内する。
+        "plugin-update" | "plugin-bootstrap" => updater::retired(&args[0])?,
         _ => bail!("Unknown command. Use remnifold --help."),
     }
     Ok(())

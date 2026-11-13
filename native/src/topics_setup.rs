@@ -261,6 +261,10 @@ mod tests {
             api_key: "fixture-owner-key".into(),
             raw: json!({}),
             codex_home: PathBuf::new(),
+            roots: crate::paths::Roots {
+                config: std::path::PathBuf::new(),
+                state: std::path::PathBuf::new(),
+            },
         };
         let result = setup(&options(true, 1), |path, body| {
             common::api(

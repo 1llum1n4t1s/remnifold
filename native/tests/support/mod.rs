@@ -163,4 +163,10 @@ pub fn isolate(command: &mut Command) {
         }
     }
     command.env("NO_PROXY", "127.0.0.1,localhost,::1");
+    // 既定では Remnifold 自身の設定・状態を毎回新しい一時フォルダへ隔離し、実環境の設定フォルダ
+    // （%APPDATA%\Remnifold 等）を読み書きしないようにする。テスト側で必要なら後から上書きする。
+    command.env(
+        "REMNIFOLD_HOME",
+        std::env::temp_dir().join(format!("remnifold-test-home-{}", uuid::Uuid::new_v4())),
+    );
 }

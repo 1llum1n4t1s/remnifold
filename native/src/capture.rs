@@ -855,15 +855,12 @@ pub fn capture(payload: &Value, config: &Config) -> Result<Value> {
         text(&project["containerTag"]),
         text(&candidate.meta["id"])
     ));
-    let paths: Vec<_> = ["remnifold", "kagayoi-memory", "cloudflare-memory"]
-        .iter()
-        .map(|n| {
-            config
-                .codex_home
-                .join(n)
-                .join("capture-state")
-                .join(format!("{state_id}.json"))
-        })
+    // 書込みは Remnifold 自身の状態フォルダ（先頭）、読取りは旧来の Codex home 配下も合わせる。
+    let paths: Vec<_> = config
+        .roots
+        .state_dirs(&config.codex_home, "capture-state")
+        .into_iter()
+        .map(|dir| dir.join(format!("{state_id}.json")))
         .collect();
     let receipts = receipt_union(&paths)?;
     let pending: Vec<_> = documents

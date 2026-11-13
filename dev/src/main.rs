@@ -13,6 +13,10 @@ mod r2;
 #[allow(dead_code)]
 #[path = "../../native/src/release_manifest.rs"]
 mod release_manifest;
+// native と同じ保存場所の解決を使い、updater fixture の作業ルートがそれと重ならないことを確かめる。
+#[allow(dead_code)]
+#[path = "../../native/src/paths.rs"]
+mod paths;
 mod server_tests;
 mod source;
 mod tools;
@@ -372,6 +376,8 @@ fn native_tests(repo: &Path, tools: &tools::Toolchain, work: &Path) -> Result<()
         .env("REMNIFOLD_ESBUILD", &tools.esbuild)
         .env("REMNIFOLD_VALIDATION_DIR", &isolated)
         .env("CODEX_HOME", isolated.join("codex"))
+        // テストが Remnifold 自身の設定フォルダ（OS 標準の場所）へ書かないよう隔離する。
+        .env("REMNIFOLD_HOME", isolated.join("remnifold-home"))
         .env("NO_PROXY", "127.0.0.1,localhost,::1")
         .env("TEMP", &temporary)
         .env("TMP", &temporary)

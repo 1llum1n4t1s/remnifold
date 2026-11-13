@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod claude_transcript;
 pub mod common;
+pub mod connect;
 pub mod embedded;
 pub mod hooks;
 pub mod live_test;
@@ -8,6 +9,7 @@ pub mod local;
 pub mod locale;
 pub mod mcp;
 pub mod organization;
+pub mod paths;
 pub mod provision;
 pub mod release_manifest;
 pub mod search;

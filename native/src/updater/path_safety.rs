@@ -77,6 +77,8 @@ pub(crate) fn physical_path(path: &Path) -> Result<PathBuf> {
         }
     }
 }
+// 開発ツール（dev）の公開処理とテストが使う。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn isolated_physical_roots(source: &Path, work: &Path, codex_home: &Path) -> Result<()> {
     let source = physical_path(source)?;
     let work = physical_path(work)?;
@@ -84,6 +86,20 @@ pub(crate) fn isolated_physical_roots(source: &Path, work: &Path, codex_home: &P
     for (left, right) in [(&source, &work), (&source, &codex), (&work, &codex)] {
         ensure!(
             !within(left, right) && !within(right, left),
+            "INVALID_WORK_ROOT"
+        );
+    }
+    Ok(())
+}
+/// 作業ルートが Remnifold 自身の設定・状態フォルダ（crate::paths）と重ならないことを確かめる。
+/// 接続設定（API キーを含む）や capture/recall 状態を、作業ルートの清掃や展開で巻き込まないため。
+pub(crate) fn isolated_from_remnifold_roots(work: &Path) -> Result<()> {
+    let work = physical_path(work)?;
+    let roots = crate::paths::Roots::current();
+    for root in [&roots.config, &roots.state] {
+        let root = physical_path(root)?;
+        ensure!(
+            !within(&root, &work) && !within(&work, &root),
             "INVALID_WORK_ROOT"
         );
     }

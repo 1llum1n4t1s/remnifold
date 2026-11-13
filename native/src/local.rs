@@ -13,7 +13,11 @@ use std::{
 
 pub fn setup(args: &[String]) -> Result<()> {
     let mut base_url = String::new();
-    let mut home = common::codex_home();
+    // 接続設定の書込み先。既定は Remnifold 自身の設定フォルダ（crate::paths）。
+    // --config-dir で変更でき、--codex-home は旧版との互換のため同じ意味で受け付ける。
+    let roots = crate::paths::Roots::current();
+    let mut dir = roots.config.clone();
+    let mut explicit_dir = false;
     let mut force = false;
     let mut stdin_key = false;
     let mut max_memories = None;
@@ -23,7 +27,8 @@ pub fn setup(args: &[String]) -> Result<()> {
         match args[index].as_str() {
             "--force" => force = true,
             "--api-key-stdin" => stdin_key = true,
-            "--base-url" | "--codex-home" | "--max-memories" | "--max-recent-tasks" => {
+            "--base-url" | "--config-dir" | "--codex-home" | "--max-memories"
+            | "--max-recent-tasks" => {
                 let option = &args[index];
                 index += 1;
                 let value = args
@@ -32,7 +37,10 @@ pub fn setup(args: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("{option} requires a value."))?;
                 match option.as_str() {
                     "--base-url" => base_url = value.clone(),
-                    "--codex-home" => home = common::absolute_path(&PathBuf::from(value))?,
+                    "--config-dir" | "--codex-home" => {
+                        dir = common::absolute_path(&PathBuf::from(value))?;
+                        explicit_dir = true;
+                    }
                     "--max-memories" => {
                         let n: u64 = value.parse().map_err(|_| {
                             anyhow::anyhow!("max-memories must be from 1 through 5.")
@@ -55,7 +63,9 @@ pub fn setup(args: &[String]) -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "remnifold setup --base-url <HTTPS endpoint> [--codex-home <directory>] [--force] [--api-key-stdin] [--max-memories 1..5] [--max-recent-tasks 0..3]\nThe API key is read from the existing connection, environment, or a hidden prompt."
+                    "remnifold setup --base-url <HTTPS endpoint> [--config-dir <directory>] [--force] [--api-key-stdin] [--max-memories 1..5] [--max-recent-tasks 0..3]\nThe API key is read from the existing connection, environment, or a hidden prompt.
+The connection is written to {} unless --config-dir (or the legacy alias --codex-home) is given.",
+                    roots.config_file().display()
                 );
                 return Ok(());
             }
@@ -67,16 +77,27 @@ pub fn setup(args: &[String]) -> Result<()> {
         base_url = std::env::var("REMNIFOLD_API_URL").unwrap_or_default();
     }
     let base_url = common::normalize_endpoint(base_url.trim())?;
-    let path = home.join("remnifold.json");
-    if path.exists() && !force {
+    let path = dir.join("remnifold.json");
+    // 既存の接続は書込み先、無ければ旧来の Codex home（明示指定が無い場合）から読み、設定値を引き継ぐ。
+    // 旧来の Codex home の remnifold.json も既存の接続とみなし、置き換えには --force を求める
+    // （旧製品名のファイルだけなら従来どおり --force なしで引き継ぐ）。
+    let legacy = common::codex_home();
+    let existing = crate::paths::CONFIG_NAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .chain(
+            crate::paths::CONFIG_NAMES
+                .iter()
+                .filter(|_| !explicit_dir)
+                .map(|name| legacy.join(name)),
+        )
+        .find(|file| file.exists());
+    let legacy_current = !explicit_dir && legacy.join("remnifold.json").exists();
+    if (path.exists() || legacy_current) && !force {
         bail!("Configuration already exists. Use --force to replace it.");
     }
     let mut raw = json!({});
-    for name in ["remnifold.json", "kagayoi-memory.json", "supermemory.json"] {
-        let file = home.join(name);
-        if !file.exists() {
-            continue;
-        }
+    if let Some(file) = existing {
         raw = serde_json::from_slice::<Value>(
             &fs::read(file)
                 .map_err(|_| anyhow::anyhow!("Existing configuration could not be read."))?,
@@ -84,7 +105,6 @@ pub fn setup(args: &[String]) -> Result<()> {
         .ok()
         .filter(Value::is_object)
         .ok_or_else(|| anyhow::anyhow!("Existing configuration must contain valid JSON."))?;
-        break;
     }
     let mut key = String::new();
     if stdin_key {
@@ -136,7 +156,8 @@ pub fn setup(args: &[String]) -> Result<()> {
         base_url: base_url.clone(),
         api_key: key.clone(),
         raw: raw.clone(),
-        codex_home: home,
+        codex_home: legacy,
+        roots,
     };
     let session = common::api(&config, "/v3/session", "GET", None, 8_000)
         .map_err(|_| anyhow::anyhow!("The authenticated memory session could not be verified."))?;

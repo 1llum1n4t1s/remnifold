@@ -29,6 +29,8 @@ fn client(home: &Fixture) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_remnifold"));
     support::isolate(&mut cmd);
     cmd.env("CODEX_HOME", &home.0);
+    // Remnifold 自身の設定も同じフォルダに隔離する（実環境の設定フォルダへ書かない）。
+    cmd.env("REMNIFOLD_HOME", &home.0);
     for name in [
         "REMNIFOLD_API_URL",
         "REMNIFOLD_API_KEY",

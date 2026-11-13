@@ -552,6 +552,10 @@ mod tests {
             api_key: String::new(),
             raw: json!({}),
             codex_home: folder.clone(),
+            roots: crate::paths::Roots {
+                config: std::path::PathBuf::new(),
+                state: std::path::PathBuf::new(),
+            },
         };
         let handles: Vec<_> = (0..2)
             .map(|_| {

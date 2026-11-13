@@ -321,7 +321,6 @@ fn download(
 }
 
 pub(super) struct Published {
-    pub archive: Vec<u8>,
     pub receipt: Value,
     pub evidence: Value,
     pub files: Files,
@@ -400,7 +399,6 @@ pub(super) fn published(
         files
     };
     Ok(Published {
-        archive: bytes,
         receipt,
         evidence,
         files,
@@ -458,7 +456,6 @@ mod tests {
     fn context() -> Context {
         Context {
             gh: vec![],
-            codex: vec![],
             repository: protocol::REPOSITORY.into(),
             work: PathBuf::new(),
             gh_log_escape: std::sync::OnceLock::new(),

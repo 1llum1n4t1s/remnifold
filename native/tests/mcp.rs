@@ -124,6 +124,10 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
             "CODEX_HOME",
             std::env::temp_dir().join("remnifold-mcp-unused-config"),
         )
+        .env(
+            "REMNIFOLD_HOME",
+            std::env::temp_dir().join("remnifold-mcp-unused-config"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
