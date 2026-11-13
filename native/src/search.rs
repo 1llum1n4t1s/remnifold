@@ -550,7 +550,9 @@ pub fn format_index_item(v: &Value) -> String {
     if !text(&v["searchExcerpt"]).is_empty() {
         result += &format!(
             "\n  {}: {}",
-            pick("原文の該当箇所", "Matching source excerpt"),
+            // 英語でも「原文（original）」と分かる語を残す。抜粋が保存された原文由来であることを
+            // 利用側が見分けられるよう、client 契約もこの語を確認している。
+            pick("原文の該当箇所", "Matching original excerpt"),
             prompt(text(&v["searchExcerpt"]), 240)
         )
     }
