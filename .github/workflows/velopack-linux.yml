@@ -1,0 +1,163 @@
+name: Velopack Linux
+
+# Linux（x64 / ARM64）の Setup（Velopack の AppImage）版を、GitHub 提供のランナーでネイティブにビルドして検証する。
+# R2 へは書かない。Environment も Secrets も使わない（checkout は自動発行の読み取り専用トークンだけを使う）。
+#
+# 中身:
+#   1. cargo test -p remnifold --lib（Linux で走るもの）と、cargo clippy（rustc の警告と clippy の correctness を拒否する。
+#      既存コード全体の style などの指摘は、このリポジトリでは CI の対象にしていないため外す）。
+#   2. update-feed-test 付きでビルドし、scripts/velopack/pack-linux.sh でテスト用 packId の 9.0.0 / 9.0.1 を作る。
+#   3. scripts/velopack/e2e-linux.sh で隔離 E2E（導入 → 登録・autostart → 複数 mcp で取得1回 → busy → 適用 → 解除）。
+# ci.yml と同じく、実行可能な Actions は使わず git で checkout する。Node.js は使わない。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'native/**'
+      - 'scripts/velopack/**'
+      - '.github/workflows/velopack-linux.yml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: velopack-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      # vpk 1.2.161 を、ランナーにある新しい .NET でも動かす（ランナーに合う版が無い場合に備える）。
+      DOTNET_ROLL_FORWARD: Major
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+    steps:
+      - name: Check out exact source commit without executable Actions
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\r\n')"
+          printf '::add-mask::%s\n' "$authorization"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Configure isolated work directories
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/remnifold-velopack-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ matrix.arch }}"
+          test ! -e "$root"
+          mkdir -p "$root"/{tmp,tools,dotnet-home,nuget,validation,pack-9.0.0,pack-9.0.1,e2e}
+          {
+            printf 'CI_ROOT=%s\n' "$root"
+            printf 'TEMP=%s/tmp\nTMP=%s/tmp\nTMPDIR=%s/tmp\n' "$root" "$root" "$root"
+            printf 'CARGO_TARGET_DIR=%s/build\n' "$root"
+            printf 'DOTNET_CLI_HOME=%s/dotnet-home\nNUGET_PACKAGES=%s/nuget\n' "$root" "$root"
+          } >> "$GITHUB_ENV"
+
+      - name: Install locked Rust toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal --component clippy && rustup default 1.100.0
+
+      - name: Install Velopack CLI 1.2.161 into the work folder
+        run: |
+          set -euo pipefail
+          # dotnet が無いランナーでは、作業フォルダーへ入れる（ランナーの全体には入れない）。
+          if ! command -v dotnet >/dev/null; then
+            curl -fsSL https://dot.net/v1/dotnet-install.sh -o "$CI_ROOT/tools/dotnet-install.sh"
+            bash "$CI_ROOT/tools/dotnet-install.sh" --channel 8.0 --install-dir "$CI_ROOT/tools/dotnet"
+            printf '%s\n' "$CI_ROOT/tools/dotnet" >> "$GITHUB_PATH"
+            # --tool-path で入れた vpk が、この dotnet を見つけられるようにする。
+            printf 'DOTNET_ROOT=%s\n' "$CI_ROOT/tools/dotnet" >> "$GITHUB_ENV"
+            export PATH="$CI_ROOT/tools/dotnet:$PATH" DOTNET_ROOT="$CI_ROOT/tools/dotnet"
+          fi
+          dotnet --version
+          dotnet tool install vpk --version 1.2.161 --tool-path "$CI_ROOT/tools/vpk"
+          printf '%s\n' "$CI_ROOT/tools/vpk" >> "$GITHUB_PATH"
+          # 出力を変数に取ってから照合する（パイプで grep -q が先に終わると、pipefail で誤って失敗になるため）。
+          help="$("$CI_ROOT/tools/vpk/vpk" --skip-updates --help 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')"
+          grep -q 'Velopack CLI 1\.2\.161' <<<"$help" || { printf '%s\n' "$help"; exit 1; }
+
+      - name: Prepare pinned native build tools
+        # build.rs が固定版の esbuild（.devtools/<host>/）を要求する。
+        run: cargo xtask prepare
+
+      - name: Check whitespace and script syntax
+        run: |
+          set -euo pipefail
+          git diff --check
+          bash -n scripts/velopack/pack-linux.sh
+          bash -n scripts/velopack/e2e-linux.sh
+
+      - name: Test the native library on Linux
+        run: |
+          set -euo pipefail
+          # テストが利用者の設定・Codex のフォルダーへ書かないよう隔離する（xtask native-test と同じ扱い）。
+          export REMNIFOLD_HOME="$CI_ROOT/validation/remnifold-home" CODEX_HOME="$CI_ROOT/validation/codex"
+          export REMNIFOLD_VALIDATION_DIR="$CI_ROOT/validation"
+          export NO_PROXY=127.0.0.1,localhost,::1
+          cargo test --locked -p remnifold --lib
+
+      - name: Lint (rustc warnings and clippy correctness)
+        run: |
+          set -euo pipefail
+          for features in '' '--features update-feed-test'; do
+            # shellcheck disable=SC2086
+            cargo clippy --locked -p remnifold --all-targets $features -- -D warnings -A clippy::style -A clippy::complexity -A clippy::perf -A clippy::suspicious
+          done
+
+      - name: Build the test executable and pack 9.0.0 / 9.0.1
+        run: |
+          set -euo pipefail
+          # vpk は Linux 上では外部の mksquashfs で squashfs を作る（同梱は Windows 用だけ）。
+          if ! command -v mksquashfs >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends squashfs-tools
+          fi
+          # テスト用の機能（ローカルの更新元）を付けたビルド。本番の梱包（pack-linux.sh の既定）では付けない。
+          cargo build --locked --release -p remnifold --bin remnifold --features update-feed-test
+          binary="$CARGO_TARGET_DIR/release/remnifold"
+          for version in 9.0.0 9.0.1; do
+            bash scripts/velopack/pack-linux.sh "$CI_ROOT/pack-$version" --pack-id RemnifoldVelopackTest --version "$version" --binary "$binary"
+          done
+
+      - name: Make FUSE available when possible
+        # AppImage のランタイムは setuid の fusermount を要る。無ければ入れてみる。入らなければ E2E が
+        # APPIMAGE_EXTRACT_AND_RUN=1 へ切り替え、どちらで動いたかをログに出す。
+        run: |
+          set -euo pipefail
+          if command -v fusermount3 >/dev/null || command -v fusermount >/dev/null; then
+            echo 'fusermount is available'
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends fuse3 || echo 'fuse3 could not be installed; the E2E will extract and run instead'
+          fi
+          ls -l /dev/fuse || true
+
+      - name: Isolated Setup E2E (install, register, download once, busy, apply, uninstall)
+        run: bash scripts/velopack/e2e-linux.sh "$CI_ROOT/e2e" --old "$CI_ROOT/pack-9.0.0/packages" --new "$CI_ROOT/pack-9.0.1/packages"

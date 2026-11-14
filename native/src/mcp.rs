@@ -352,6 +352,9 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<Value> {
 }
 
 pub fn start() -> Result<()> {
+    // Setup（Velopack）導入版では、確認と取得を別スレッドで行う（適用はログオン時の update-apply だけ）。
+    // 管理外のビルドでは何もしない。標準出力は MCP 専用のため、このスレッドは何も出力しない。
+    crate::app_update::spawn_background();
     let server = Arc::new(Server::default());
     let mut workers = Vec::new();
     // 読み取りは常時このスレッドに残し、roots応答をAPI処理と独立して受信する。

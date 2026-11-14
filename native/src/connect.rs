@@ -12,14 +12,62 @@
 //! Codex:
 //! - MCP サーバーを公式 CLI（`codex mcp add`）で登録する。フックはプラグイン以外から登録する公式手段が
 //!   無いため登録しない（索引の自動想起と保存は Claude Code のフックで行う）。
+//!
+//! 解除（`--remove`）は、登録の逆を自分の項目だけに行う。settings.json の他のフック・設定、他の MCP 登録は
+//! 保つ。Setup（Velopack）版のインストール・更新・アンインストールの各フックからは、
+//! [`register_for_setup`] / [`unregister_for_setup`] を通して同じ処理を呼ぶ（失敗しても例外にせず、
+//! 結果を文字列で返す。フックの失敗でインストールや更新を止めないため）。
 use crate::common::{atomic_write, home_dir};
 use anyhow::{Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
+
+/// Setup（Velopack）のフックから呼ぶ CLI 1回あたりの上限。Velopack はインストール・アンインストール後の
+/// フックを30秒、更新後のフックを15秒で打ち切る。最悪でも全体が15秒に収まるよう、1回を3秒に制限する
+/// （remove と add の間で打ち切られると登録が消えたままになるため、無制限に待たせない）。
+const HOOK_CLI_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// CLI を1回実行する。終了コード 0 なら標準出力を返し、非 0 なら None。起動できない・時間切れは Err。
+/// `bounded` のときは、子プロセスの木ごと時間で打ち切る（フック用）。
+fn run_cli<S: AsRef<OsStr>>(cli: &Path, args: &[S], bounded: bool) -> Result<Option<String>> {
+    let mut command = Command::new(cli);
+    command.args(args);
+    // macOS の Setup 版は、インストーラーの `open` やログイン時の launchd から、最小限の PATH
+    // （/usr/bin:/bin:/usr/sbin:/sbin）で起動されることがある。npm で入れた CLI は `#!/usr/bin/env node` の
+    // スクリプトで、node は CLI と同じフォルダー（Homebrew など）にあることが多い。CLI のフォルダーを
+    // PATH の先頭に足し、子プロセスがその隣の node を見つけられるようにする。
+    // Linux の AppImage も、ファイルマネージャーからの起動では利用者のシェルの PATH を持たないことがあるため同じ扱い。
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(dir) = cli.parent() {
+        let mut paths = vec![dir.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            command.env("PATH", joined);
+        }
+    }
+    if bounded {
+        return match crate::updater::process::run(command, HOOK_CLI_TIMEOUT, 64 * 1024) {
+            Ok(stdout) => Ok(Some(String::from_utf8_lossy(&stdout).into_owned())),
+            Err(error) if error.to_string() == "CLI_FAILED" => Ok(None),
+            Err(error) => Err(error),
+        };
+    }
+    let output = command
+        .output()
+        .map_err(|_| anyhow::anyhow!("The command could not be started."))?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
+}
 
 /// 登録するフック。マッチャー・タイムアウト・非同期・表示文言はパッケージの hooks.json と揃える。
 const HOOKS: [(&str, Option<&str>, u64, bool, &str); 4] = [
@@ -44,23 +92,25 @@ const HOOKS: [(&str, Option<&str>, u64, bool, &str); 4] = [
 pub fn run(args: &[String]) -> Result<()> {
     let Some(tool) = args.first().map(String::as_str) else {
         bail!(
-            "Usage: remnifold connect <claude-code|codex> [--apply] [--executable <path>] [--cli <path>]"
+            "Usage: remnifold connect <claude-code|codex> [--remove] [--apply] [--executable <path>] [--cli <path>]"
         );
     };
     if matches!(tool, "--help" | "-h") {
         println!(
-            "Usage: remnifold connect <claude-code|codex> [--apply] [--executable <path>] [--cli <path>]\nRegisters the installed Remnifold ({}) with Claude Code (MCP server and hooks) or Codex (MCP server).\nWithout --apply, only the planned registration is shown.",
+            "Usage: remnifold connect <claude-code|codex> [--remove] [--apply] [--executable <path>] [--cli <path>]\nRegisters the installed Remnifold ({}) with Claude Code (MCP server and hooks) or Codex (MCP server).\nWith --remove, deletes only Remnifold's own registrations and keeps every other setting.\nWithout --apply, only the planned change is shown.",
             crate::paths::app_executable(&crate::paths::app_root()).display()
         );
         return Ok(());
     }
     let mut apply = false;
+    let mut remove = false;
     let mut executable = None;
     let mut cli = None;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
             "--apply" => apply = true,
+            "--remove" => remove = true,
             "--executable" | "--cli" => {
                 let flag = args[index].clone();
                 index += 1;
@@ -79,6 +129,17 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         index += 1;
     }
+    if remove {
+        // 解除は実行ファイルが無くても行える（アンインストール後の掃除）。--executable を指定したときだけ、
+        // その実行ファイルを指す登録に限って消す。省略時は、どこを指していても Remnifold の登録を消す。
+        let result = match tool {
+            "claude-code" => claude_code_remove(executable.as_deref(), cli, apply, false)?,
+            "codex" => codex_remove(executable.as_deref(), cli, apply, false)?,
+            _ => bail!("Unknown tool. Use claude-code or codex."),
+        };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     let executable =
         executable.unwrap_or_else(|| crate::paths::app_executable(&crate::paths::app_root()));
     ensure!(
@@ -87,8 +148,8 @@ pub fn run(args: &[String]) -> Result<()> {
         executable.display()
     );
     let result = match tool {
-        "claude-code" => claude_code(&executable, cli, apply)?,
-        "codex" => codex(&executable, cli, apply)?,
+        "claude-code" => claude_code(&executable, cli, apply, false)?,
+        "codex" => codex(&executable, cli, apply, false)?,
         _ => bail!("Unknown tool. Use claude-code or codex."),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -166,7 +227,12 @@ fn claude_settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-fn claude_code(executable: &Path, cli: Option<PathBuf>, apply: bool) -> Result<Value> {
+fn claude_code(
+    executable: &Path,
+    cli: Option<PathBuf>,
+    apply: bool,
+    bounded: bool,
+) -> Result<Value> {
     let settings_path = claude_settings_path();
     let mut settings = match fs::read(&settings_path) {
         Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map_err(|_| {
@@ -203,11 +269,11 @@ fn claude_code(executable: &Path, cli: Option<PathBuf>, apply: bool) -> Result<V
             false,
         )?;
     }
-    result["mcp"] = register_mcp(cli.or_else(|| find_cli("claude")), &mcp_args, true)?;
+    result["mcp"] = register_mcp(cli.or_else(|| find_cli("claude")), &mcp_args, true, bounded)?;
     Ok(result)
 }
 
-fn codex(executable: &Path, cli: Option<PathBuf>, apply: bool) -> Result<Value> {
+fn codex(executable: &Path, cli: Option<PathBuf>, apply: bool, bounded: bool) -> Result<Value> {
     let mcp_args = mcp_add_args(executable, false);
     let mut result = json!({
         "tool":"codex",
@@ -217,9 +283,346 @@ fn codex(executable: &Path, cli: Option<PathBuf>, apply: bool) -> Result<Value> 
         "hooks":"not registered: Codex has no supported way to register hooks outside plugins"
     });
     if apply {
-        result["mcp"] = register_mcp(cli.or_else(|| find_cli("codex")), &mcp_args, false)?;
+        result["mcp"] = register_mcp(cli.or_else(|| find_cli("codex")), &mcp_args, false, bounded)?;
     }
     Ok(result)
+}
+
+/// パスを比較用に正規化する（区切りを / に揃え、小文字にする。Windows のパスは大小を区別しない）。
+fn normalize_for_match(text: &str) -> String {
+    text.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// このフック項目のコマンドが、指定の実行ファイルを指しているか。
+fn entry_points_at(entry: &Value, executable: &Path) -> bool {
+    let needle = normalize_for_match(&executable.to_string_lossy());
+    entry["hooks"].as_array().is_some_and(|hooks| {
+        hooks.iter().any(|hook| {
+            normalize_for_match(hook["command"].as_str().unwrap_or("")).contains(&needle)
+        })
+    })
+}
+
+/// settings.json の値から Remnifold のフックだけを取り除く（何度実行しても同じ結果になる）。
+/// `only_executable` を指定すると、その実行ファイルを指す項目に限る。空になったイベントと
+/// `hooks` は削除する。形が想定外（配列でない等）の部分は触らない。
+fn remove_hooks(settings: &mut Value, only_executable: Option<&Path>) -> Result<()> {
+    ensure!(
+        settings.is_object(),
+        "Claude Code settings must be a JSON object; it was not changed."
+    );
+    let Some(hooks) = settings.get_mut("hooks") else {
+        return Ok(());
+    };
+    ensure!(
+        hooks.is_object(),
+        "Claude Code settings has a non-object \"hooks\" value; it was not changed."
+    );
+    let map = hooks.as_object_mut().expect("checked above");
+    for (event, ..) in HOOKS {
+        let Some(entries) = map.get_mut(event) else {
+            continue;
+        };
+        let Some(items) = entries.as_array_mut() else {
+            bail!("Claude Code settings has a non-array hooks.{event} value; it was not changed.");
+        };
+        items.retain(|entry| {
+            !(is_remnifold_entry(entry, event)
+                && only_executable.is_none_or(|exe| entry_points_at(entry, exe)))
+        });
+        if items.is_empty() {
+            map.remove(event);
+        }
+    }
+    if map.is_empty() {
+        settings
+            .as_object_mut()
+            .expect("checked above")
+            .remove("hooks");
+    }
+    Ok(())
+}
+
+/// MCP の登録が、指定の実行ファイルを指しているか（`mcp get remnifold` の出力で確かめる）。
+/// 確かめられない（CLI が失敗した・登録が無い・時間切れ）ときは false。
+fn mcp_points_at(cli: &Path, executable: &Path, bounded: bool) -> bool {
+    run_cli(cli, &["mcp", "get", "remnifold"], bounded)
+        .ok()
+        .flatten()
+        .is_some_and(|stdout| {
+            normalize_for_match(&stdout)
+                .contains(&normalize_for_match(&executable.to_string_lossy()))
+        })
+}
+
+fn unregister_mcp(
+    cli: Option<PathBuf>,
+    claude: bool,
+    only_executable: Option<&Path>,
+    bounded: bool,
+) -> Result<Value> {
+    let Some(cli) = cli else {
+        return Ok(
+            json!({"status":"manual","reason":"CLI not found; remove the remnifold MCP entry yourself"}),
+        );
+    };
+    if let Some(executable) = only_executable
+        && !mcp_points_at(&cli, executable, bounded)
+    {
+        return Ok(
+            json!({"status":"kept","reason":"the remnifold MCP entry is absent or points at another executable"}),
+        );
+    }
+    let mut remove = vec!["mcp", "remove", "remnifold"];
+    if claude {
+        remove.extend(["--scope", "user"]);
+    }
+    let removed = run_cli(&cli, &remove, bounded)
+        .map_err(|_| anyhow::anyhow!("The MCP removal command could not be completed."))?;
+    if removed.is_some() {
+        return Ok(json!({"status":"removed","cli":cli}));
+    }
+    // 登録が無いときに CLI が非 0 で終わる実装がある。その場合は「既に無い」ので成功として扱い、
+    // 登録が残っているのに失敗したときだけエラーにする。
+    if run_cli(&cli, &["mcp", "get", "remnifold"], bounded)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Ok(json!({"status":"absent","cli":cli}));
+    }
+    bail!("The MCP removal command failed.")
+}
+
+fn claude_code_remove(
+    executable: Option<&Path>,
+    cli: Option<PathBuf>,
+    apply: bool,
+    bounded: bool,
+) -> Result<Value> {
+    let settings_path = claude_settings_path();
+    // settings.json が無ければ何も作らない（Claude Code 未使用の環境に空のファイルを残さない）。
+    let (mut settings, exists) = match fs::read(&settings_path) {
+        Ok(bytes) => (
+            serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+                anyhow::anyhow!("Claude Code settings is not valid JSON; it was not changed.")
+            })?,
+            true,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (json!({}), false),
+        Err(_) => bail!("Claude Code settings could not be read."),
+    };
+    let before = settings.clone();
+    remove_hooks(&mut settings, executable)?;
+    let mut result = json!({
+        "tool":"claude-code",
+        "action":"remove",
+        "applied":apply,
+        "settings":settings_path,
+        "hooksChanged": settings != before,
+        "mcpCommand":"claude mcp remove remnifold --scope user"
+    });
+    if !apply {
+        return Ok(result);
+    }
+    if exists && settings != before {
+        let backup = settings_path.with_file_name("settings.json.remnifold-backup");
+        if !backup.exists() {
+            fs::copy(&settings_path, &backup)?;
+            result["backup"] = json!(backup);
+        }
+        atomic_write(
+            &settings_path,
+            &[serde_json::to_vec_pretty(&settings)?, b"\n".to_vec()].concat(),
+            false,
+        )?;
+    }
+    result["mcp"] = unregister_mcp(
+        cli.or_else(|| find_cli("claude")),
+        true,
+        executable,
+        bounded,
+    )?;
+    Ok(result)
+}
+
+fn codex_remove(
+    executable: Option<&Path>,
+    cli: Option<PathBuf>,
+    apply: bool,
+    bounded: bool,
+) -> Result<Value> {
+    let mut result = json!({
+        "tool":"codex",
+        "action":"remove",
+        "applied":apply,
+        "mcpCommand":"codex mcp remove remnifold"
+    });
+    if apply {
+        result["mcp"] = unregister_mcp(
+            cli.or_else(|| find_cli("codex")),
+            false,
+            executable,
+            bounded,
+        )?;
+    }
+    Ok(result)
+}
+
+/// Setup（Velopack）のインストール・更新フックから呼ぶ登録。導入先の固定の実行ファイルを、
+/// 見つかった CLI ごとに登録する。CLI が見つからない側は何も書かずに飛ばし、理由を返す。
+/// どの失敗も例外にせず、人が読める結果の行にして返す（フックを失敗させないため）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn register_for_setup(executable: &Path) -> Vec<String> {
+    register_tools_for_setup(executable, &SETUP_TOOLS)
+        .into_iter()
+        .map(|outcome| outcome.line)
+        .collect()
+}
+
+/// Setup 版が登録する CLI の名前（`claude` と `codex`）。
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub const SETUP_TOOLS: [&str; 2] = ["claude", "codex"];
+
+/// [`register_tools_for_setup`] の1つの CLI の結果。
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub struct SetupOutcome {
+    /// CLI の名前（`claude` / `codex`）。
+    pub tool: &'static str,
+    /// 登録まで済んだか。CLI が見つからない・失敗した場合は false（次の機会に再試行してよい）。
+    pub done: bool,
+    /// 診断ログ用の1行。
+    pub line: String,
+}
+
+/// 指定の CLI だけを登録する（macOS の初回起動・更新後の登録で、未完了の CLI だけをやり直すために使う）。
+/// 未知の名前は無視する。どの失敗も例外にしない。
+pub fn register_tools_for_setup(executable: &Path, tools: &[&str]) -> Vec<SetupOutcome> {
+    let mut outcomes = Vec::new();
+    for (tool, claude) in [("claude", true), ("codex", false)] {
+        if !tools.contains(&tool) {
+            continue;
+        }
+        let Some(cli) = find_cli(tool) else {
+            outcomes.push(SetupOutcome {
+                tool,
+                done: false,
+                line: format!("{tool}: CLI not found; skipped"),
+            });
+            continue;
+        };
+        let outcome = if claude {
+            claude_code(executable, Some(cli), true, true)
+        } else {
+            codex(executable, Some(cli), true, true)
+        };
+        outcomes.push(match outcome {
+            Ok(value) => SetupOutcome {
+                tool,
+                done: true,
+                line: format!(
+                    "{tool}: {}",
+                    value["mcp"]["status"].as_str().unwrap_or("done")
+                ),
+            },
+            Err(error) => SetupOutcome {
+                tool,
+                done: false,
+                line: format!("{tool}: failed: {error}"),
+            },
+        });
+    }
+    outcomes
+}
+
+/// 更新の後に、Claude Code の settings.json にある Remnifold のフックだけを最新の定義へ張り直す。
+/// CLI は呼ばない（MCP の登録は実行ファイルのパスが変わらない限り有効なままで、使用中のセッションの
+/// 設定を CLI で外して付け直すことを避けるため）。この実行ファイルを指す Remnifold のフックが1つも
+/// 無ければ（利用者が外した・未登録）、何も書かない。
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub fn refresh_claude_hooks_for_setup(executable: &Path) -> String {
+    let outcome = (|| -> Result<bool> {
+        let settings_path = claude_settings_path();
+        let bytes = match fs::read(&settings_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => bail!("Claude Code settings could not be read."),
+        };
+        let mut settings = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+            anyhow::anyhow!("Claude Code settings is not valid JSON; it was not changed.")
+        })?;
+        let ours = HOOKS.iter().any(|(event, ..)| {
+            settings["hooks"][event].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|entry| is_remnifold_entry(entry, event) && entry_points_at(entry, executable))
+            })
+        });
+        if !ours {
+            return Ok(false);
+        }
+        let before = settings.clone();
+        merge_hooks(&mut settings, executable)?;
+        if settings == before {
+            return Ok(false);
+        }
+        let backup = settings_path.with_file_name("settings.json.remnifold-backup");
+        if !backup.exists() {
+            fs::copy(&settings_path, &backup)?;
+        }
+        atomic_write(
+            &settings_path,
+            &[serde_json::to_vec_pretty(&settings)?, b"\n".to_vec()].concat(),
+            false,
+        )?;
+        Ok(true)
+    })();
+    match outcome {
+        Ok(true) => "claude: hooks updated".to_string(),
+        Ok(false) => "claude: hooks unchanged".to_string(),
+        Err(error) => format!("claude: hooks failed: {error}"),
+    }
+}
+
+/// その CLI が見つかるか（プロセスを起動しない軽い確認。登録をやり直すべきかの判定に使う）。
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub fn cli_available(tool: &str) -> bool {
+    find_cli(tool).is_some()
+}
+
+/// Setup（Velopack）のアンインストールフックから呼ぶ解除。導入先の実行ファイルを指す登録だけを消し、
+/// 別の場所（旧 install 版など）を指す登録は保つ。失敗は例外にせず結果の行で返す。
+pub fn unregister_for_setup(executable: &Path) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (tool, claude) in [("claude", true), ("codex", false)] {
+        let Some(cli) = find_cli(tool) else {
+            // CLI が無ければ MCP は解除できないが、Claude のフックは settings.json から外せる。
+            if claude {
+                lines.push(
+                    match claude_code_remove(Some(executable), None, true, true) {
+                        Ok(_) => "claude: CLI not found; hooks removed, MCP entry left".to_string(),
+                        Err(error) => format!("claude: failed: {error}"),
+                    },
+                );
+            } else {
+                lines.push(format!("{tool}: CLI not found on PATH; skipped"));
+            }
+            continue;
+        };
+        let outcome = if claude {
+            claude_code_remove(Some(executable), Some(cli), true, true)
+        } else {
+            codex_remove(Some(executable), Some(cli), true, true)
+        };
+        lines.push(match outcome {
+            Ok(value) => format!(
+                "{tool}: {}",
+                value["mcp"]["status"].as_str().unwrap_or("done")
+            ),
+            Err(error) => format!("{tool}: failed: {error}"),
+        });
+    }
+    lines
 }
 
 fn mcp_add_args(executable: &Path, claude: bool) -> Vec<String> {
@@ -250,38 +653,89 @@ fn display_args(args: &[String]) -> String {
 }
 
 /// 既存の remnifold 登録を外してから登録し直す（同じ名前の古い登録を残さない）。
-fn register_mcp(cli: Option<PathBuf>, add: &[String], claude: bool) -> Result<Value> {
+fn register_mcp(
+    cli: Option<PathBuf>,
+    add: &[String],
+    claude: bool,
+    bounded: bool,
+) -> Result<Value> {
     let Some(cli) = cli else {
         return Ok(json!({"status":"manual","reason":"CLI not found; run mcpCommand yourself"}));
     };
-    let mut remove = Command::new(&cli);
-    remove.args(["mcp", "remove", "remnifold"]);
+    let mut remove = vec!["mcp", "remove", "remnifold"];
     if claude {
-        remove.args(["--scope", "user"]);
+        remove.extend(["--scope", "user"]);
     }
-    let _ = remove.output();
-    let output = Command::new(&cli)
-        .args(add)
-        .output()
-        .map_err(|_| anyhow::anyhow!("The MCP registration command could not be started."))?;
-    ensure!(
-        output.status.success(),
-        "The MCP registration command failed (exit {}).",
-        output.status.code().unwrap_or(-1)
-    );
+    // 登録が無くて失敗しても構わない（外した後に登録し直すだけ）。打ち切りや起動の失敗も、ここでは無視する。
+    let _ = run_cli(&cli, &remove, bounded);
+    let added = run_cli(&cli, add, bounded)
+        .map_err(|_| anyhow::anyhow!("The MCP registration command could not be completed."))?;
+    ensure!(added.is_some(), "The MCP registration command failed.");
     Ok(json!({"status":"registered","cli":cli}))
 }
 
 /// PATH から実行ファイルを探す（Windows は .exe だけを対象にし、スクリプトのラッパーは使わない）。
+///
+/// macOS では PATH に無ければ、CLI の代表的な導入先も探す。Setup 版の初回起動（インストーラーの `open`）や
+/// ログイン時の起動は launchd の最小限の PATH で動くため、PATH だけでは `~/.local/bin/claude`
+/// （Claude Code の公式導入先）や Homebrew の `codex` を見つけられないため。PATH を先に探すので、
+/// PATH に置いた CLI（検証用のスタブを含む）が常に優先される。
 fn find_cli(name: &str) -> Option<PathBuf> {
     let file = if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
     };
-    std::env::split_paths(&std::env::var_os("PATH")?)
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let dirs: Vec<PathBuf> = dirs
+        .into_iter()
+        .chain(macos_cli_fallback_dirs(&home_dir()))
+        .collect();
+    #[cfg(target_os = "linux")]
+    let dirs: Vec<PathBuf> = dirs
+        .into_iter()
+        .chain(linux_cli_fallback_dirs(&home_dir()))
+        .collect();
+    dirs.into_iter()
         .map(|dir| dir.join(&file))
         .find(|path| path.is_file())
+}
+
+/// Linux で PATH の後に探す、CLI の代表的な導入先（探す順）。AppImage をファイルマネージャーから起動した場合や、
+/// XDG autostart から起動した場合は、ログインシェルで足される `~/.local/bin` などが PATH に無いことがあるため。
+/// 全 OS でコンパイルし、単体テストで順序を確かめる。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_cli_fallback_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if home.is_absolute() {
+        // Claude Code の公式インストーラー、旧来のローカル導入、npm の利用者単位の導入先。
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".claude/local"));
+        dirs.push(home.join(".npm-global/bin"));
+    }
+    // ディストリビューションの外から入れたもの（npm の全体導入など）と、Linuxbrew。
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
+    dirs
+}
+
+/// macOS で PATH の後に探す、CLI の代表的な導入先（探す順）。
+#[cfg(target_os = "macos")]
+fn macos_cli_fallback_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if home.is_absolute() {
+        // Claude Code の公式インストーラー、旧来のローカル導入、npm の利用者単位の導入先。
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".claude/local"));
+        dirs.push(home.join(".npm-global/bin"));
+    }
+    // Homebrew（Apple Silicon と旧来の場所）。
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
 }
 
 #[cfg(test)]
@@ -334,6 +788,86 @@ mod tests {
         assert!(merge_hooks(&mut json!({"hooks":{"Stop":{}}}), &exe).is_err());
         assert!(hook_command(Path::new("/tmp/a\"b/remnifold"), "Stop").is_err());
         assert!(hook_command(Path::new("/tmp/$HOME/remnifold"), "Stop").is_err());
+    }
+
+    #[test]
+    fn hooks_removal_keeps_other_entries_and_is_idempotent() {
+        let exe = std::env::temp_dir().join("Remnifold App/bin/remnifold.exe");
+        let other = std::env::temp_dir().join("Elsewhere/remnifold.exe");
+        let mut settings = json!({
+            "model":"keep",
+            "hooks":{
+                "SessionStart":[{"hooks":[{"type":"command","command":"other-tool start"}]}],
+                "Notification":[{"hooks":[{"type":"command","command":"notify"}]}]
+            }
+        });
+        merge_hooks(&mut settings, &exe).unwrap();
+        // 別の実行ファイルを指す指定では何も消えない。
+        let mut untouched = settings.clone();
+        remove_hooks(&mut untouched, Some(&other)).unwrap();
+        assert_eq!(untouched, settings);
+        // 自分の項目だけが消え、他社・他の設定は残る。
+        remove_hooks(&mut settings, Some(&exe)).unwrap();
+        let once = settings.clone();
+        remove_hooks(&mut settings, None).unwrap();
+        assert_eq!(settings, once);
+        assert_eq!(settings["model"], "keep");
+        assert_eq!(
+            settings["hooks"]["Notification"][0]["hooks"][0]["command"],
+            "notify"
+        );
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+            1
+        );
+        assert!(settings["hooks"].get("Stop").is_none());
+        // Remnifold しか無い設定では hooks ごと消える。
+        let mut only = json!({"hooks":{}});
+        merge_hooks(&mut only, &exe).unwrap();
+        remove_hooks(&mut only, None).unwrap();
+        assert_eq!(only, json!({}));
+        // 形が想定外の設定は変更せず拒否する。
+        assert!(remove_hooks(&mut json!({"hooks":{"Stop":{}}}), None).is_err());
+        assert!(remove_hooks(&mut json!([]), None).is_err());
+    }
+
+    /// macOS の代替の探索先は、利用者単位の場所を Homebrew より先に探す（相対の HOME は使わない）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fallback_dirs_prefer_user_locations() {
+        let dirs = macos_cli_fallback_dirs(Path::new("/Users/a"));
+        assert_eq!(dirs[0], Path::new("/Users/a/.local/bin"));
+        assert!(dirs.iter().all(|dir| dir.is_absolute()));
+        assert!(
+            dirs.iter().position(|d| d == Path::new("/opt/homebrew/bin")).unwrap()
+                > dirs.iter().position(|d| d == Path::new("/Users/a/.claude/local")).unwrap()
+        );
+        assert!(
+            macos_cli_fallback_dirs(Path::new(""))
+                .iter()
+                .all(|dir| !dir.starts_with(".local"))
+        );
+    }
+
+    /// Linux の代替の探索先も、利用者単位の場所を先に探し、相対の HOME は使わない。
+    #[test]
+    fn linux_fallback_dirs_prefer_user_locations() {
+        // どの OS でも絶対パスになる HOME で確かめる（Windows では "/home/a" は絶対パスでない）。
+        let home = std::env::temp_dir().join("home-a");
+        let dirs = linux_cli_fallback_dirs(&home);
+        assert_eq!(dirs[0], home.join(".local/bin"));
+        assert!(
+            dirs.iter().position(|d| d == Path::new("/usr/local/bin")).unwrap()
+                > dirs
+                    .iter()
+                    .position(|d| d == &home.join(".claude/local"))
+                    .unwrap()
+        );
+        assert!(
+            linux_cli_fallback_dirs(Path::new("rel"))
+                .iter()
+                .all(|dir| !dir.starts_with("rel"))
+        );
     }
 
     #[test]

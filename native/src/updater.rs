@@ -21,7 +21,7 @@ pub use install::{retired, run as run_install};
 mod hook_command;
 mod path_safety;
 mod private_work;
-mod process;
+pub(crate) mod process;
 use path_safety::{isolated_from_remnifold_roots, no_links, physical_path, within};
 #[cfg(test)]
 use path_safety::{isolated_physical_roots, path_equal};

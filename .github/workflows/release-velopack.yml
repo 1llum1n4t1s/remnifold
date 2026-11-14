@@ -1,0 +1,138 @@
+name: Release Velopack
+
+# 【未実行の定義】第1段階では書いただけで、一度も実行していない（CI 実行・R2 書き込み・push は本人の許可が要る）。
+#
+# Setup（Velopack）の Windows 版を梱包・署名し、R2（https://remnifold-updates.kagayoi.com/velopack/）へ配信する。
+# 厳格な install 用の releases/<version>/index.json を配信する ci.yml とは別のワークフローで、互いに触れない。
+#
+# 方針:
+# - 実行可能な Actions を使わない（ci.yml と同じ）。checkout は git のコマンドで行い、Sigilune はタグを固定して
+#   git で取得して導入する。成果物の受け渡しに upload-artifact が要らないよう、梱包・署名と配信は同じジョブで行う。
+# - 署名の Secrets と R2 の Secrets は、それぞれ使う step だけへ渡す（梱包・ビルドの step には渡さない）。
+# - 手動起動（workflow_dispatch）だけで、release/* ブランチ上でだけ動く（Environment の deployment branch policy も
+#   release/* に限る）。push では起動しない: push で起動すると ci.yml の成功と無関係に公開バケットへ書いてしまい、
+#   AGENTS.md の「公開バケットへの書き込みは、全ターゲット成功後の publisher だけ」という境界に反するため。
+#   起動する側が、同じコミットの ci.yml（release/* の publish-r2）が成功済みであることを確認してから実行する。
+#   版は ci-release-branch（release/<版> と Cargo の版の一致確認）を通す。
+# - 本人が事前に用意するもの（リポジトリの設定。値はここに書かない）:
+#     Environment `r2-release`（release/* のみ）に Secrets: R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY /
+#       SIGILUNE_EMAIL / SIGILUNE_TOTP_URI、Variables: CLOUDFLARE_ACCOUNT_ID / SIGILUNE_VERSION（導入する版）。
+#     署名の Secrets を配信の Secrets から分けたい場合は、署名用の Environment を別に作り、ジョブを分けて
+#     成果物を受け渡す形に変える（その場合は upload-artifact 相当の受け渡し方法を決める必要がある）。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-velopack
+  cancel-in-progress: false
+
+jobs:
+  windows-installer:
+    name: windows-installer
+    if: github.repository == '1llum1n4t1s/remnifold' && github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/release/')
+    runs-on: windows-latest
+    environment: r2-release
+    timeout-minutes: 60
+    env:
+      # vpk 1.2.161 は新しい .NET ランタイムでも動かす（ランナーに合う版が無い場合に備える）。
+      DOTNET_ROLL_FORWARD: Major
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out exact source commit without executable Actions
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Unexpected commit id.' }
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$env:GITHUB_REPOSITORY.git"
+          $authorization = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("x-access-token:$env:CHECKOUT_TOKEN"))
+          Write-Host "::add-mask::$authorization"
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+          $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item Env:GIT_CONFIG_VALUE_0, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_COUNT
+          git checkout --detach FETCH_HEAD
+          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA) { throw 'Checked-out commit differs from the pushed commit.' }
+
+      - name: Prepare Rust and Velopack CLI
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
+          rustup target add x86_64-pc-windows-msvc
+          # scripts/velopack/pack-windows.ps1 が要求する固定版。
+          dotnet tool install --global vpk --version 1.2.161
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $help = (vpk --help 2>&1 | Out-String) -replace "`e\[[0-9;]*m", ''
+          if ($help -notmatch '\bVelopack CLI 1\.2\.161\b') { Write-Host $help; throw 'vpk 1.2.161 could not start.' }
+
+      - name: Require the release branch to match the package version
+        run: cargo xtask ci-release-branch
+
+      - name: Build the native executable
+        # 依存 crate の build script も動くため、この step には署名用 Secrets を渡さない。
+        # 梱包スクリプトの cargo build と同じ条件（既定の機能のみ。update-feed-test を含めない）でビルドする。
+        # build.rs は固定版の esbuild（.devtools/<host>/）を要求する。新しいランナーには無いため、先に用意する
+        # （pack-windows.ps1 は prepare を呼ばない）。
+        run: |
+          cargo xtask prepare
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $target = Join-Path $env:RUNNER_TEMP 'remnifold-target'
+          "CARGO_TARGET_FOR_PACK=$target" >> $env:GITHUB_ENV
+          cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir $target --bin remnifold
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install Sigilune at the pinned version without executable Actions
+        env:
+          SIGILUNE_VERSION: ${{ vars.SIGILUNE_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SIGILUNE_VERSION -cnotmatch '^\d+\.\d+\.\d+$') { throw 'Set the repository variable SIGILUNE_VERSION to an exact version (x.y.z).' }
+          $source = Join-Path $env:RUNNER_TEMP 'sigilune-src'
+          git clone --depth 1 --branch "v$env:SIGILUNE_VERSION" https://github.com/1llum1n4t1s/Sigilune.git $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $install = Join-Path $env:RUNNER_TEMP 'sigilune'
+          & (Join-Path $source 'install.ps1') -Version $env:SIGILUNE_VERSION -InstallDir $install -NoPath
+          "SIGILUNE_EXE=$(Join-Path $install 'sigilune.exe')" >> $env:GITHUB_ENV
+          # ランナーごとに独立したセッションキャッシュを使う。
+          "SIGILUNE_HOME=$(Join-Path $env:RUNNER_TEMP 'sigilune-home')" >> $env:GITHUB_ENV
+
+      - name: Pack and sign the installer
+        env:
+          SIGILUNE_EMAIL: ${{ secrets.SIGILUNE_EMAIL }}
+          SIGILUNE_TOTP_URI: ${{ secrets.SIGILUNE_TOTP_URI }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'remnifold-installer'
+          New-Item -ItemType Directory -Path $work | Out-Null
+          "WORK_DIR=$work" >> $env:GITHUB_ENV
+          & ./scripts/velopack/pack-windows.ps1 -WorkDirectory $work -Sign -CargoTargetDirectory $env:CARGO_TARGET_FOR_PACK
+
+      - name: Sign out of Sigilune
+        # ランナー上の Certum セッションを残さない。
+        if: always()
+        run: |
+          if ($env:SIGILUNE_EXE -and (Test-Path -LiteralPath $env:SIGILUNE_EXE)) { & $env:SIGILUNE_EXE logout | Out-Null }
+
+      - name: Publish the feed and installer to R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          R2_RELEASE_ACCESS_KEY_ID: ${{ secrets.R2_RELEASE_ACCESS_KEY_ID }}
+          R2_RELEASE_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASE_SECRET_ACCESS_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Join-Path $env:WORK_DIR 'packages/RemnifoldApp-win-Setup.exe'
+          $signature = Get-AuthenticodeSignature -LiteralPath $setup
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notlike 'CN=Open Source Developer Yuichiro Shinozaki*' -or !$signature.TimeStamperCertificate) { throw 'Setup signature verification failed.' }
+          "SHA256 $((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash)"
+          # 版付きの成果物は新規作成のみ（上書きしない）。releases.win.json は最後に置く。
+          & ./scripts/velopack/publish-r2.ps1 -PackagesDirectory (Join-Path $env:WORK_DIR 'packages') -Channel win

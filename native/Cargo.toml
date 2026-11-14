@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.97"
 publish = false
 
+[features]
+# 隔離したE2E検証専用。更新元をローカルフォルダーへ差し替える環境変数と、未署名パッケージの適用許可を有効にする。
+# 本番ビルド（既定の機能）にはどちらの分岐も残さない。
+update-feed-test = []
+
 [dependencies]
 same-file = "1.0.6"
 md-5 = "0.11"
@@ -27,10 +32,14 @@ tar = "0.4"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 unicode-normalization = "0.1"
+# Setup（Velopack）導入版のフック処理・更新の取得と適用（版は Skilvella と揃える）。
+# public-utils は依存を増やさず `velopack::bundle` を公開するだけの機能。macOS の署名検証で、UpdateMac が導入先へ
+# 展開するのと同じ関数（extract_lib_contents_to_path）で nupkg を展開し、実際に入れ替わる中身そのものを検証するために使う。
+velopack = { version = "=1.2.161", default-features = false, features = ["public-utils"] }
 zip = { version = "9.4.1", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_System_Registry", "Win32_Security_WinTrust", "Win32_Security_Cryptography"] }
 
 [build-dependencies]
 serde_json = "1"

@@ -2,7 +2,10 @@
 use super::path_safety::no_links;
 #[cfg(target_os = "macos")]
 use super::process as acl_process;
-use anyhow::{Result, bail, ensure};
+// bail は Windows の実装（mod windows）だけが使う。Unix のビルドで unused_imports にならないよう分ける。
+#[cfg(windows)]
+use anyhow::bail;
+use anyhow::{Result, ensure};
 use std::{fs, path::Path};
 // Windows 専用テスト（windows::tests の junction fixture）だけが使う複製なので、
 // Unix のテストビルドで dead_code 警告にならないよう Windows に限定する。
