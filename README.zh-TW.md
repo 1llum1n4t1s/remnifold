@@ -71,20 +71,17 @@ Linux 同樣沒有解除安裝程式。在刪除 AppImage 之前，請以相同�
 
 ### 首次安裝
 
-在 Windows 上，請使用支援 `release verify` 與 `release verify-asset` 的原生 GitHub CLI 2.93.0 或更新版本，從不可變的 GitHub Release 取得第一個執行檔。請先檢查 `gh --version`；更舊的版本會受到 [CVE-2026-48501](https://github.com/advisories/GHSA-8xvp-7hj6-mcj9) 影響。請選擇一個已存在、受信任的私人目錄，使其他使用者無法在驗證與執行之間替換下載的檔案。替換下方引號內的版本與路徑後，從 Git Bash 執行：
+在 Windows 上，發布工作流程會把已簽章的 bootstrap 執行檔放到 R2 中帶版本號的不可變鍵下。它從 1.0.30 版開始提供；更早的版本請從可信任的原始碼建置第一個執行檔。請選擇一個已存在、受信任的私人目錄，使其他使用者無法在驗證與執行之間替換下載的檔案。替換下方引號內的版本與路徑後，從 PowerShell 執行：
 
-```sh
-version='<published-version>'
-tag="v$version"
-repo=github.com/1llum1n4t1s/remnifold
-bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
-gh release verify "$tag" --repo "$repo" &&
-gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
-gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" install --version "$version" --apply
+```powershell
+$version = '<published-version>'
+$bootstrap = 'C:\absolute\trusted\private\path\remnifold-bootstrap.exe'
+Invoke-WebRequest -MaximumRedirection 0 -Uri "https://remnifold-updates.kagayoi.com/velopack/remnifold-bootstrap-$version-x86_64-pc-windows-msvc.exe" -OutFile $bootstrap
+$signature = Get-AuthenticodeSignature -LiteralPath $bootstrap
+if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -like 'CN=Open Source Developer Yuichiro Shinozaki*' -and $signature.TimeStamperCertificate) { & $bootstrap install --version $version --apply } else { Write-Error 'Signature verification failed. Do not run this file.' }
 ```
 
-執行之前，發布版本與本機資產都必須通過 GitHub 的簽章驗證。請勿改用未經驗證的 R2 輔助程式，也不要繞過失敗的驗證。
+下載不得被重新導向，且檔案在執行之前必須通過 Authenticode 檢查（狀態為 `Valid`，簽署者為 `CN=Open Source Developer Yuichiro Shinozaki`，並帶有 RFC 3161 時間戳記）；檢查失敗就不要執行。此簽章只能證明是誰簽署的，並不綁定產品、版本或發布是否被接受。`install` 仍需要已驗證的原生 GitHub CLI，並自行驗證發布（請參閱 [DESIGN.md](DESIGN.md#release-installation)）。請勿改用未經驗證的 R2 輔助程式，也不要繞過失敗的驗證。
 
 在 macOS 與 Linux 上，請取得並檢閱來源可信的 [Bash bootstrap](scripts/bootstrap-plugin.sh)，並將它儲存在工作目錄之外。它需要原生 GitHub CLI、curl、tar，以及 `sha256sum` 或 `shasum`：
 
@@ -134,8 +131,6 @@ remnifold setup --base-url https://your-worker.example.workers.dev
 執行 `whoAmI` MCP 工具即可驗證連線與記憶空間探索。
 
 若要匯入既有的 Codex 工作階段，請先以 `remnifold import --limit 10` 預覽一個有上限的批次。若要上傳經過淨化的紀錄，請加上 `--apply`。預覽不會寫入遠端記憶；重複匯入會沿用確定性的擷取識別碼。`--codex-home` 可指定讀取 Codex 工作階段的位置。
-
-Bootstrap 的發布作業是維護者的程序，記載於 [AGENTS.md](AGENTS.md#bootstrap-release-publication)。
 
 ## 建立或更新伺服器
 

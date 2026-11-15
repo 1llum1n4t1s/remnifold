@@ -71,20 +71,17 @@ Mac Intel은 지원하지 않습니다.
 
 ### 최초 설치
 
-Windows에서는 `release verify`와 `release verify-asset`을 지원하는 네이티브 GitHub CLI 2.93.0 이상을 사용해 변경 불가능한 GitHub Release에서 첫 실행 파일을 받으세요. 먼저 `gh --version`을 확인하세요. 이전 버전은 [CVE-2026-48501](https://github.com/advisories/GHSA-8xvp-7hj6-mcj9)의 영향을 받습니다. 검증과 실행 사이에 다른 사용자가 내려받은 파일을 바꿔치기할 수 없는, 신뢰할 수 있는 기존 비공개 디렉터리를 선택하세요. 아래의 따옴표 안 버전과 경로를 바꾼 뒤 Git Bash에서 실행하세요.
+Windows에서는 릴리스 워크플로가 서명된 bootstrap 실행 파일을 R2의 버전이 붙은 변경 불가능한 키에 올립니다. 버전 1.0.30 이후에만 존재하며, 그보다 이전 버전은 신뢰할 수 있는 소스에서 첫 실행 파일을 직접 빌드하세요. 검증과 실행 사이에 다른 사용자가 내려받은 파일을 바꿔치기할 수 없는, 신뢰할 수 있는 기존 비공개 디렉터리를 선택하세요. 아래의 따옴표 안 버전과 경로를 바꾼 뒤 PowerShell에서 실행하세요.
 
-```sh
-version='<published-version>'
-tag="v$version"
-repo=github.com/1llum1n4t1s/remnifold
-bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
-gh release verify "$tag" --repo "$repo" &&
-gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
-gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" install --version "$version" --apply
+```powershell
+$version = '<published-version>'
+$bootstrap = 'C:\absolute\trusted\private\path\remnifold-bootstrap.exe'
+Invoke-WebRequest -MaximumRedirection 0 -Uri "https://remnifold-updates.kagayoi.com/velopack/remnifold-bootstrap-$version-x86_64-pc-windows-msvc.exe" -OutFile $bootstrap
+$signature = Get-AuthenticodeSignature -LiteralPath $bootstrap
+if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -like 'CN=Open Source Developer Yuichiro Shinozaki*' -and $signature.TimeStamperCertificate) { & $bootstrap install --version $version --apply } else { Write-Error 'Signature verification failed. Do not run this file.' }
 ```
 
-실행하기 전에 릴리스와 로컬 에셋 모두 GitHub의 서명 검증을 통과해야 합니다. 검증되지 않은 R2 헬퍼로 대체하거나 실패한 검증을 우회하지 마세요.
+다운로드는 리다이렉트되어서는 안 되며, 실행하기 전에 파일이 Authenticode 검사(상태 `Valid`, 서명자 `CN=Open Source Developer Yuichiro Shinozaki`, RFC 3161 타임스탬프 있음)를 통과해야 합니다. 실패하면 실행하지 마세요. 이 서명은 누가 서명했는지만 보여 줄 뿐, 제품·버전·게시 수락까지 보증하지는 않습니다. `install`에는 여전히 인증된 네이티브 GitHub CLI가 필요하며, 게시 검증은 `install`이 직접 수행합니다([DESIGN.md](DESIGN.md#release-installation) 참조). 검증되지 않은 R2 헬퍼로 대체하거나 실패한 검증을 우회하지 마세요.
 
 macOS와 Linux에서는 신뢰할 수 있는 출처의 [Bash 부트스트랩](scripts/bootstrap-plugin.sh)을 받아 내용을 검토하고, 작업 디렉터리 밖에 저장하세요. 네이티브 GitHub CLI, curl, tar, 그리고 `sha256sum` 또는 `shasum`이 필요합니다.
 
@@ -134,8 +131,6 @@ API 키가 아직 제공되지 않았다면 숨김 프롬프트에 입력하세�
 연결과 공간 탐색을 확인하려면 `whoAmI` MCP 도구를 실행하세요.
 
 기존 Codex 세션을 가져오려면 `remnifold import --limit 10`으로 제한된 배치를 미리 확인하세요. 정리된(sanitized) 기록을 업로드하려면 `--apply`를 추가합니다. 미리 보기는 원격 메모리에 아무것도 기록하지 않으며, 가져오기를 반복해도 결정적(deterministic) 캡처 식별자를 재사용합니다. `--codex-home`은 Codex 세션을 읽어 올 위치를 지정합니다.
-
-부트스트랩 릴리스 게시는 유지 관리자용 절차이며 [AGENTS.md](AGENTS.md#bootstrap-release-publication)에 문서화되어 있습니다.
 
 ## 서버 생성 또는 업데이트
 

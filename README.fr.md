@@ -71,20 +71,17 @@ L'application s'installe par utilisateur, sans droits d'administrateur :
 
 ### Première installation
 
-Sous Windows, obtenez le premier exécutable depuis la GitHub Release immuable avec un GitHub CLI natif 2.93.0 ou plus récent, qui prend en charge `release verify` et `release verify-asset`. Vérifiez d'abord `gh --version` ; les versions plus anciennes sont touchées par [CVE-2026-48501](https://github.com/advisories/GHSA-8xvp-7hj6-mcj9). Choisissez un répertoire privé de confiance existant, où un autre utilisateur ne peut pas remplacer le fichier téléchargé entre la vérification et l'exécution. Remplacez la version et le chemin entre guillemets ci-dessous, puis exécutez depuis Git Bash :
+Sous Windows, le workflow de publication dépose l'exécutable bootstrap signé sous une clé immuable et versionnée dans R2. Il existe à partir de la version 1.0.30 ; pour les versions antérieures, compilez le premier exécutable à partir de sources de confiance. Choisissez un répertoire privé de confiance existant, où un autre utilisateur ne peut pas remplacer le fichier téléchargé entre la vérification et l'exécution. Remplacez la version et le chemin entre guillemets ci-dessous, puis exécutez depuis PowerShell :
 
-```sh
-version='<published-version>'
-tag="v$version"
-repo=github.com/1llum1n4t1s/remnifold
-bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
-gh release verify "$tag" --repo "$repo" &&
-gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
-gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" install --version "$version" --apply
+```powershell
+$version = '<published-version>'
+$bootstrap = 'C:\absolute\trusted\private\path\remnifold-bootstrap.exe'
+Invoke-WebRequest -MaximumRedirection 0 -Uri "https://remnifold-updates.kagayoi.com/velopack/remnifold-bootstrap-$version-x86_64-pc-windows-msvc.exe" -OutFile $bootstrap
+$signature = Get-AuthenticodeSignature -LiteralPath $bootstrap
+if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -like 'CN=Open Source Developer Yuichiro Shinozaki*' -and $signature.TimeStamperCertificate) { & $bootstrap install --version $version --apply } else { Write-Error 'Signature verification failed. Do not run this file.' }
 ```
 
-La release et l'asset local doivent tous deux passer la vérification de signature de GitHub avant l'exécution. Ne substituez pas un assistant R2 non vérifié et ne contournez pas une vérification échouée.
+Le téléchargement ne doit pas être redirigé, et le fichier doit réussir la vérification Authenticode avant d'être exécuté (état `Valid`, signataire `CN=Open Source Developer Yuichiro Shinozaki`, horodatage RFC 3161 présent) ; en cas d'échec, ne l'exécutez pas. Cette signature prouve seulement qui a signé ; elle ne lie ni un produit, ni une version, ni l'acceptation d'une publication. `install` exige toujours un GitHub CLI natif authentifié et vérifie lui-même la publication (voir [DESIGN.md](DESIGN.md#release-installation)). Ne substituez pas un assistant R2 non vérifié et ne contournez pas une vérification échouée.
 
 Sous macOS et Linux, obtenez et examinez le [bootstrap Bash](scripts/bootstrap-plugin.sh) de source de confiance, en l'enregistrant hors du répertoire de travail. Il exige un GitHub CLI natif, curl, tar, et `sha256sum` ou `shasum` :
 
@@ -134,8 +131,6 @@ La connexion et l'état local résident dans le dossier de configuration propre 
 Exécutez l'outil MCP `whoAmI` pour vérifier la connectivité et la découverte des espaces.
 
 Pour importer des sessions Codex existantes, prévisualisez un lot limité avec `remnifold import --limit 10`. Ajoutez `--apply` lorsque vous voulez téléverser les enregistrements assainis. L'aperçu n'écrit aucune mémoire distante ; les imports répétés réutilisent des identités de capture déterministes. `--codex-home` indique où lire les sessions Codex.
-
-La publication de la release de bootstrap est une procédure de mainteneur documentée dans [AGENTS.md](AGENTS.md#bootstrap-release-publication).
 
 ## Créer ou mettre à jour un serveur
 

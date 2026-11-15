@@ -71,20 +71,17 @@ Die App wird pro Benutzer ohne Administratorrechte installiert:
 
 ### Erstinstallation
 
-Beziehen Sie unter Windows die erste ausführbare Datei aus dem unveränderlichen GitHub Release mit der nativen GitHub CLI ab Version 2.93.0, die `release verify` und `release verify-asset` unterstützt. Prüfen Sie zuerst `gh --version`; ältere Versionen sind von [CVE-2026-48501](https://github.com/advisories/GHSA-8xvp-7hj6-mcj9) betroffen. Wählen Sie ein vorhandenes, vertrauenswürdiges privates Verzeichnis, in dem kein anderer Benutzer die heruntergeladene Datei zwischen Prüfung und Ausführung ersetzen kann. Ersetzen Sie die in Anführungszeichen stehende Version und den Pfad unten und führen Sie das Skript in Git Bash aus:
+Unter Windows legt der Release-Workflow die signierte Bootstrap-Datei unter einem unveränderlichen, versionierten Schlüssel in R2 ab. Sie existiert ab Version 1.0.30; für frühere Versionen bauen Sie die erste ausführbare Datei stattdessen aus vertrauenswürdigem Quellcode. Wählen Sie ein vorhandenes, vertrauenswürdiges privates Verzeichnis, in dem kein anderer Benutzer die heruntergeladene Datei zwischen Prüfung und Ausführung ersetzen kann. Ersetzen Sie die in Anführungszeichen stehende Version und den Pfad unten und führen Sie das Skript in PowerShell aus:
 
-```sh
-version='<published-version>'
-tag="v$version"
-repo=github.com/1llum1n4t1s/remnifold
-bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
-gh release verify "$tag" --repo "$repo" &&
-gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
-gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" install --version "$version" --apply
+```powershell
+$version = '<published-version>'
+$bootstrap = 'C:\absolute\trusted\private\path\remnifold-bootstrap.exe'
+Invoke-WebRequest -MaximumRedirection 0 -Uri "https://remnifold-updates.kagayoi.com/velopack/remnifold-bootstrap-$version-x86_64-pc-windows-msvc.exe" -OutFile $bootstrap
+$signature = Get-AuthenticodeSignature -LiteralPath $bootstrap
+if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -like 'CN=Open Source Developer Yuichiro Shinozaki*' -and $signature.TimeStamperCertificate) { & $bootstrap install --version $version --apply } else { Write-Error 'Signature verification failed. Do not run this file.' }
 ```
 
-Sowohl das Release als auch das lokale Asset müssen vor der Ausführung die Signaturprüfung von GitHub bestehen. Ersetzen Sie sie nicht durch einen ungeprüften R2-Helfer und umgehen Sie keine fehlgeschlagene Prüfung.
+Der Download darf nicht umgeleitet werden, und die Datei muss vor der Ausführung die Authenticode-Prüfung bestehen (Status `Valid`, Signierer `CN=Open Source Developer Yuichiro Shinozaki`, RFC-3161-Zeitstempel vorhanden); schlägt die Prüfung fehl, führen Sie die Datei nicht aus. Die Signatur belegt nur, wer signiert hat, nicht Produkt, Version oder die Annahme einer Veröffentlichung. `install` benötigt weiterhin die authentifizierte native GitHub CLI und prüft die Veröffentlichung selbst (siehe [DESIGN.md](DESIGN.md#release-installation)). Ersetzen Sie die Prüfung nicht durch einen ungeprüften R2-Helfer und umgehen Sie keine fehlgeschlagene Prüfung.
 
 Beziehen und prüfen Sie unter macOS und Linux das aus vertrauenswürdiger Quelle stammende [Bash-Bootstrap](scripts/bootstrap-plugin.sh) und speichern Sie es außerhalb des Arbeitsverzeichnisses. Es benötigt die native GitHub CLI, curl, tar sowie `sha256sum` oder `shasum`:
 
@@ -134,8 +131,6 @@ Die Verbindung und der lokale Status liegen im eigenen Konfigurationsordner der 
 Führen Sie das MCP-Tool `whoAmI` aus, um Konnektivität und Space-Erkennung zu prüfen.
 
 Um bestehende Codex-Sitzungen zu importieren, zeigen Sie mit `remnifold import --limit 10` eine begrenzte Charge vorab an. Fügen Sie `--apply` hinzu, wenn die bereinigten Einträge hochgeladen werden sollen. Die Vorschau schreibt keine Remote-Erinnerungen; wiederholte Importe verwenden deterministische Erfassungsidentitäten erneut. `--codex-home` legt fest, woher Codex-Sitzungen gelesen werden.
-
-Die Veröffentlichung des Bootstrap-Releases ist ein Wartungsverfahren für Maintainer und in [AGENTS.md](AGENTS.md#bootstrap-release-publication) dokumentiert.
 
 ## Einen Server erstellen oder aktualisieren
 

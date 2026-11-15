@@ -71,20 +71,17 @@ The app installs per user without administrator rights:
 
 ### First installation
 
-On Windows, obtain the first executable from the immutable GitHub Release using native GitHub CLI 2.93.0 or newer with `release verify` and `release verify-asset` support. Check `gh --version` first; older versions are affected by [CVE-2026-48501](https://github.com/advisories/GHSA-8xvp-7hj6-mcj9). Select an existing trusted private directory where another user cannot replace the downloaded file between verification and execution. Replace the quoted version and path below, then run from Git Bash:
+On Windows, the release workflow publishes the signed bootstrap executable under an immutable, versioned key in R2. It exists for version 1.0.30 and later; for earlier versions, build the first executable from trusted source instead. Select an existing trusted private directory where another user cannot replace the downloaded file between verification and execution. Replace the quoted version and path below, then run from PowerShell:
 
-```sh
-version='<published-version>'
-tag="v$version"
-repo=github.com/1llum1n4t1s/remnifold
-bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
-gh release verify "$tag" --repo "$repo" &&
-gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
-gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" install --version "$version" --apply
+```powershell
+$version = '<published-version>'
+$bootstrap = 'C:\absolute\trusted\private\path\remnifold-bootstrap.exe'
+Invoke-WebRequest -MaximumRedirection 0 -Uri "https://remnifold-updates.kagayoi.com/velopack/remnifold-bootstrap-$version-x86_64-pc-windows-msvc.exe" -OutFile $bootstrap
+$signature = Get-AuthenticodeSignature -LiteralPath $bootstrap
+if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -like 'CN=Open Source Developer Yuichiro Shinozaki*' -and $signature.TimeStamperCertificate) { & $bootstrap install --version $version --apply } else { Write-Error 'Signature verification failed. Do not run this file.' }
 ```
 
-The release and local asset must both pass GitHub's signature verification before execution. Do not substitute an unverified R2 helper or bypass a failed verification.
+The download must not be redirected, and the file must pass the Authenticode check (status `Valid`, signer `CN=Open Source Developer Yuichiro Shinozaki`, RFC 3161 timestamp present) before it is executed; if the check fails, do not run it. This signature shows who signed the file; it does not bind a product, a version or the acceptance of a publication. `install` still requires authenticated native GitHub CLI and verifies the publication itself (see [DESIGN.md](DESIGN.md#release-installation)). Do not substitute an unverified R2 helper or bypass a failed verification.
 
 On macOS and Linux, obtain and review the trusted-source [Bash bootstrap](scripts/bootstrap-plugin.sh), saving it outside the work directory. It requires native GitHub CLI, curl, tar, and `sha256sum` or `shasum`:
 
@@ -134,8 +131,6 @@ The connection and local state live in the app's own configuration folder, indep
 Run the `whoAmI` MCP tool to verify connectivity and space discovery.
 
 To import existing Codex sessions, preview a bounded batch with `remnifold import --limit 10`. Add `--apply` when you want to upload the sanitized records. The preview does not write remote memories; repeat imports reuse deterministic capture identities. `--codex-home` selects where Codex sessions are read.
-
-Bootstrap release publication is a maintainer procedure documented in [AGENTS.md](AGENTS.md#bootstrap-release-publication).
 
 ## Create or update a server
 

@@ -71,20 +71,17 @@ O app é instalado por usuário, sem direitos de administrador:
 
 ### Primeira instalação
 
-No Windows, obtenha o primeiro executável da GitHub Release imutável usando o GitHub CLI nativo 2.93.0 ou mais recente, com suporte a `release verify` e `release verify-asset`. Verifique `gh --version` primeiro; versões mais antigas são afetadas pela [CVE-2026-48501](https://github.com/advisories/GHSA-8xvp-7hj6-mcj9). Escolha um diretório privado confiável já existente, onde outro usuário não possa substituir o arquivo baixado entre a verificação e a execução. Substitua a versão e o caminho entre aspas abaixo e execute no Git Bash:
+No Windows, o workflow de publicação coloca o executável bootstrap assinado sob uma chave imutável e versionada no R2. Ele existe a partir da versão 1.0.30; para versões anteriores, compile o primeiro executável a partir de código-fonte confiável. Escolha um diretório privado confiável já existente, onde outro usuário não possa substituir o arquivo baixado entre a verificação e a execução. Substitua a versão e o caminho entre aspas abaixo e execute no PowerShell:
 
-```sh
-version='<published-version>'
-tag="v$version"
-repo=github.com/1llum1n4t1s/remnifold
-bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
-gh release verify "$tag" --repo "$repo" &&
-gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
-gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
-"$bootstrap" install --version "$version" --apply
+```powershell
+$version = '<published-version>'
+$bootstrap = 'C:\absolute\trusted\private\path\remnifold-bootstrap.exe'
+Invoke-WebRequest -MaximumRedirection 0 -Uri "https://remnifold-updates.kagayoi.com/velopack/remnifold-bootstrap-$version-x86_64-pc-windows-msvc.exe" -OutFile $bootstrap
+$signature = Get-AuthenticodeSignature -LiteralPath $bootstrap
+if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -like 'CN=Open Source Developer Yuichiro Shinozaki*' -and $signature.TimeStamperCertificate) { & $bootstrap install --version $version --apply } else { Write-Error 'Signature verification failed. Do not run this file.' }
 ```
 
-A release e o asset local devem passar ambos pela verificação de assinatura do GitHub antes da execução. Não substitua por um helper do R2 não verificado nem contorne uma verificação que falhou.
+O download não pode ser redirecionado, e o arquivo deve passar na verificação Authenticode antes da execução (status `Valid`, assinante `CN=Open Source Developer Yuichiro Shinozaki` e carimbo de data/hora RFC 3161); se falhar, não o execute. Essa assinatura só mostra quem assinou; ela não vincula produto, versão nem a aceitação de uma publicação. `install` continua exigindo o GitHub CLI nativo autenticado e verifica a publicação por conta própria (consulte [DESIGN.md](DESIGN.md#release-installation)). Não substitua por um helper do R2 não verificado nem contorne uma verificação que falhou.
 
 No macOS e no Linux, obtenha e revise o [bootstrap em Bash](scripts/bootstrap-plugin.sh) de origem confiável, salvando-o fora do diretório de trabalho. Ele exige GitHub CLI nativo, curl, tar e `sha256sum` ou `shasum`:
 
@@ -134,8 +131,6 @@ A conexão e o estado local ficam na pasta de configuração própria do app, in
 Execute a ferramenta MCP `whoAmI` para verificar a conectividade e a descoberta de espaços.
 
 Para importar sessões existentes do Codex, veja uma prévia de um lote limitado com `remnifold import --limit 10`. Adicione `--apply` quando quiser enviar os registros sanitizados. A prévia não grava memórias remotas; importações repetidas reutilizam identidades de captura determinísticas. `--codex-home` seleciona de onde as sessões do Codex são lidas.
-
-A publicação da release de bootstrap é um procedimento de mantenedor, documentado em [AGENTS.md](AGENTS.md#bootstrap-release-publication).
 
 ## Criar ou atualizar um servidor
 
