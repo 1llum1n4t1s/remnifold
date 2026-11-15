@@ -63,13 +63,15 @@ pub fn setup(args: &[String]) -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "remnifold setup --base-url <HTTPS endpoint> [--config-dir <directory>] [--force] [--api-key-stdin] [--max-memories 1..5] [--max-recent-tasks 0..3]\nThe API key is read from the existing connection, environment, or a hidden prompt.
-The connection is written to {} unless --config-dir (or the legacy alias --codex-home) is given.",
-                    roots.config_file().display()
+                    "{}",
+                    crate::locale::tr_with(
+                        "setup.help",
+                        &[("config_path", &roots.config_file().display().to_string())]
+                    )
                 );
                 return Ok(());
             }
-            _ => bail!("Unknown setup option. Use remnifold setup --help."),
+            _ => bail!("{}", crate::locale::tr("setup.unknown_option")),
         }
         index += 1;
     }
@@ -182,8 +184,11 @@ The connection is written to {} unless --config-dir (or the legacy alias --codex
         raw["maxRecentTasks"] = json!(n);
     }
     common::atomic_write(&path, &serde_json::to_vec_pretty(&raw)?, true)
-        .map_err(|_| anyhow::anyhow!("Connection configuration could not be saved."))?;
-    println!("Connected and wrote {}.", path.display());
+        .map_err(|_| anyhow::anyhow!("{}", crate::locale::tr("setup.save_failed")))?;
+    println!(
+        "{}",
+        crate::locale::tr_with("setup.connected", &[("path", &path.display().to_string())])
+    );
     Ok(())
 }
 
@@ -197,33 +202,59 @@ pub fn status() -> Result<()> {
     } else {
         None
     };
+    use crate::locale::{tr, tr_with};
     println!(
-        "Remnifold status\nAPI reachability: {}\nStorage: configured Cloudflare D1\nDefault storage container: memories\nWorkspace provenance tag: {}",
-        if connected {
-            "connected"
-        } else {
-            "unavailable"
-        },
-        text(&context["containerTag"])
+        "{}\n{}\n{}\n{}\n{}",
+        tr("status.title"),
+        tr_with(
+            "status.api",
+            &[(
+                "state",
+                if connected {
+                    tr("status.api_connected")
+                } else {
+                    tr("status.api_unavailable")
+                }
+            )]
+        ),
+        tr("status.storage"),
+        tr("status.container"),
+        tr_with(
+            "status.workspace",
+            &[("tag", text(&context["containerTag"]))]
+        )
     );
     if let Some(discovery) = discovery {
         println!(
-            "Topic search scope: {} nonempty spaces discovered by the API{}",
-            discovery["tags"].as_array().map_or(0, Vec::len),
-            if discovery["complete"] == true {
-                ""
-            } else {
-                " (incomplete at the 100-space API limit)"
-            }
+            "{}",
+            tr_with(
+                "status.scope",
+                &[
+                    (
+                        "count",
+                        &discovery["tags"].as_array().map_or(0, Vec::len).to_string()
+                    ),
+                    (
+                        "note",
+                        if discovery["complete"] == true {
+                            ""
+                        } else {
+                            tr("status.scope_incomplete")
+                        }
+                    ),
+                ]
+            )
         );
     } else {
-        println!(
-            "Topic search scope: unavailable; global topic search cannot claim complete coverage"
-        );
+        println!("{}", tr("status.scope_unavailable"));
     }
     println!(
-        "Auto-recall: {}; document index only\nSession start: no index is injected until a topic query is available\nDetails: getDocument(documentId)\nCodex built-in memory files: not read by this integration\nMCP reachability: check whoAmI separately",
-        text(&settings["recallMode"])
+        "{}\n{}\n{}\n{}\n{}",
+        tr_with("status.recall", &[("mode", text(&settings["recallMode"]))]),
+        tr("status.session_start"),
+        tr("status.details"),
+        tr("status.codex_memory"),
+        tr("status.mcp")
     );
     Ok(())
 }

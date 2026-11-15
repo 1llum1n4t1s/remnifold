@@ -43,8 +43,8 @@ fn run(startup: app_update::Startup) -> Result<()> {
     match command {
         "--version" | "-V" => println!("remnifold {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" | "help" => println!(
-            "Remnifold {}\n\nUsage: remnifold <command>\n  mcp                 Run the stdio MCP server (default)\n  hook <event>        Run a Claude Code or Codex lifecycle hook\n  capture             Capture completed turns from stdin JSON\n  import [options]    Import Codex history (dry run unless --apply)\n  setup [options]     Connect an existing self-hosted server\n  server-setup ...    Provision and deploy a Cloudflare server\n  topics-setup ...    Plan or queue finite unclassified enrichment\n  server-live-test    Explicitly verify configured remote server\n  status              Check connection and recall settings\n  install ...         Verify, install or update the standalone app (advanced; the Setup installer is the default)\n  connect <tool> ...  Register (or --remove) the installed app with claude-code or codex\n  update-apply        Apply a downloaded update when no other Remnifold process is running (run at logon)\n  uninstall-setup     Remove the Setup installation's registrations before deleting the app (--apply)\n\nNormal client use requires no Node.js runtime.",
-            env!("CARGO_PKG_VERSION")
+            "{}",
+            remnifold::locale::tr_with("cli.help", &[("version", env!("CARGO_PKG_VERSION"))])
         ),
         "mcp" => mcp::start()?,
         "hook" => {
@@ -80,7 +80,7 @@ fn run(startup: app_update::Startup) -> Result<()> {
                     {
                         print!(
                             "{}",
-                            serde_json::json!({"systemMessage":format!("Remnifold: saved {} documents; pending {}.",result["saved"],result["pending"])})
+                            serde_json::json!({"systemMessage":remnifold::locale::tr_with("hook.saved_notice", &[("saved", &result["saved"].to_string()), ("pending", &result["pending"].to_string())])})
                         );
                     }
                 }
@@ -117,7 +117,7 @@ fn run(startup: app_update::Startup) -> Result<()> {
         ),
         // Codex プラグインとしての導入・更新は廃止した。固定の失敗コードで install を案内する。
         "plugin-update" | "plugin-bootstrap" => updater::retired(&args[0])?,
-        _ => bail!("Unknown command. Use remnifold --help."),
+        _ => bail!("{}", remnifold::locale::tr("cli.unknown_command")),
     }
     Ok(())
 }

@@ -558,71 +558,38 @@ pub fn update_apply() -> Result<ApplyOutcome> {
 /// `mcp` として stdin を待たず、導入済み・登録済みであることと次の手順を示す。
 /// 端末が対話的で接続が未設定なら、そのまま `setup` を始める。
 pub fn welcome(first_run: bool) -> Result<()> {
+    use crate::locale::tr;
     use std::io::{BufRead, IsTerminal};
-    let japanese = crate::locale::current() == crate::locale::Language::Japanese;
-    let say = |ja: &str, en: &str| println!("{}", if japanese { ja } else { en });
-    say(
-        "Remnifold を導入しました。Claude Code と Codex への登録は自動で済んでいます（CLI が見つかったものだけ）。",
-        "Remnifold is installed. It registered itself with Claude Code and Codex (only where their CLI was found).",
-    );
-    say(
-        "更新は自動で取得し、パソコンへのログオン時に適用します。切るには app-update.json の auto_update を false にしてください。",
-        "Updates download automatically and are applied at your next logon. Set auto_update to false in app-update.json to turn this off.",
-    );
+    println!("{}", tr("welcome.installed"));
+    println!("{}", tr("welcome.updates"));
     let roots = Roots::current();
     let configured = crate::paths::config_file(&roots, &crate::common::codex_home())
         .ok()
         .flatten()
         .is_some();
     if configured {
-        say(
-            "サーバーへの接続は設定済みです。Claude Code を新しく開き直すと使えます。",
-            "The server connection is already configured. Start a new Claude Code session to use it.",
-        );
+        println!("{}", tr("welcome.configured"));
         return Ok(());
     }
-    say(
-        "次に、記憶サーバーへの接続を設定します（self-hosted の Cloudflare サーバーの URL と API キーが必要です）。",
-        "Next, connect it to your memory server (you need your self-hosted Cloudflare server URL and API key).",
-    );
+    println!("{}", tr("welcome.next"));
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !interactive {
-        say(
-            "ターミナルで `remnifold setup --base-url <URL>` を実行してください。",
-            "Run `remnifold setup --base-url <URL>` in a terminal.",
-        );
+        println!("{}", tr("welcome.run_setup"));
         return Ok(());
     }
-    print!(
-        "{}",
-        if japanese {
-            "サーバーの URL（https://…）を入力してください。空のままなら後で設定します: "
-        } else {
-            "Server URL (https://...). Leave empty to set it up later: "
-        }
-    );
+    print!("{}", tr("welcome.prompt_url"));
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     let url = line.trim();
     if url.is_empty() {
-        say(
-            "後で `remnifold setup --base-url <URL>` を実行してください。",
-            "Later, run `remnifold setup --base-url <URL>`.",
-        );
+        println!("{}", tr("welcome.later"));
     } else {
         crate::local::setup(&["--base-url".to_string(), url.to_string()])?;
     }
     if first_run {
         // 初回起動のコンソールは、閉じると結果が読めなくなる。確認してから閉じる。
-        print!(
-            "{}",
-            if japanese {
-                "Enter で閉じます。"
-            } else {
-                "Press Enter to close."
-            }
-        );
+        print!("{}", tr("welcome.press_enter"));
         std::io::stdout().flush()?;
         let mut ignored = String::new();
         let _ = std::io::stdin().lock().read_line(&mut ignored);

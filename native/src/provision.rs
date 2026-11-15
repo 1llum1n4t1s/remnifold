@@ -12,7 +12,6 @@ use std::{
 const NAMES: [&str; 3] = ["remnifold", "kagayoi-memory", "cloudflare-supermemory"];
 const CRONS: [&str; 2] = ["*/15 * * * *", "0 18 * * *"];
 const API: &str = "https://api.cloudflare.com/client/v4";
-const HELP: &str = "Remnifold server setup (no Node.js or Wrangler required)\n\nUsage: remnifold server-setup [options]\nDefault: authenticated read-only discovery. --apply creates/reuses resources, applies migrations and deploys.\n\n  --apply\n  --worker-name <name>\n  --database-name <name>\n  --vector-index-name <name>\n  --account-id <id>\n  --config <absolute-jsonc-path>   Existing installation input (never overwritten)\n  --state <absolute-json-path>    External resume configuration\n  --location <weur|eeur|apac|oc|wnam|enam>\n  --jurisdiction <eu|fedramp|us>\n  --api-key-env <name>            Default REMNIFOLD_API_KEY\n  --base-url <https-url>\n  --token-stdin                  Read Cloudflare API token from stdin\n  --help\n\nAuthentication: CLOUDFLARE_API_TOKEN (or --token-stdin); no Wrangler OAuth import.\nThe token needs account read, Workers scripts, D1 and Vectorize permissions.\nWithout explicit names: existing configuration, remnifold, kagayoi-memory, cloudflare-supermemory.\n";
 
 #[derive(Default)]
 struct Options {
@@ -1614,7 +1613,7 @@ fn verify_endpoint(client: &Client, base: &str, key: Option<&str>) -> Result<()>
 pub fn run(args: &[String]) -> Result<()> {
     let mut o = parse(args)?;
     if o.help {
-        print!("{HELP}");
+        print!("{}", crate::locale::tr("server_setup.help"));
         return Ok(());
     }
     let state = state_path(&o)?;

@@ -18,9 +18,19 @@ use super::*;
 pub fn run(argv: &[String]) -> Result<()> {
     if argv == ["--help"] || argv == ["-h"] {
         println!(
-            "Usage: remnifold install --version <version> [--work-root <absolute-path>] [--check-published | --apply | --verify-only]\nDefault: --check-published (verify the publication without installing).\n--apply installs or updates the standalone app under {} and points {} at it.\n--verify-only re-checks the installed version against its retained receipt.",
-            crate::paths::app_root().display(),
-            crate::paths::app_executable(&crate::paths::app_root()).display()
+            "{}",
+            crate::locale::tr_with(
+                "install.help",
+                &[
+                    ("app_root", &crate::paths::app_root().display().to_string()),
+                    (
+                        "executable",
+                        &crate::paths::app_executable(&crate::paths::app_root())
+                            .display()
+                            .to_string()
+                    ),
+                ]
+            )
         );
         return Ok(());
     }

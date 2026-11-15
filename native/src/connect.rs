@@ -118,8 +118,16 @@ pub fn run(args: &[String]) -> Result<()> {
     };
     if matches!(tool, "--help" | "-h") {
         println!(
-            "Usage: remnifold connect <claude-code|codex> [--remove] [--apply] [--executable <path>] [--cli <path>]\nRegisters the installed Remnifold ({}) with Claude Code (MCP server and hooks) or Codex (MCP server).\nWith --remove, deletes only Remnifold's own registrations and keeps every other setting.\nWithout --apply, only the planned change is shown.",
-            crate::paths::app_executable(&crate::paths::app_root()).display()
+            "{}",
+            crate::locale::tr_with(
+                "connect.help",
+                &[(
+                    "executable",
+                    &crate::paths::app_executable(&crate::paths::app_root())
+                        .display()
+                        .to_string()
+                )]
+            )
         );
         return Ok(());
     }

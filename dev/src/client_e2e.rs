@@ -44,6 +44,8 @@ pub(crate) fn command(binary: &Path, home: &Path, project: &Path, endpoint: &str
         // Remnifold 自身の設定・状態も同じフォルダに隔離する（実環境の設定フォルダへ書かない）。
         // 親プロセスの REMNIFOLD_* を外した後に設定する。
         .env("REMNIFOLD_HOME", home)
+        // 人が読む文言は実行環境の言語で変わるため、検証は英語に固定する。
+        .env("REMNIFOLD_LANGUAGE", "en")
         .env("NO_PROXY", "*")
         .env("LOCALAPPDATA", home.join("local-app-data"));
     // PATHをOS付属ツールだけに制限し、成功した子プロセスからNodeを起動できなくする。

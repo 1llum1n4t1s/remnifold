@@ -4,7 +4,6 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
-const HELP: &str = "Usage: remnifold topics-setup [--limit 1..50] [--apply]\nDefaults to a read-only plan, limit 10. Uses the existing memory connection.\n--apply queues at most the selected number of eligible unclassified records for\nWorkers AI enrichment, using the existing backend AI/vector/fact pipeline and\nits revision guards and opt-outs. Accepted requests are asynchronous, not completed\nclassifications. This incurs existing backend usage; rerun only after work completes.\n";
 #[derive(Debug, PartialEq)]
 struct Options {
     apply: bool,
@@ -80,7 +79,7 @@ fn setup(
 pub fn run(args: &[String]) -> Result<()> {
     let options = parse(args)?;
     if options.help {
-        print!("{HELP}");
+        print!("{}", crate::locale::tr("topics.help"));
         return Ok(());
     }
     let config = common::load_config(None)

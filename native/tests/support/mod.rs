@@ -163,6 +163,8 @@ pub fn isolate(command: &mut Command) {
         }
     }
     command.env("NO_PROXY", "127.0.0.1,localhost,::1");
+    // 人が読む文言は実行環境の言語で変わる。検証は英語に固定し、必要なテストだけが上書きする。
+    command.env("REMNIFOLD_LANGUAGE", "en");
     // 既定では Remnifold 自身の設定・状態を毎回新しい一時フォルダへ隔離し、実環境の設定フォルダ
     // （%APPDATA%\Remnifold 等）を読み書きしないようにする。テスト側で必要なら後から上書きする。
     command.env(
