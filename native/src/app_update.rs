@@ -12,10 +12,12 @@
 //! - 確認と取得は、長く動く `mcp` の別スレッドで行う（[`spawn_background`]）。取得だけで適用しない。
 //! - 適用はログオン時だけ。`update-apply`（[`update_apply`]）が、導入先に他のプロセスが無いことを確かめ、
 //!   署名者を検証してから、再起動なしで適用する。
-//! - 登録（Claude Code・Codex）とログオン時の適用の登録は、Windows では Velopack のフック（install /
-//!   updated / uninstall）から行い、いずれも必ず終了コード 0 で終える（フックの失敗でインストール・更新・
-//!   アンインストールを止めない）。macOS ではフックが呼ばれないため、引数なしの起動と `mcp` の起動のときに、
-//!   登録が今の自分を指していなければ登録する（[`registration`]）。macOS にはアンインストーラーも無いため、
+//! - 登録（Claude Code・Codex）とログオン時の適用の登録は、全 OS で [`registration`] が状態ファイル
+//!   （`setup-registration.json`）とあわせて行う。Windows では Velopack のフック（install / updated /
+//!   uninstall）からも呼び、いずれも必ず終了コード 0 で終える（フックの失敗でインストール・更新・
+//!   アンインストールを止めない）。フックは CLI 1回を3秒で打ち切るため、登録が終わらなかった CLI は状態に
+//!   「未完了」と残り、ログオン時の `update-apply`・引数なしの起動・`mcp` の起動で（長めの上限で）やり直す。
+//!   macOS ではフックが呼ばれないため、これらの起動だけで登録する。macOS にはアンインストーラーも無いため、
 //!   解除は利用者が `uninstall-setup --apply` で行う（[`uninstall_setup`]）。
 //! - Linux（AppImage）も macOS と同じく、フック・インストーラー・アンインストーラーが無い（利用者が AppImage を
 //!   置いて起動するだけ）。登録・解除は macOS と同じ流れで行い、登録する実行ファイルは AppImage 本体にする
@@ -47,8 +49,7 @@ use velopack::{
 
 mod logon;
 mod processes;
-// macOS・Linux の登録の要否の判定。状態の読み書きは全 OS で単体テストするため、宣言は OS で分けない。
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+// 登録の要否の判定と状態の読み書き（全 OS 共通）。
 mod registration;
 mod trust;
 
@@ -222,7 +223,6 @@ struct SetupContext {
     /// macOS は `.app/Contents/MacOS/remnifold`、Linux は AppImage 本体（引数はそのまま主実行ファイルへ渡る）。
     executable: PathBuf,
     app_id: String,
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     version: String,
 }
 
@@ -243,22 +243,23 @@ impl SetupContext {
     }
 }
 
-/// インストール・更新の直後の登録。Claude Code・Codex と、ログオン時の適用を最新の定義で張る。
+/// インストール・更新の直後の登録（Windows のフック）。`fresh`（インストール）のときは前回の状態を忘れ、
+/// Claude Code・Codex とログオン時の適用を全て張り直す。更新では [`registration::plan`] のとおり、
+/// ログオン時の適用とフックだけを張り直し、MCP の登録はパスが同じなら CLI を呼ばない（使用中のセッションの
+/// 登録を外して付け直さない）。CLI は1回3秒で打ち切り（フックの時間制限のため）、終わらなかった CLI は状態に
+/// 未完了と残して、ログオン時の `update-apply` などでやり直す。
 #[cfg_attr(not(windows), allow(dead_code))]
-fn register_everything(label: &str) {
+fn register_everything(label: &str, fresh: bool) {
     let Some(context) = SetupContext::detect() else {
         log_line(&format!("{label}: not a Velopack installation; skipped"));
         return;
     };
-    // 一瞬で終わるログオン時の適用の登録を先に行う。CLI の登録は時間がかかりうるため、
-    // Velopack がフックを打ち切る場合に備えて後ろに置く。
-    match logon::register(&context.app_id, &context.executable) {
-        Ok(result) => log_line(&format!("{label}: logon apply {result:?}")),
-        Err(error) => log_line(&format!("{label}: logon apply failed: {error}")),
+    if fresh && let Err(error) = registration::forget(&Roots::current().state) {
+        log_line(&format!(
+            "{label}: previous registration state not reset: {error}"
+        ));
     }
-    for line in connect::register_for_setup(&context.executable) {
-        log_line(&format!("{label}: {line}"));
-    }
+    registration::ensure(&context, label);
 }
 
 /// アンインストール前の解除。Claude Code・Codex の登録とログオン時の適用を外す。
@@ -277,10 +278,12 @@ fn unregister_everything() {
 fn unregister_context(context: &SetupContext) -> Vec<String> {
     let mut lines = Vec::new();
     // ログオン時の適用の解除（一瞬で終わる）を先に行い、時間がかかりうる CLI の解除を後ろに置く。
-    lines.push(match logon::unregister(&context.app_id, &context.executable) {
-        Ok(removed) => format!("logon apply removed={removed}"),
-        Err(error) => format!("logon apply failed: {error}"),
-    });
+    lines.push(
+        match logon::unregister(&context.app_id, &context.executable) {
+            Ok(removed) => format!("logon apply removed={removed}"),
+            Err(error) => format!("logon apply failed: {error}"),
+        },
+    );
     lines.extend(connect::unregister_for_setup(&context.executable));
     // 次に導入したときに登録し直すよう、登録の状態を忘れる（macOS・Linux の登録の判定に使う）。
     match registration::forget(&Roots::current().state) {
@@ -290,12 +293,14 @@ fn unregister_context(context: &SetupContext) -> Vec<String> {
     lines
 }
 
-/// macOS・Linux の Setup 版で、登録が今の自分を指していなければ登録する（[`registration`]）。
-/// 引数なしの起動（.pkg の初回起動・AppImage の直接起動）から同期的に呼ぶ。Windows（フックで登録する）と
-/// Velopack 管理外のビルドでは何もしない。panic しても呼び出し元（MCP・案内）を止めない。
+/// Setup 版で、登録が今の自分を指していなければ（または前回終わらなかった CLI があれば）登録する
+/// （[`registration`]）。引数なしの起動（.pkg の初回起動・AppImage の直接起動・スタートメニュー）、`mcp` の
+/// 背景スレッド、ログオン時の `update-apply` から呼ぶ。Windows ではフックの3秒の打ち切りで終わらなかった
+/// 登録をここで完了させる（フック以外なので CLI の上限を長めにする）。普段は状態ファイルを読むだけで終わる。
+/// Velopack 管理外のビルドでは何もしない。panic しても呼び出し元（MCP・案内・適用）を止めない。
 pub fn ensure_registered() {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(context) = SetupContext::detect() {
+        connect::set_cli_timeout(connect::RETRY_CLI_TIMEOUT);
         guarded("register", || registration::ensure(&context, "register"));
     }
 }
@@ -314,11 +319,15 @@ pub fn uninstall_setup(args: &[String]) -> Result<Value> {
                     "description": "Removes the Setup installation's Claude Code/Codex registrations and logon update entry that point at this executable. Without --apply, only the plan is shown."
                 }));
             }
-            _ => anyhow::bail!("Unknown uninstall-setup option. Use remnifold uninstall-setup --help."),
+            _ => anyhow::bail!(
+                "Unknown uninstall-setup option. Use remnifold uninstall-setup --help."
+            ),
         }
     }
     let Some(context) = SetupContext::detect() else {
-        return Ok(json!({"status":"unmanaged","reason":"this executable is not a Setup (Velopack) installation"}));
+        return Ok(
+            json!({"status":"unmanaged","reason":"this executable is not a Setup (Velopack) installation"}),
+        );
     };
     let mut result = json!({
         "executable": context.executable,
@@ -328,14 +337,18 @@ pub fn uninstall_setup(args: &[String]) -> Result<Value> {
     });
     if !apply {
         result["status"] = json!("planned");
-        result["next"] = json!("Run again with --apply, then move the app to the Trash (macOS), delete the AppImage (Linux) or uninstall it from Settings (Windows).");
+        result["next"] = json!(
+            "Run again with --apply, then move the app to the Trash (macOS), delete the AppImage (Linux) or uninstall it from Settings (Windows)."
+        );
         return Ok(result);
     }
     let lines = unregister_context(&context);
     log_line(&format!("uninstall-setup: {}", lines.join("; ")));
     result["status"] = json!("removed");
     result["results"] = json!(lines);
-    result["next"] = json!("Move the app to the Trash (macOS), delete the AppImage and /var/tmp/velopack/<packId> (Linux) or uninstall it from Settings (Windows). Your memory server, configuration and state folders are kept.");
+    result["next"] = json!(
+        "Move the app to the Trash (macOS), delete the AppImage and /var/tmp/velopack/<packId> (Linux) or uninstall it from Settings (Windows). Your memory server, configuration and state folders are kept."
+    );
     Ok(result)
 }
 
@@ -353,10 +366,10 @@ pub fn startup() -> Startup {
     {
         app = app
             .on_after_install_fast_callback(|_| {
-                guarded("install", || register_everything("install"))
+                guarded("install", || register_everything("install", true))
             })
             .on_after_update_fast_callback(|_| {
-                guarded("updated", || register_everything("updated"))
+                guarded("updated", || register_everything("updated", false))
             })
             .on_before_uninstall_fast_callback(|_| guarded("uninstall", unregister_everything));
     }
@@ -442,8 +455,8 @@ pub fn spawn_background() {
     let spawned = std::thread::Builder::new()
         .name("remnifold-auto-update".into())
         .spawn(move || {
-            // macOS・Linux では、まず登録が今の自分を指しているかを確かめる（Velopack のフックが無いため。
-            // 普段は状態ファイルを読むだけで終わる）。MCP の応答を遅らせないよう、このスレッドで行う。
+            // まず登録が今の自分を指しているか（Windows ではフックで終わらなかった CLI が無いか）を確かめる
+            // （普段は状態ファイルを読むだけで終わる）。MCP の応答を遅らせないよう、このスレッドで行う。
             ensure_registered();
             loop {
                 // panic しても MCP 本体へは波及させない（このスレッドだけが止まる）。
@@ -496,6 +509,10 @@ pub fn update_apply() -> Result<ApplyOutcome> {
     let Some(locator) = locate() else {
         return Ok(ApplyOutcome::Unmanaged);
     };
+    // ログオンのたびに、登録が残っているか（フックで終わらなかった CLI が無いか）を確かめて直す。
+    // MCP の登録が消えていると Claude Code が `mcp` を起動しないため、ここが確実な再試行の機会になる。
+    // 自動更新の設定とは関係なく行う。
+    ensure_registered();
     let state_dir = Roots::current().state;
     if !load_settings(&state_dir).auto_update {
         return Ok(ApplyOutcome::Disabled);

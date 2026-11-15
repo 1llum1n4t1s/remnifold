@@ -31,7 +31,8 @@ fn run(startup: app_update::Startup) -> Result<()> {
         None => {
             // macOS・Linux の Setup 版には Velopack のインストールフックが無い。.pkg は導入後に引数なしで
             // 1回起動し、AppImage は利用者が引数なしで起動するので、ここで Claude Code・Codex とログイン時の
-            // 適用を登録する（登録済みなら状態ファイルを読むだけで終わる。Windows と管理外のビルドでは何もしない）。
+            // 適用を登録する。Windows では、インストールフックの3秒の打ち切りで終わらなかった登録をここでも
+            // やり直す（登録済みなら状態ファイルを読むだけで終わる。管理外のビルドでは何もしない）。
             app_update::ensure_registered();
             if startup.first_run || (app_update::is_managed() && io::stdin().is_terminal()) {
                 return app_update::welcome(startup.first_run);

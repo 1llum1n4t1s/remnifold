@@ -149,7 +149,10 @@ mod linux {
         // packages フォルダーと、その親（`<packId>` フォルダー）。`/var/tmp/velopack` 自体は最初に使った
         // 利用者のものなので確かめない（`<packId>` を差し替えられても、ここで所有者の違いとして気づく）。
         for directory in package.ancestors().skip(1).take(2) {
-            checked.push((directory.to_path_buf(), std::fs::symlink_metadata(directory)?));
+            checked.push((
+                directory.to_path_buf(),
+                std::fs::symlink_metadata(directory)?,
+            ));
         }
         for (path, meta) in &checked {
             if !owned_and_private(meta.uid(), meta.gid(), meta.mode(), uid, gid) {
@@ -241,9 +244,11 @@ mod macos {
         let bundle = velopack::bundle::load_bundle_from_file(package).map_err(|_| {
             anyhow::anyhow!("The update package is not a readable Velopack package.")
         })?;
-        bundle.extract_lib_contents_to_path(&app, |_| {}).map_err(|_| {
-            anyhow::anyhow!("The update package could not be extracted for verification.")
-        })?;
+        bundle
+            .extract_lib_contents_to_path(&app, |_| {})
+            .map_err(|_| {
+                anyhow::anyhow!("The update package could not be extracted for verification.")
+            })?;
         verify_app(&app, team_id)
     }
 
@@ -693,9 +698,7 @@ mod tests {
         };
         assert!(linux_package_names(&with(&["lib/app/RemnifoldApp.AppImage"])).is_ok());
         assert!(linux_package_names(&with(&[])).is_err());
-        assert!(
-            linux_package_names(&with(&["lib/app/A.AppImage", "lib/app/B.appimage"])).is_err()
-        );
+        assert!(linux_package_names(&with(&["lib/app/A.AppImage", "lib/app/B.appimage"])).is_err());
         // 入れ子の AppImage は数えない。
         assert!(linux_package_names(&with(&["lib/app/x/A.AppImage"])).is_err());
         for bad in ["lib/app/../x", "/abs", "lib\\app\\x", "C:/x"] {

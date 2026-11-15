@@ -232,9 +232,9 @@ mod xdg {
     /// 他の導入のものとして扱えるよう空文字を返す（上書きも削除もしない側へ倒す）。
     fn read_existing(path: &Path) -> io::Result<Option<String>> {
         match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_file() => {
-                Ok(Some(String::from_utf8_lossy(&std::fs::read(path)?).into_owned()))
-            }
+            Ok(meta) if meta.is_file() => Ok(Some(
+                String::from_utf8_lossy(&std::fs::read(path)?).into_owned(),
+            )),
             Ok(_) => Ok(Some(String::new())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -335,7 +335,10 @@ mod xdg {
             // 古い定義でも、自分を指していれば書き直す。
             std::fs::write(
                 &path,
-                format!("[Desktop Entry]\nX-Remnifold-Executable={}\n", mine.display()),
+                format!(
+                    "[Desktop Entry]\nX-Remnifold-Executable={}\n",
+                    mine.display()
+                ),
             )
             .unwrap();
             assert_eq!(
@@ -367,7 +370,10 @@ mod xdg {
             );
             // 改行を含むパスは表せないので登録しない。
             assert!(desktop_body("TestApp", Path::new("/tmp/a\nb"), None).is_none());
-            assert!(!points_at("X-Remnifold-Executable=/tmp/a", Path::new("/tmp/a\nb")));
+            assert!(!points_at(
+                "X-Remnifold-Executable=/tmp/a",
+                Path::new("/tmp/a\nb")
+            ));
             // 専用キーの行の完全一致だけを見る（前方一致する別のパスは違う）。
             let body = desktop_body("TestApp", Path::new("/x/R.AppImage"), None).unwrap();
             assert!(points_at(&body, Path::new("/x/R.AppImage")));
@@ -412,7 +418,9 @@ mod macos {
 
     /// 本番の置き場。`HOME` を差し替えた隔離検証では、その配下になる。
     pub fn launch_agents_dir() -> PathBuf {
-        crate::common::home_dir().join("Library").join("LaunchAgents")
+        crate::common::home_dir()
+            .join("Library")
+            .join("LaunchAgents")
     }
 
     /// launchd のラベル（逆 DNS 形式）。
@@ -461,9 +469,9 @@ mod macos {
     /// 他の導入のものとして扱えるよう空文字を返す（上書きも削除もしない側へ倒す）。
     fn read_existing(path: &Path) -> io::Result<Option<String>> {
         match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_file() => {
-                Ok(Some(String::from_utf8_lossy(&std::fs::read(path)?).into_owned()))
-            }
+            Ok(meta) if meta.is_file() => Ok(Some(
+                String::from_utf8_lossy(&std::fs::read(path)?).into_owned(),
+            )),
             Ok(_) => Ok(Some(String::new())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),

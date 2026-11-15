@@ -15,7 +15,7 @@
 //!
 //! 解除（`--remove`）は、登録の逆を自分の項目だけに行う。settings.json の他のフック・設定、他の MCP 登録は
 //! 保つ。Setup（Velopack）版のインストール・更新・アンインストールの各フックからは、
-//! [`register_for_setup`] / [`unregister_for_setup`] を通して同じ処理を呼ぶ（失敗しても例外にせず、
+//! [`register_tools_for_setup`] / [`unregister_for_setup`] を通して同じ処理を呼ぶ（失敗しても例外にせず、
 //! 結果を文字列で返す。フックの失敗でインストールや更新を止めないため）。
 use crate::common::{atomic_write, home_dir};
 use anyhow::{Result, bail, ensure};
@@ -28,10 +28,31 @@ use std::{
     time::Duration,
 };
 
-/// Setup（Velopack）のフックから呼ぶ CLI 1回あたりの上限。Velopack はインストール・アンインストール後の
+/// Setup（Velopack）のフックから呼ぶ CLI 1回あたりの上限（既定）。Velopack はインストール・アンインストール後の
 /// フックを30秒、更新後のフックを15秒で打ち切る。最悪でも全体が15秒に収まるよう、1回を3秒に制限する
 /// （remove と add の間で打ち切られると登録が消えたままになるため、無制限に待たせない）。
-const HOOK_CLI_TIMEOUT: Duration = Duration::from_secs(3);
+pub const HOOK_CLI_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// フック以外（ログオン時の `update-apply`・引数なしの起動・`mcp` の背景スレッド）で登録をやり直すときの上限。
+/// Velopack の打ち切りが無いので長めにし、フックで3秒に収まらなかった登録をここで完了させる。
+pub const RETRY_CLI_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// このプロセスで、時間制限付きの CLI 呼び出し（`bounded`）に使う上限（ミリ秒）。プロセスごとに役割が1つ
+/// （フック・ログオン時の適用・MCP など）なので、起動の入口で一度だけ [`set_cli_timeout`] で決める。
+static CLI_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(HOOK_CLI_TIMEOUT.as_millis() as u64);
+
+/// 時間制限付きの CLI 呼び出しの上限を変える（フック以外の入口から、登録をやり直す前に呼ぶ）。
+pub fn set_cli_timeout(timeout: Duration) {
+    CLI_TIMEOUT_MS.store(
+        timeout.as_millis() as u64,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+fn cli_timeout() -> Duration {
+    Duration::from_millis(CLI_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
 
 /// CLI を1回実行する。終了コード 0 なら標準出力を返し、非 0 なら None。起動できない・時間切れは Err。
 /// `bounded` のときは、子プロセスの木ごと時間で打ち切る（フック用）。
@@ -54,7 +75,7 @@ fn run_cli<S: AsRef<OsStr>>(cli: &Path, args: &[S], bounded: bool) -> Result<Opt
         }
     }
     if bounded {
-        return match crate::updater::process::run(command, HOOK_CLI_TIMEOUT, 64 * 1024) {
+        return match crate::updater::process::run(command, cli_timeout(), 64 * 1024) {
             Ok(stdout) => Ok(Some(String::from_utf8_lossy(&stdout).into_owned())),
             Err(error) if error.to_string() == "CLI_FAILED" => Ok(None),
             Err(error) => Err(error),
@@ -469,23 +490,11 @@ fn codex_remove(
     Ok(result)
 }
 
-/// Setup（Velopack）のインストール・更新フックから呼ぶ登録。導入先の固定の実行ファイルを、
-/// 見つかった CLI ごとに登録する。CLI が見つからない側は何も書かずに飛ばし、理由を返す。
-/// どの失敗も例外にせず、人が読める結果の行にして返す（フックを失敗させないため）。
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn register_for_setup(executable: &Path) -> Vec<String> {
-    register_tools_for_setup(executable, &SETUP_TOOLS)
-        .into_iter()
-        .map(|outcome| outcome.line)
-        .collect()
-}
-
-/// Setup 版が登録する CLI の名前（`claude` と `codex`）。
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+/// Setup 版が登録する CLI の名前（`claude` と `codex`）。Setup 版の登録は全 OS 共通で
+/// `app_update::registration` が状態ファイルとあわせて [`register_tools_for_setup`] を呼ぶ。
 pub const SETUP_TOOLS: [&str; 2] = ["claude", "codex"];
 
 /// [`register_tools_for_setup`] の1つの CLI の結果。
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub struct SetupOutcome {
     /// CLI の名前（`claude` / `codex`）。
     pub tool: &'static str,
@@ -539,7 +548,6 @@ pub fn register_tools_for_setup(executable: &Path, tools: &[&str]) -> Vec<SetupO
 /// CLI は呼ばない（MCP の登録は実行ファイルのパスが変わらない限り有効なままで、使用中のセッションの
 /// 設定を CLI で外して付け直すことを避けるため）。この実行ファイルを指す Remnifold のフックが1つも
 /// 無ければ（利用者が外した・未登録）、何も書かない。
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub fn refresh_claude_hooks_for_setup(executable: &Path) -> String {
     let outcome = (|| -> Result<bool> {
         let settings_path = claude_settings_path();
@@ -553,9 +561,9 @@ pub fn refresh_claude_hooks_for_setup(executable: &Path) -> String {
         })?;
         let ours = HOOKS.iter().any(|(event, ..)| {
             settings["hooks"][event].as_array().is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|entry| is_remnifold_entry(entry, event) && entry_points_at(entry, executable))
+                items.iter().any(|entry| {
+                    is_remnifold_entry(entry, event) && entry_points_at(entry, executable)
+                })
             })
         });
         if !ours {
@@ -585,7 +593,6 @@ pub fn refresh_claude_hooks_for_setup(executable: &Path) -> String {
 }
 
 /// その CLI が見つかるか（プロセスを起動しない軽い確認。登録をやり直すべきかの判定に使う）。
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub fn cli_available(tool: &str) -> bool {
     find_cli(tool).is_some()
 }
@@ -639,6 +646,12 @@ fn mcp_add_args(executable: &Path, claude: bool) -> Vec<String> {
     args
 }
 
+/// [`mcp_add_args`] の引数から、登録する実行ファイル（`--` の直後）を取り出す。
+fn add_executable(add: &[String]) -> Option<&str> {
+    let separator = add.iter().position(|arg| arg == "--")?;
+    add.get(separator + 1).map(String::as_str)
+}
+
 fn display_args(args: &[String]) -> String {
     args.iter()
         .map(|arg| {
@@ -662,6 +675,14 @@ fn register_mcp(
     let Some(cli) = cli else {
         return Ok(json!({"status":"manual","reason":"CLI not found; run mcpCommand yourself"}));
     };
+    // 既にこの実行ファイルを指す登録なら、外さずにそのまま使う。外してから付け直す間に打ち切られると
+    // 登録が消えたままになるため、必要なときだけ remove → add を行う（旧導入先を指す登録の置き換えなど）。
+    // `add` の引数の先頭（`mcp add ... -- <実行ファイル> mcp`）から実行ファイルを取り出して照合する。
+    if let Some(executable) = add_executable(add)
+        && mcp_points_at(&cli, Path::new(executable), bounded)
+    {
+        return Ok(json!({"status":"unchanged","cli":cli}));
+    }
     let mut remove = vec!["mcp", "remove", "remnifold"];
     if claude {
         remove.extend(["--scope", "user"]);
@@ -741,6 +762,34 @@ fn macos_cli_fallback_dirs(home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_arguments_name_the_registered_executable() {
+        // 登録済みの確認（`mcp get`）は、add の `--` の直後の実行ファイルで照合する。
+        let executable =
+            Path::new(r"C:\Users\利用者\AppData\Local\RemnifoldApp\current\remnifold.exe");
+        for claude in [true, false] {
+            let args = mcp_add_args(executable, claude);
+            assert_eq!(
+                add_executable(&args),
+                Some(executable.to_string_lossy().as_ref())
+            );
+        }
+        assert_eq!(
+            add_executable(&["mcp".to_string(), "add".to_string()]),
+            None
+        );
+        assert_eq!(add_executable(&["--".to_string()]), None);
+    }
+
+    #[test]
+    fn cli_timeout_defaults_to_the_hook_bound_and_can_be_raised() {
+        // 既定はフック用の3秒。フック以外の入口が長めの上限へ切り替える。
+        assert_eq!(cli_timeout(), HOOK_CLI_TIMEOUT);
+        set_cli_timeout(RETRY_CLI_TIMEOUT);
+        assert_eq!(cli_timeout(), RETRY_CLI_TIMEOUT);
+        set_cli_timeout(HOOK_CLI_TIMEOUT);
+    }
 
     #[test]
     fn hooks_merge_replaces_only_remnifold_entries_and_is_idempotent() {
@@ -839,8 +888,13 @@ mod tests {
         assert_eq!(dirs[0], Path::new("/Users/a/.local/bin"));
         assert!(dirs.iter().all(|dir| dir.is_absolute()));
         assert!(
-            dirs.iter().position(|d| d == Path::new("/opt/homebrew/bin")).unwrap()
-                > dirs.iter().position(|d| d == Path::new("/Users/a/.claude/local")).unwrap()
+            dirs.iter()
+                .position(|d| d == Path::new("/opt/homebrew/bin"))
+                .unwrap()
+                > dirs
+                    .iter()
+                    .position(|d| d == Path::new("/Users/a/.claude/local"))
+                    .unwrap()
         );
         assert!(
             macos_cli_fallback_dirs(Path::new(""))
@@ -857,7 +911,9 @@ mod tests {
         let dirs = linux_cli_fallback_dirs(&home);
         assert_eq!(dirs[0], home.join(".local/bin"));
         assert!(
-            dirs.iter().position(|d| d == Path::new("/usr/local/bin")).unwrap()
+            dirs.iter()
+                .position(|d| d == Path::new("/usr/local/bin"))
+                .unwrap()
                 > dirs
                     .iter()
                     .position(|d| d == &home.join(".claude/local"))
