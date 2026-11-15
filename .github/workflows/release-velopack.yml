@@ -16,7 +16,7 @@ name: Release Velopack
 #   版は ci-release-branch（release/<版> と Cargo の版の一致確認）を通す。
 # - 本人が事前に用意するもの（リポジトリの設定。値はここに書かない）:
 #     Environment `r2-release`（release/* のみ）に Secrets: R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY /
-#       SIGILUNE_EMAIL / SIGILUNE_TOTP_URI、Variables: CLOUDFLARE_ACCOUNT_ID / SIGILUNE_VERSION（導入する版）。
+#       SIGILUNE_EMAIL / SIGILUNE_TOTP_URI、Variables: CLOUDFLARE_ACCOUNT_ID。
 #     署名の Secrets を配信の Secrets から分けたい場合は、署名用の Environment を別に作り、ジョブを分けて
 #     成果物を受け渡す形に変える（その場合は upload-artifact 相当の受け渡し方法を決める必要がある）。
 on:
@@ -93,16 +93,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install Sigilune at the pinned version without executable Actions
-        env:
-          SIGILUNE_VERSION: ${{ vars.SIGILUNE_VERSION }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:SIGILUNE_VERSION -cnotmatch '^\d+\.\d+\.\d+$') { throw 'Set the repository variable SIGILUNE_VERSION to an exact version (x.y.z).' }
+          # Sigilune は R2 配布の版とコミット SHA を固定する（タグは使わない）。更新するときはこの 2 行を同時に変える。
+          $sigiluneVersion = '1.1.3'
+          $sigiluneCommit = '05006dcad019e5e863a08985b9208d72004f1b5f'
           $source = Join-Path $env:RUNNER_TEMP 'sigilune-src'
-          git clone --depth 1 --branch "v$env:SIGILUNE_VERSION" https://github.com/1llum1n4t1s/Sigilune.git $source
+          git init -q $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $source fetch --depth 1 https://github.com/1llum1n4t1s/Sigilune.git $sigiluneCommit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $source checkout -q --detach FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $install = Join-Path $env:RUNNER_TEMP 'sigilune'
-          & (Join-Path $source 'install.ps1') -Version $env:SIGILUNE_VERSION -InstallDir $install -NoPath
+          & (Join-Path $source 'install.ps1') -Version $sigiluneVersion -InstallDir $install -NoPath
           "SIGILUNE_EXE=$(Join-Path $install 'sigilune.exe')" >> $env:GITHUB_ENV
           # ランナーごとに独立したセッションキャッシュを使う。
           "SIGILUNE_HOME=$(Join-Path $env:RUNNER_TEMP 'sigilune-home')" >> $env:GITHUB_ENV
