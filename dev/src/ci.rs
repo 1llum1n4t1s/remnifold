@@ -79,6 +79,89 @@ mod tests {
         assert!(publisher.contains("cargo xtask r2-publish --apply"));
     }
 
+    // Setup（Velopack）の配信ワークフローの契約。release/* への push で起動し、公開バケットへ書くのは
+    // 「同じコミットの ci.yml が成功し publish-r2 が成功済み」を gate が確認した後の windows-installer だけ。
+    // gate は Secrets・Environment を持たない。ci.yml に署名を持ち込まないこと（署名の失敗が strict 公開の
+    // witness を壊さないため）も併せて確かめる。
+    #[test]
+    fn release_velopack_starts_on_release_pushes_only_after_the_gate() {
+        let workflow = include_str!("../../.github/workflows/release-velopack.yml");
+        let (header, jobs) = workflow.split_once("\njobs:\n").unwrap();
+        let triggers = header.split_once("\non:\n").unwrap().1;
+        assert!(triggers.contains("  push:\n    branches:\n      - 'release/**'\n"));
+        assert!(triggers.contains("  workflow_dispatch:"));
+        for forbidden in ["tags", "workflow_run", "pull_request"] {
+            assert!(
+                !triggers.contains(forbidden),
+                "{forbidden} must not start the release"
+            );
+        }
+        // concurrency はワークフロー直下ではなく windows-installer だけに掛ける（gate の待機で枠を占有しない）。
+        assert!(!workflow.contains("\nconcurrency:"));
+
+        let (gate, installer) = jobs.split_once("\n  windows-installer:").unwrap();
+        assert!(gate.contains("  gate:\n    name: gate"));
+        assert!(gate.contains("runs-on: ubuntu-latest"));
+        assert!(gate.contains("actions: read") && gate.contains("contents: read"));
+        assert!(gate.contains("scripts/velopack/wait-ci-publication.sh"));
+        assert!(gate.contains("startsWith(github.ref, 'refs/heads/release/')"));
+        for forbidden in [
+            "environment:",
+            "secrets.",
+            "vars.",
+            "r2-release",
+            "SIGILUNE",
+            "R2_",
+            "concurrency:",
+            "statuses: write",
+            "uses:",
+        ] {
+            assert!(
+                !gate.contains(forbidden),
+                "gate must not contain {forbidden}"
+            );
+        }
+
+        assert!(installer.contains("needs: gate"));
+        assert!(installer.contains("environment: r2-release"));
+        assert!(installer.contains(
+            "    concurrency:\n      group: release-velopack\n      cancel-in-progress: false\n"
+        ));
+        assert!(installer.contains("github.repository == '1llum1n4t1s/remnifold'"));
+        assert!(
+            installer.contains(
+                "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"
+            )
+        );
+        assert!(installer.contains("startsWith(github.ref, 'refs/heads/release/')"));
+        assert!(installer.contains("cargo xtask ci-release-branch"));
+        // Sigilune は版とコミット SHA の固定で取得する（リポジトリ変数の版指定は使わない）。
+        assert!(installer.contains("$sigiluneVersion") && installer.contains("$sigiluneCommit"));
+        assert!(!workflow.contains("vars.SIGILUNE_VERSION"));
+        // 署名と R2 の Secrets はこのジョブの専用 step にだけ渡す。
+        assert!(installer.contains("secrets.SIGILUNE_EMAIL"));
+        assert!(installer.contains("secrets.R2_RELEASE_ACCESS_KEY_ID"));
+        assert!(!workflow.lines().any(|line| {
+            line.trim_start()
+                .trim_start_matches("- ")
+                .starts_with("uses:")
+        }));
+        // 署名は ci.yml へ入れない。
+        let ci = include_str!("../../.github/workflows/ci.yml").to_ascii_lowercase();
+        assert!(!ci.contains("sigilune") && !ci.contains("authenticode"));
+    }
+
+    #[test]
+    fn release_gate_script_requires_a_single_successful_publisher() {
+        let script = include_str!("../../scripts/velopack/wait-ci-publication.sh");
+        assert!(script.contains("publish-r2"));
+        assert!(script.contains("attempts/$run_attempt/jobs"));
+        assert!(script.contains("workflows/ci.yml/runs"));
+        assert!(script.contains("head_sha"));
+        // 失敗・取消は待たずに即失敗にする。
+        assert!(script.contains("concluded"));
+    }
+
     #[test]
     fn release_branch_must_match_manifest_version_exactly() {
         assert!(release_identity(&json!("1.0.16"), "refs/heads/release/1.0.16").is_ok());

@@ -1,4 +1,3 @@
-mod bootstrap_release;
 mod ci;
 #[cfg(test)]
 #[allow(dead_code)]
@@ -50,9 +49,6 @@ fn run() -> Result<()> {
     if command == "local-input" {
         return r2::local_input(&args.collect::<Vec<_>>());
     }
-    if command == "bootstrap-release" {
-        return bootstrap_release::run(&repo, &args.collect::<Vec<_>>());
-    }
     if command == "r2-stage" {
         return r2::stage(&args.collect::<Vec<_>>());
     }
@@ -70,7 +66,7 @@ fn run() -> Result<()> {
     }
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         println!(
-            "cargo xtask <prepare|type-check|native-test|server-test|client-test|updater-test|bootstrap-test|package|verify|check>\n\nOptions: --tool-root <absolute-cache> --work-root <absolute-output>\nPackage: --target <Rust target> --binary <executable> --output <archive>\nBootstrap release: bootstrap-release --source-commit <SHA> --work-root <absolute-output> [--apply]\nSource: --source-mode commit|checkout (package/verify default: commit)\nVerify/update tests: --archive <archive> [--legacy-archive <old-JS-package>] [--previous-archive <old-native-package>]"
+            "cargo xtask <prepare|type-check|native-test|server-test|client-test|updater-test|bootstrap-test|package|verify|check>\n\nOptions: --tool-root <absolute-cache> --work-root <absolute-output>\nPackage: --target <Rust target> --binary <executable> --output <archive>\nSource: --source-mode commit|checkout (package/verify default: commit)\nVerify/update tests: --archive <archive> [--legacy-archive <old-JS-package>] [--previous-archive <old-native-package>]"
         );
         return Ok(());
     }

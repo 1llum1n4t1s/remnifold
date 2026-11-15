@@ -1,38 +1,86 @@
-name: Release Velopack
-
-# 【未実行の定義】第1段階では書いただけで、一度も実行していない（CI 実行・R2 書き込み・push は本人の許可が要る）。
-#
 # Setup（Velopack）の Windows 版を梱包・署名し、R2（https://remnifold-updates.kagayoi.com/velopack/）へ配信する。
 # 厳格な install 用の releases/<version>/index.json を配信する ci.yml とは別のワークフローで、互いに触れない。
 #
 # 方針:
-# - 実行可能な Actions を使わない（ci.yml と同じ）。checkout は git のコマンドで行い、Sigilune はタグを固定して
-#   git で取得して導入する。成果物の受け渡しに upload-artifact が要らないよう、梱包・署名と配信は同じジョブで行う。
+# - 実行可能な Actions を使わない（ci.yml と同じ）。checkout は git のコマンドで行い、Sigilune は R2 配布の版と
+#   コミット SHA を固定して git で取得して導入する。成果物の受け渡しに upload-artifact が要らないよう、
+#   梱包・署名と配信は同じジョブで行う。
 # - 署名の Secrets と R2 の Secrets は、それぞれ使う step だけへ渡す（梱包・ビルドの step には渡さない）。
-# - 手動起動（workflow_dispatch）だけで、release/* ブランチ上でだけ動く（Environment の deployment branch policy も
-#   release/* に限る）。push では起動しない: push で起動すると ci.yml の成功と無関係に公開バケットへ書いてしまい、
-#   AGENTS.md の「公開バケットへの書き込みは、全ターゲット成功後の publisher だけ」という境界に反するため。
-#   起動する側が、同じコミットの ci.yml（release/* の publish-r2）が成功済みであることを確認してから実行する。
+# - 起動は release/* ブランチへの push、または同ブランチ上の手動起動（workflow_dispatch）。タグでは起動しない
+#   （タグと GitHub Release は作らない運用）。Environment の deployment branch policy も release/* に限る。
+# - push では ci.yml と同時に起動するため、公開バケットへ書く前に gate ジョブで「同じコミットの ci.yml が成功し、
+#   publish-r2 が成功済み」を待って確認する（AGENTS.md の「公開バケットへの書き込みは、全ターゲット成功後の
+#   publisher だけ」という境界を守るため）。ci.yml 自体は触らない: 署名の失敗が strict 公開の witness
+#   （唯一成功した publish-r2 job）を壊さないよう、署名はこのワークフローに分けている。
+#   workflow_run は使わない（GITHUB_REF が既定ブランチになり、release/* 限定の r2-release に弾かれるため）。
 #   版は ci-release-branch（release/<版> と Cargo の版の一致確認）を通す。
+# - gate は Environment・Secrets を持たず、読み取り専用（actions: read, contents: read）で動く。待機の本体は
+#   scripts/velopack/wait-ci-publication.sh（スタブの gh で検証できる）。concurrency は windows-installer だけに掛け、
+#   gate の待機中に直列の枠を占有しない。
+# - この Windows 版のほか、署名済みの bootstrap 実行ファイル（remnifold-bootstrap-<版>-x86_64-pc-windows-msvc.exe）も
+#   同じ梱包・配信で R2 の版付き不変キーへ置く（scripts/velopack/pack-windows.ps1 が取り出し、publish-r2.ps1 が置く）。
 # - 本人が事前に用意するもの（リポジトリの設定。値はここに書かない）:
 #     Environment `r2-release`（release/* のみ）に Secrets: R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY /
 #       SIGILUNE_EMAIL / SIGILUNE_TOTP_URI、Variables: CLOUDFLARE_ACCOUNT_ID。
 #     署名の Secrets を配信の Secrets から分けたい場合は、署名用の Environment を別に作り、ジョブを分けて
 #     成果物を受け渡す形に変える（その場合は upload-artifact 相当の受け渡し方法を決める必要がある）。
 on:
+  push:
+    branches:
+      - 'release/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-velopack
-  cancel-in-progress: false
-
 jobs:
+  gate:
+    name: gate
+    if: github.repository == '1llum1n4t1s/remnifold' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    # ci.yml の native-package（90 分）と publish-r2（30 分）が直列に終わるまで待てる長さ。待機の上限
+    # （GATE_TIMEOUT_SECONDS の既定 140 分）より長くする。
+    timeout-minutes: 150
+    permissions:
+      actions: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out exact source commit without executable Actions
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\r\n')"
+          printf '::add-mask::%s\n' "$authorization"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Wait for the same commit's CI to succeed and publish to R2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/velopack/wait-ci-publication.sh
+
   windows-installer:
     name: windows-installer
-    if: github.repository == '1llum1n4t1s/remnifold' && github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/release/')
+    needs: gate
+    if: github.repository == '1llum1n4t1s/remnifold' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/release/')
+    # 配信は 1 本ずつ。gate の待機中に枠を占有しないよう、concurrency はこのジョブにだけ掛ける。
+    concurrency:
+      group: release-velopack
+      cancel-in-progress: false
     runs-on: windows-latest
     environment: r2-release
     timeout-minutes: 60
@@ -138,5 +186,11 @@ jobs:
           $signature = Get-AuthenticodeSignature -LiteralPath $setup
           if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notlike 'CN=Open Source Developer Yuichiro Shinozaki*' -or !$signature.TimeStamperCertificate) { throw 'Setup signature verification failed.' }
           "SHA256 $((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash)"
+          # bootstrap（署名済みの remnifold.exe）も、置く前に同じ署名検査を通す。ちょうど 1 つだけあること。
+          $bootstraps = @(Get-ChildItem -LiteralPath (Join-Path $env:WORK_DIR 'packages') -Filter 'remnifold-bootstrap-*-x86_64-pc-windows-msvc.exe' -File)
+          if ($bootstraps.Count -ne 1) { throw 'Expected exactly one bootstrap executable.' }
+          $bootstrapSignature = Get-AuthenticodeSignature -LiteralPath $bootstraps[0].FullName
+          if ($bootstrapSignature.Status -ne 'Valid' -or $bootstrapSignature.SignerCertificate.Subject -notlike 'CN=Open Source Developer Yuichiro Shinozaki*' -or !$bootstrapSignature.TimeStamperCertificate) { throw 'Bootstrap signature verification failed.' }
+          "Bootstrap SHA256 $((Get-FileHash -LiteralPath $bootstraps[0].FullName -Algorithm SHA256).Hash)"
           # 版付きの成果物は新規作成のみ（上書きしない）。releases.win.json は最後に置く。
           & ./scripts/velopack/publish-r2.ps1 -PackagesDirectory (Join-Path $env:WORK_DIR 'packages') -Channel win

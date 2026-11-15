@@ -9,12 +9,15 @@
 # - 厳格な install 用の releases/<version>/index.json とは別の `velopack/` 階層へ置く。既存のオブジェクトには触れない。
 # - 版付きの成果物（*.nupkg、版番号を含む名前）は「新規作成のみ」で配信し、既存オブジェクトを上書きしない。
 #   同じ名前が既にあれば内容のハッシュを照合し、一致しなければ失敗する。
+# - strict 初回導入用の署名済み bootstrap（remnifold-bootstrap-<版>-x86_64-pc-windows-msvc.exe）も packages\ にあれば、
+#   版付きの不変キーとして同じ規則（新規作成のみ・ハッシュ照合）で置く。
+# - 公開中の releases.<channel>.json の最大版より低い版は配信前に拒否する（-AllowOlderVersion でだけ許す）。
 # - 固定名（<packId>-<channel>-Setup.exe、releases.<channel>.json、assets.<channel>.json、RELEASES*）は最新を指すため
 #   置き換える。クライアントから未配信の nupkg が見える時間を作らないよう、manifest は最後に置く。
 # - 認証: CI（Environment r2-release）は R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY と
 #   CLOUDFLARE_ACCOUNT_ID（既存の publisher と同じ権限境界）。手元は CLOUDFLARE_API_TOKEN、
 #   無ければ D:\Dev\Secret\secrets.json の cloudflare.api_token。値はログへ出さない。
-# - 実行は本人の明示の依頼があるときだけ。-DryRun は置く予定のファイルと分類を表示するだけ。
+# - 実行は本人の明示の依頼があるときだけ。-DryRun は置く予定のファイルと分類を表示するだけ（公開中フィードの読み取りと巻き戻しの検査だけは行う。書き込みはしない）。
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -22,6 +25,8 @@ param(
     # releases.<channel>.json の <channel>（win / osx / linux-x64 / linux-arm64 など）。
     [string] $Channel = 'win',
     [string] $PackId = 'RemnifoldApp',
+    # 公開中のフィードより低い版の配信（巻き戻し）を明示的に許す。通常は使わない。
+    [switch] $AllowOlderVersion,
     [switch] $DryRun
 )
 
@@ -55,6 +60,41 @@ function Test-Immutable([IO.FileInfo]$File) {
     return $File.Extension -eq '.nupkg' -or $File.Name -match '\d+\.\d+\.\d+'
 }
 $ordered = @($files | Sort-Object @{ Expression = { Get-Order $_ } }, Name)
+
+# フィード（releases.<channel>.json）に載る $PackId の最大版を返す。無ければ $null。
+function Get-FeedMaxVersion($Feed) {
+    $versions = @($Feed.Assets | Where-Object { $_.PackageId -eq $PackId -and $_.Version } |
+        ForEach-Object { [System.Management.Automation.SemanticVersion]::Parse([string] $_.Version) })
+    if ($versions.Count -eq 0) { return $null }
+    return ($versions | Sort-Object | Select-Object -Last 1)
+}
+# 公開中のフィードより低い版の配信は、既存の利用者の更新を巻き戻せないうえフィードの整合も崩すため、配信前に拒否する
+# （-AllowOlderVersion でだけ許す）。フィードがまだ無い初回（HTTP 404）は通す。それ以外の取得失敗は、
+# 巻き戻しの有無を確かめられないので失敗にする（-DryRun だけは、オフラインでも計画を表示できるよう警告に留める）。
+function Assert-NotOlderThanPublished {
+    $local = Get-FeedMaxVersion (Get-Content -LiteralPath (Join-Path $packagesRoot.FullName "releases.$Channel.json") -Raw | ConvertFrom-Json)
+    if ($null -eq $local) { throw "releases.$Channel.json has no $PackId asset." }
+    $uri = "$BaseUrl/releases.$Channel.json"
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Headers @{ 'Cache-Control' = 'no-cache' } -SkipHttpErrorCheck -TimeoutSec 60
+    } catch {
+        if ($DryRun) { Write-Warning "Could not read the published feed; skipping the rollback check: $($_.Exception.Message)"; return }
+        throw "Could not read the published feed to check for a rollback: $($_.Exception.Message)"
+    }
+    if ($response.StatusCode -eq 404) { Write-Host "No published $Channel feed yet; first publication."; return }
+    if ($response.StatusCode -ne 200) {
+        if ($DryRun) { Write-Warning "Published feed returned HTTP $($response.StatusCode); skipping the rollback check."; return }
+        throw "Published feed returned HTTP $($response.StatusCode); cannot check for a rollback."
+    }
+    $published = Get-FeedMaxVersion ($response.Content | ConvertFrom-Json)
+    if ($null -ne $published -and $local -lt $published) {
+        if ($AllowOlderVersion) { Write-Warning "Publishing $local although $published is already published (-AllowOlderVersion)."; return }
+        throw "Refusing to publish ${local}: the published $Channel feed is already at ${published}. Use -AllowOlderVersion only for an intentional rollback."
+    }
+    Write-Host "Version check passed ($local, published: $(if ($null -eq $published) { 'none' } else { $published }))."
+}
+Assert-NotOlderThanPublished
+
 if ($DryRun) {
     foreach ($file in $ordered) {
         $kind = if (Test-Immutable $file) { 'immutable' } else { 'replace' }

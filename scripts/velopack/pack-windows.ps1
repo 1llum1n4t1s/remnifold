@@ -3,6 +3,9 @@
 # 出力（packages\）は自動更新の更新元として R2 へ置く一式（Setup・releases.win.json・full nupkg など）。
 # 配信は scripts/velopack/publish-r2.ps1 が行う。共通仕様は D:\Dev\APP-DISTRIBUTION.md。
 #
+# 出力には、nupkg 内の署名済み remnifold.exe を取り出した remnifold-bootstrap-<版>-x86_64-pc-windows-msvc.exe も含む
+# （strict 初回導入用。-Sign のときだけ署名・CN・タイムスタンプを検証し、SHA-256 を出力する）。
+#
 # -Sign は Sigilune（Certum SimplySign のクラウド鍵）で署名する。手元は `sigilune setup` で登録済みであること。
 # CI は .github/workflows/release-velopack.yml が Environment の Secrets を SIGILUNE_EMAIL / SIGILUNE_TOTP_URI で渡す。
 # アプリは適用前に、パッケージ内の remnifold.exe の署名者 CN を native/src/app_update/trust.rs の値と照合する。
@@ -129,6 +132,22 @@ try {
     }
     # 版付きの不変名の Setup も置く（固定名 Setup は最新版を指す URL として毎回置き換える）。
     Copy-Item -LiteralPath $setup -Destination (Join-Path $packages "$PackId-$PackVersion-win-Setup.exe")
+    # bootstrap（Setup を使わない strict な初回導入用）の実行ファイル。nupkg 内の lib/app/remnifold.exe は
+    # vpk が署名した後の実体なので、それをそのまま版付きの名前で取り出す。これは同じ remnifold.exe であり、
+    # `install` サブコマンドを持つ。Velopack の導入先以外では更新処理が何もしないため、単体で起動して使える。
+    # 版付きの不変キーで R2 へ置く（publish-r2.ps1 が packages 直下の全ファイルを新規作成のみで置く）。
+    # 署名の検証は -Sign のときだけ行う（検証用の未署名パッケージでも、ファイルが生成されることは確かめられる）。
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $bootstrap = Join-Path $packages "remnifold-bootstrap-$PackVersion-x86_64-pc-windows-msvc.exe"
+    $bootstrapArchive = [IO.Compression.ZipFile]::OpenRead((Join-Path $packages "$PackId-$PackVersion-full.nupkg"))
+    try {
+        $bootstrapEntries = @($bootstrapArchive.Entries | Where-Object { $_.FullName -ieq 'lib/app/remnifold.exe' })
+        if ($bootstrapEntries.Count -ne 1) { throw 'The full nupkg must contain exactly one lib/app/remnifold.exe.' }
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($bootstrapEntries[0], $bootstrap)
+    } finally {
+        $bootstrapArchive.Dispose()
+    }
+    if (!(Test-Path -LiteralPath $bootstrap -PathType Leaf)) { throw 'Bootstrap executable was not generated.' }
     if ($Sign) {
         $signature = Get-AuthenticodeSignature -LiteralPath $setup
         if ($signature.Status -ne 'Valid' -or
@@ -136,6 +155,15 @@ try {
             !$signature.TimeStamperCertificate) {
             throw 'Setup failed Authenticode verification (signer and timestamp).'
         }
+        # 利用者は取得後に同じ検査（Status=Valid・署名者 CN・タイムスタンプ）を手元で行ってから実行する。
+        # 検査を通らない bootstrap は配信しない。
+        $bootstrapSignature = Get-AuthenticodeSignature -LiteralPath $bootstrap
+        if ($bootstrapSignature.Status -ne 'Valid' -or
+            $bootstrapSignature.SignerCertificate.Subject -notlike "CN=$signerCommonName*" -or
+            !$bootstrapSignature.TimeStamperCertificate) {
+            throw 'Bootstrap executable failed Authenticode verification (signer and timestamp).'
+        }
+        Write-Host "Bootstrap SHA256 $((Get-FileHash -LiteralPath $bootstrap -Algorithm SHA256).Hash)"
         # アプリ（native/src/app_update/trust.rs）は適用前に、nupkg 内の全ての PE（.exe・.dll）の署名者を同じ CN で
         # 照合し、主実行ファイルと更新器（Squirrel.exe）がちょうど1つずつあることも要求する。
         # 配信前に同じ検査を通し、ここで通らない一式は配信しない（配信すると、全利用者の更新が適用前に拒否される）。
