@@ -1,0 +1,236 @@
+[English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (Brasil)](README.pt-BR.md)
+
+# Remnifold
+
+Un servidor de memoria autoalojado en Cloudflare, con acceso MCP remoto y una aplicación local independiente, para recuperar un historial de implementación útil entre carpetas de proyecto en Claude Code y Codex.
+
+La aplicación guarda el trabajo terminado en una colección compartida y conserva la carpeta del proyecto como procedencia. Puedes explorar los registros por temas de contenido, o preguntar por un tema como “extensión de Chrome”: la recuperación busca en todos los espacios de memoria con una sola solicitud al servidor, inyecta índices concisos y deja que el asistente abra un registro de origen aplicable mediante MCP antes de reutilizar la implementación.
+
+## Requisitos
+
+Los clientes MCP remotos se conectan al servidor desplegado sin instalar nada en local. La aplicación local es un único ejecutable nativo para tu sistema operativo y tu CPU; su servidor MCP, los hooks, la configuración de la conexión, la importación del historial y el instalador no necesitan Node.js, Codex ni el sistema de plugins de Claude Code. Los usuarios habituales la instalan con el instalador Setup, que no requiere línea de comandos y se mantiene actualizado por sí solo. La vía estricta `remnifold install`, para usuarios avanzados, requiere la CLI nativa de GitHub autenticada. Para registrarla en Claude Code se usa la CLI de Claude Code si está disponible; si no, se imprime el comando exacto que debes ejecutar.
+
+La configuración y el mantenimiento del servidor usan el mismo ejecutable nativo y tu propia cuenta de Cloudflare con Workers, D1, Vectorize y Workers AI habilitados. Para usar el paquete de la plataforma no hace falta instalar Node.js, un gestor de paquetes, Wrangler ni Rust.
+
+## Conectar un cliente MCP remoto
+
+Una vez que el servidor se haya actualizado y verificado según se explica más abajo, usa `https://your-worker.example.workers.dev/mcp` como punto de conexión MCP Streamable HTTP. Un cliente compatible puede autenticarse con el descubrimiento de OAuth 2.1, el registro dinámico público de clientes y PKCE S256. En la página de autorización del servidor, introduce la clave de API de memoria existente y aprueba el cliente indicado. Si la página de finalización no vuelve al cliente automáticamente, sigue su enlace para continuar. Los tokens OAuth solo son válidos para MCP; los clientes REST existentes siguen usando la clave de API. Los clientes que admiten una credencial Bearer configurada también pueden usar directamente la clave de API de memoria. Mantén las claves y los tokens en privado.
+
+[Connect apps de Grok Bot](https://docs.x.ai/grok-bot/overview) y los [conectores de Grok](https://docs.x.ai/grok/connectors) ofrecen vías de conexión para aplicaciones y servidores MCP personalizados. Elige OAuth cuando el cliente lo admita; no se ha verificado que Grok Bot permita introducir manualmente una clave Bearer.
+
+Para ChatGPT, sigue la [configuración de plugins privados](https://developers.openai.com/plugins/build/plugins): elige **+ Add custom MCP server**, introduce la URL `/mcp` y la autenticación, y luego elige **Create as a plugin**. Esta conexión privada no requiere enviarla al directorio público. [ChatGPT dots](https://learn.chatgpt.com/docs/dots/computers-and-apps) usa los plugins compatibles que estén instalados y habilitados; comprueba en tu cuenta que este plugin aparece y funciona en dots. No se ha verificado que dots permita introducir directamente una URL MCP arbitraria.
+
+El servidor pide a la IA que busque contexto relevante, abra los registros completos cuando haga falta y guarde los resultados duraderos. El cliente y el modelo deciden cuándo usar las herramientas, por lo que no se garantizan las búsquedas ni los guardados automáticos. Pide a la IA que busque o guarde de forma explícita cuando lo necesites. Esta integración remota no sustituye al servidor stdio local ni a los hooks; evita registrar un servidor remoto duplicado en el mismo cliente.
+
+## Instalar la aplicación local
+
+### Instalador Setup (recomendado)
+
+En Windows x64, descarga [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe) (firmado por el editor, sin derechos de administrador) y ejecútalo. Los paquetes Setup de macOS y Linux que se describen a continuación todavía no están publicados; en esas plataformas, usa por ahora la instalación estricta de más abajo. Setup instala la aplicación para tu usuario en `%LOCALAPPDATA%\RemnifoldApp`, la registra en Claude Code y Codex (solo en aquellos cuya herramienta de línea de comandos se encuentre) y abre en el terminal una guía de primer uso que explica el siguiente paso: conectar tu servidor (`remnifold setup`). Sus comprobaciones no necesitan una cuenta de GitHub. En macOS (Apple Silicon), abre `RemnifoldApp-osx-Setup.pkg` (firmado y notarizado con el Developer ID del editor). Instala `Remnifold.app` (si eliges "Install for me only", se coloca en `~/Applications`; una instalación para todos los usuarios va a `/Applications`, donde aplicar una actualización puede pedir la contraseña de administrador) y arranca la aplicación una vez, lo que la registra en Claude Code y Codex. Si la herramienta de línea de comandos de un cliente se instala más tarde, el siguiente inicio de Remnifold la registra. Ejecuta `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>` (ajusta la ruta si usas `~/Applications`) para conectar tu servidor. En Linux (x64 o ARM64), el Setup es un único AppImage (`RemnifoldApp-linux-x64.AppImage` o `RemnifoldApp-linux-arm64.AppImage`): colócalo donde quieras conservarlo (por ejemplo `~/Applications`), hazlo ejecutable y ejecútalo una vez sin argumentos, lo que registra ese AppImage en Claude Code y Codex; si más tarde mueves el archivo, la nueva ubicación se registra en su siguiente inicio. Ejecuta `<path-to-AppImage> setup --base-url <URL>` para conectar tu servidor. Los AppImage no llevan firma de código, así que en Linux la aplicación se fía del HTTPS del sitio de actualizaciones y de las sumas de comprobación del feed de actualizaciones.
+
+Las actualizaciones son automáticas. Mientras se ejecuta una sesión MCP, la aplicación consulta el feed de actualizaciones como máximo una vez al día (una comprobación fallida también espera un día) y descarga en segundo plano una versión más reciente sin interrumpir nada. La nueva versión se aplica en tu siguiente inicio de sesión (Windows: una entrada `Run`; macOS: el LaunchAgent `~/Library/LaunchAgents/com.kagayoi.RemnifoldApp.update.plist`; Linux: la entrada de autoarranque `~/.config/autostart/com.kagayoi.RemnifoldApp.update.desktop`), y solo cuando no se está ejecutando ningún otro proceso de Remnifold, de modo que una sesión abierta nunca se cierra. Antes de aplicarla, la aplicación verifica que todos los ejecutables del paquete descargado estén firmados por el editor (macOS: el Developer ID del editor; Linux: sin firma, pero la carpeta de descarga `/var/tmp/velopack/RemnifoldApp` debe pertenecerte y no ser escribible por otros usuarios). Para desactivarlo, establece `"auto_update": false` en `app-update.json`, dentro de la carpeta de estado de la aplicación (`%APPDATA%\Remnifold`, `~/Library/Application Support/Remnifold`, `$XDG_STATE_HOME/remnifold` (por defecto `~/.local/state/remnifold`) en Linux, o `<REMNIFOLD_HOME>/remnifold`); los diagnósticos se escriben en `app-update.log`, junto a él. Si ya usas la instalación estricta descrita más abajo, Setup cambia los registros de Claude Code y Codex para que apunten a sí mismo y usa la misma conexión y el mismo estado de memoria; los archivos de la instalación estricta se conservan, así que elimina tú mismo `%LOCALAPPDATA%\Programs\Remnifold` cuando ya no lo necesites. Si un registro no pudo completarse durante Setup (por ejemplo, por una CLI de cliente lenta), se reintenta automáticamente en tu siguiente inicio de sesión. Desinstala desde la Configuración de Windows; con ello se eliminan los registros de Claude Code y Codex y la entrada de inicio de sesión, mientras que tu conexión y tu estado de memoria se conservan. Para volver después a la instalación estricta, regístrala de nuevo con sus propios `connect claude-code --apply` y `connect codex --apply`. Para quitar los registros sin desinstalar, ejecuta `remnifold connect claude-code --remove --apply` y `remnifold connect codex --remove --apply`.
+
+macOS no tiene desinstalador. Antes de mover `Remnifold.app` a la Papelera, elimina sus registros y su entrada de inicio de sesión (sin `--apply`, el comando solo muestra lo que eliminaría):
+
+```sh
+"/Applications/Remnifold.app/Contents/MacOS/remnifold" uninstall-setup --apply
+```
+
+Tu conexión, configuración y estado de memoria en `~/Library/Application Support/Remnifold` se conservan; la caché de actualizaciones descargadas es `~/Library/Caches/velopack/RemnifoldApp`.
+
+Linux tampoco tiene desinstalador. Antes de borrar el AppImage, ejecútalo del mismo modo (ajusta la ruta a donde lo guardes):
+
+```sh
+~/Applications/RemnifoldApp-linux-x64.AppImage uninstall-setup --apply
+```
+
+Tu conexión, configuración y estado de memoria en `~/.config/remnifold` y `~/.local/state/remnifold` se conservan; la caché de actualizaciones descargadas `/var/tmp/velopack/RemnifoldApp` se puede borrar.
+
+### Instalación estricta (avanzada)
+
+Los paquetes nativos publicados se sirven desde [Remnifold updates](https://remnifold-updates.kagayoi.com). El índice de versiones es `releases/<version>/index.json`; su manifiesto selecciona un archivo comprimido con nombre basado en su hash para cada destino de la tabla siguiente. Autentica la publicación a través de GitHub antes de ejecutar un ejecutable descargado; ni una URL de R2 ni un enlace de estado de un commit bastan por sí solos para establecer su origen.
+
+| Plataforma | Destino de Rust |
+| --- | --- |
+| Windows x64 | `x86_64-pc-windows-msvc` |
+| Mac Apple Silicon | `aarch64-apple-darwin` |
+| Linux x64 | `x86_64-unknown-linux-gnu` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` |
+
+Mac Intel no es compatible.
+
+La aplicación se instala por usuario, sin derechos de administrador:
+
+| Plataforma | Carpeta de la aplicación | Ejecutable fijo |
+| --- | --- | --- |
+| Windows | `%LOCALAPPDATA%\Programs\Remnifold` | `bin\remnifold.exe` |
+| macOS | `~/Library/Application Support/Remnifold/app` | `bin/remnifold` |
+| Linux | `$XDG_DATA_HOME/remnifold` (por defecto `~/.local/share/remnifold`) | `bin/remnifold` |
+
+`remnifold install` verifica el commit de la versión, el registro correcto del publicador en CI, el manifiesto de R2, el tamaño y el resumen (digest) del archivo comprimido y el origen del paquete antes de escribir nada. Desempaqueta cada versión una sola vez en `versions/<version>` (una versión instalada nunca se sobrescribe con bytes distintos), conserva un recibo en `receipts/` para una verificación posterior sin conexión y reemplaza el ejecutable fijo. Los registros apuntan siempre al ejecutable fijo, así que las actualizaciones no requieren volver a registrar. En Windows, un servidor MCP en ejecución conserva el ejecutable antiguo hasta que se reinicia; entonces el resultado indica `"restartRequired": true`.
+
+### Primera instalación
+
+En Windows, obtén el primer ejecutable de la GitHub Release inmutable usando la CLI nativa de GitHub 2.93.0 o posterior, con compatibilidad con `release verify` y `release verify-asset`. Comprueba primero `gh --version`; las versiones anteriores están afectadas por [CVE-2026-48501](https://github.com/advisories/GHSA-8xvp-7hj6-mcj9). Elige un directorio privado de confianza ya existente, donde otro usuario no pueda reemplazar el archivo descargado entre la verificación y la ejecución. Sustituye la versión y la ruta entre comillas de abajo y ejecuta desde Git Bash:
+
+```sh
+version='<published-version>'
+tag="v$version"
+repo=github.com/1llum1n4t1s/remnifold
+bootstrap='/absolute/trusted/private/path/remnifold-bootstrap.exe'
+gh release verify "$tag" --repo "$repo" &&
+gh release download "$tag" --repo "$repo" --pattern remnifold-bootstrap-x86_64-pc-windows-msvc.exe --output "$bootstrap" &&
+gh release verify-asset "$tag" "$bootstrap" --repo "$repo" &&
+"$bootstrap" install --version "$version" --apply
+```
+
+Tanto la versión como el recurso local deben superar la verificación de firma de GitHub antes de la ejecución. No sustituyas esto por un ayudante de R2 sin verificar ni omitas una verificación fallida.
+
+En macOS y Linux, obtén y revisa el [bootstrap en Bash](scripts/bootstrap-plugin.sh) de origen de confianza, guardándolo fuera del directorio de trabajo. Requiere la CLI nativa de GitHub, curl, tar y `sha256sum` o `shasum`:
+
+```sh
+bash ./bootstrap-plugin.sh --version '<published-version>' --apply
+```
+
+Sin `--apply` solo verifica la publicación; `--download-only` devuelve el archivo comprimido verificado sin ejecutarlo.
+
+### Actualizar, verificar y registrar
+
+```sh
+remnifold install --version <published-version>                 # solo verificar la publicación
+remnifold install --version <published-version> --apply         # instalar o actualizar
+remnifold install --version <published-version> --verify-only   # volver a comprobar sin conexión la versión instalada
+remnifold connect claude-code                                    # mostrar el registro previsto
+remnifold connect claude-code --apply                            # registrar el servidor MCP y los hooks
+remnifold connect claude-code --remove --apply                   # eliminar solo la entrada MCP y los hooks de Remnifold
+```
+
+Usa el ejecutable fijo de la carpeta de la aplicación (o añade su carpeta `bin` al `PATH`). `install` usa una carpeta de trabajo en `%LOCALAPPDATA%\remnifold` en Windows y en `~/.cache/remnifold` en los demás sistemas; `--work-root <absolute-path>` selecciona otra carpeta fuera de las carpetas de la aplicación, de configuración y del repositorio. Cuando caducan los registros de testigos, las instalaciones nuevas fallan de forma segura (fail closed); el recibo conservado sigue permitiendo `--verify-only`. Sigue siendo necesario el acceso de GitHub a los metadatos de origen de la versión.
+
+`connect claude-code --apply` registra el servidor MCP con `claude mcp add --scope user remnifold -- <fixed executable> mcp` (o imprime ese comando cuando la CLI de Claude Code no está en el `PATH`; pasa `--cli <path>` para elegirla) y fusiona los hooks `SessionStart`, `UserPromptSubmit`, `Stop` asíncrono y `PreToolUse` en el `settings.json` de Claude Code (`$CLAUDE_CONFIG_DIR` o `~/.claude`). Solo se reemplazan las entradas de hook de Remnifold ya existentes; el primer cambio conserva `settings.json.remnifold-backup`. Un archivo de configuración mal formado se deja sin cambios. `connect <tool> --remove` (primero una vista previa; `--apply` escribe) elimina únicamente la entrada MCP y los hooks propios de Remnifold, conserva todos los demás ajustes y, con `--executable <path>`, solo las entradas que apuntan a ese ejecutable. `connect codex --apply` registra el servidor MCP con `codex mcp add`; Codex no ofrece una forma compatible de registrar hooks fuera de los plugins, por lo que la recuperación y la captura automáticas funcionan a través de Claude Code. Inicia una sesión nueva después de registrar.
+
+La captura de `Stop` lee tanto las transcripciones de Claude Code como los rollouts de Codex. Almacena únicamente cada solicitud humana y el texto final del asistente, omitiendo el razonamiento (thinking), las llamadas a herramientas y sus resultados, las copias de solicitudes y las filas de otras sesiones. Una respuesta posterior a una notificación en segundo plano se almacena como un turno de continuación separado, de modo que los turnos ya guardados conservan sus claves de captura. Los registros de Claude Code llevan `sm_source: "claude-code"`. Para evitar dos sistemas de memoria, desactiva la memoria automática integrada de Claude Code con `"autoMemoryEnabled": false`; Remnifold no lee ni importa esos archivos. Dentro de este repositorio, el `.mcp.json` del código fuente (`cargo run`) tiene prioridad sobre el registro del usuario; añade `"disabledMcpjsonServers": ["remnifold"]` al `.claude/settings.local.json` sin versionar para usar en su lugar la aplicación instalada.
+
+Los antiguos comandos del plugin de Codex `plugin-update` y `plugin-bootstrap` se retiraron; devuelven `USE_REMNIFOLD_INSTALL`. Instala en su lugar la aplicación independiente; después se puede eliminar el plugin antiguo de Codex.
+
+### Conectar con tu servidor
+
+```sh
+remnifold setup --base-url https://your-worker.example.workers.dev
+```
+
+Introduce la clave de API en el aviso oculto si todavía no se ha proporcionado. Setup verifica una sesión autenticada antes de escribir la conexión. Para actualizar una conexión existente, usa `--force`; los ajustes no relacionados se conservan. `REMNIFOLD_API_URL` y `REMNIFOLD_API_KEY` pueden proporcionar sobrescrituras a nivel de proceso. Para una configuración no interactiva, `--api-key-stdin` lee la clave de la entrada estándar.
+
+La conexión y el estado local residen en la carpeta de configuración propia de la aplicación, independiente de Codex y Claude Code:
+
+| Plataforma | Conexión (`remnifold.json`) y estado del servidor | Estado de captura y recuperación |
+| --- | --- | --- |
+| Windows | `%APPDATA%\Remnifold` | la misma carpeta |
+| macOS | `~/Library/Application Support/Remnifold` | la misma carpeta |
+| Linux | `$XDG_CONFIG_HOME/remnifold` (por defecto `~/.config/remnifold`) | `$XDG_STATE_HOME/remnifold` (por defecto `~/.local/state/remnifold`) |
+
+`REMNIFOLD_HOME` sobrescribe ambas (conexión en `<REMNIFOLD_HOME>/remnifold.json`, estado en `<REMNIFOLD_HOME>/remnifold/`, aplicación en `<REMNIFOLD_HOME>/app`); `setup --config-dir <directory>` escribe la conexión en otro lugar. Las versiones anteriores guardaban estos archivos en el directorio principal de Codex (`CODEX_HOME`, por defecto `~/.codex`). Cuando la carpeta nueva no tiene conexión, la primera ejecución copia allí una conexión heredada válida y lee el estado de captura y recuperación anterior, escribiendo el estado nuevo solo en la carpeta nueva. Los archivos heredados nunca se borran; `server-setup` mueve su estado heredado solo con `--apply`.
+
+Ejecuta la herramienta MCP `whoAmI` para verificar la conectividad y el descubrimiento de espacios.
+
+Para importar sesiones de Codex existentes, obtén una vista previa de un lote acotado con `remnifold import --limit 10`. Añade `--apply` cuando quieras subir los registros depurados. La vista previa no escribe memorias remotas; las importaciones repetidas reutilizan identidades de captura deterministas. `--codex-home` selecciona desde dónde se leen las sesiones de Codex.
+
+La publicación de la versión bootstrap es un procedimiento de mantenedores, documentado en [AGENTS.md](AGENTS.md#bootstrap-release-publication).
+
+## Crear o actualizar un servidor
+
+El paquete incluye el bundle del Worker y las migraciones. Proporciona un token de API de Cloudflare mediante la variable de entorno del proceso `CLOUDFLARE_API_TOKEN` o `--token-stdin`, y luego obtén una vista previa de los recursos existentes:
+
+```sh
+remnifold server-setup --account-id <Cloudflare-account-id>
+```
+
+Por defecto, el descubrimiento es autenticado y de solo lectura. El token necesita permisos de lectura de la cuenta, de scripts de Workers, de D1 y de Vectorize; los cambios de dominio o de rutas requieren además los permisos correspondientes de Zone, Routes o Custom Domain. Setup no importa las credenciales OAuth de Wrangler. Mantén en privado el token y la clave de API de memoria.
+
+Para una instalación existente, pasa `--config <absolute-existing-jsonc-path>` para leer su configuración sin sobrescribirla. Setup reutiliza los nombres de recursos en este orden: `remnifold`, `kagayoi-memory` y luego `cloudflare-supermemory`; los `--worker-name`, `--database-name` y `--vector-index-name` explícitos tienen prioridad. Comprueba que el plan selecciona el Worker, la base de datos D1 y el índice de Vectorize existentes. Los ID configurados y las dimensiones y la métrica de los vectores deben coincidir. Se conservan los bindings, las programaciones cron y las rutas existentes; los conflictos detienen la configuración. No crees un servidor de reemplazo ni copies memorias para esta actualización.
+
+Cuando quieras aprovisionar o desplegar, proporciona la clave de memoria elegida mediante `REMNIFOLD_API_KEY` y aplica el plan:
+
+```sh
+remnifold server-setup --account-id <Cloudflare-account-id> --apply --location apac
+```
+
+Usa la misma configuración y los mismos nombres que en la vista previa. `--apply` crea los recursos que faltan, instala la clave proporcionada como secreto del Worker, aplica las migraciones aditivas de D1, despliega el Worker incorporado y comprueba el endpoint. Para un servidor existente, proporciona su clave actual para evitar reemplazarla sin querer. Si no se proporciona una clave, Setup conserva el secreto e informa de que la verificación autenticada se omitió; el estado de salud por sí solo no verifica la migración ni el acceso MCP. Una clave proporcionada habilita la verificación de sesión, la inicialización de MCP remoto y el descubrimiento de `search_memory`, `getDocument` y `add_memory`.
+
+Aplica la actualización del servidor y las migraciones antes de conectar o actualizar los clientes. Setup guarda la configuración reanudable fuera del repositorio, en la carpeta de configuración de la aplicación, como `server/config.json` (consulta [Conectar con tu servidor](#conectar-con-tu-servidor)); `--state <absolute-json-path>` selecciona otra ubicación externa. Conserva este estado para las actualizaciones, no incluyas nunca en un commit los ID generados ni las credenciales, y vuelve a ejecutar el mismo comando tras corregir un paso fallido. Usa `--base-url` para un endpoint personalizado existente y `--help` para ver todas las opciones. El uso de Cloudflare se factura a la cuenta que aloja el servidor.
+
+Para la versión 1.0.22, actualiza el servidor con el `server-setup --apply` de esa versión antes de actualizar los clientes. La migración `0013_memory_created_index.sql` añade un índice para la organización por rangos de días; no cambia ningún registro ni ID almacenado.
+
+Para la versión 1.0.21, actualiza el servidor con el `server-setup --apply` de esa versión antes de actualizar los clientes. Las migraciones `0010_capture_variants.sql`, `0011_consolidation_recall_opt_out.sql` y `0012_organization_retry_fairness.sql` añaden variantes de captura verificadas, invalidan los puntos de control históricos que contienen orígenes excluidos de la recuperación y reducen a una hora los futuros aplazamientos heredados. Los registros originales y sus ID se conservan; los puntos de control afectados pueden regenerarse a partir de los orígenes elegibles.
+
+## Comportamiento de la memoria
+
+- Las solicitudes de usuario completadas y las respuestas finales se guardan en la colección compartida `memories`, con la procedencia de la carpeta de origen. Las definiciones de skills adjuntas y los sobres de estado de navegador/página se omiten del texto de solicitud guardado; las respuestas finales se conservan. Una identidad de captura determinista hace que los reintentos reutilicen el mismo registro almacenado en lugar de crear duplicados.
+- Usa `listTopics` para encontrar categorías de contenido y luego pasa un `topic` a `listDocuments` o `listMemories`. Las listas incluyen registros tanto de los espacios de carpeta heredados como de la colección compartida. Usa `topic: "__unclassified__"` para ver los registros sin etiquetas de tema vigentes, incluidos aquellos cuya clasificación falló, está desactivada o se omitió deliberadamente.
+- El `add_memory` manual guarda en la colección compartida. Para olvidar un registro después de leerlo, llama a `add_memory` con `action: "forget"`, su `documentId` y el `containerTag` de origen; el contenido almacenado exacto sigue admitiéndose por compatibilidad. Con el plugin de Codex, un `sourceFolder` absoluto o una única raíz de espacio de trabajo proporcionada por el cliente MCP añade procedencia; la herramienta MCP remota acepta en cambio un `projectId` explícito. Un `containerTag` explícito sustituye al almacenamiento. El plugin nunca usa su carpeta de instalación como proyecto del usuario. `listSpaces` expone los espacios físicos por compatibilidad y diagnóstico.
+- La recuperación por prompt busca por tema en todos los espacios. Los seguimientos breves pueden recuperar un tema a partir de mensajes anteriores del usuario en la misma sesión, incluso antes de salidas grandes de herramientas. La recuperación del historial está acotada; sin un tema concreto, no se ejecuta ninguna búsqueda por tema. La recuperación automática selecciona la última revisión disponible de cada turno y parte capturados, mientras que la búsqueda manual conserva las revisiones históricas. La búsqueda global incluye espacios más allá del antiguo límite de descubrimiento; los servidores más antiguos usan una vía de compatibilidad limitada a 100 espacios e informan cuando el descubrimiento está incompleto. Las búsquedas parciales informan de los espacios e índices de documentos no disponibles y conservan los resultados correctos. El evento inicial de la sesión solo restablece el estado de recuperación. Cada prompt ordinario no vacío muestra además hasta dos tareas completadas recientes de distintos proyectos, con independencia de la coincidencia de temas, con el proyecto de origen, la fecha y el ID del documento. Se excluyen la tarea actual y los registros de tareas duplicados. Estos resúmenes se etiquetan por separado para que puedan sugerir trabajo previo sin implicar relevancia. Establece `maxRecentTasks` en `remnifold.json` como un entero de 0 a 3; 0 desactiva este contexto de trabajo reciente. Los servidores más antiguos sin este modo de listado siguen ofreciendo la recuperación por tema.
+- Las búsquedas manuales también coinciden con el nombre de proyecto almacenado. Las búsquedas solo por nombre de proyecto prefieren los proyectos de origen coincidentes y los registros de origen más recientes; las búsquedas combinadas de proyecto y tema siguen priorizando la cobertura del tema.
+- El contexto automático contiene un título, una descripción, nombres de secciones, marcas de tiempo e ID de documentos. Un breve pasaje original coincidente puede mostrar detalles ausentes del índice; sigue siendo texto de origen histórico que debe verificarse antes de reutilizarlo. Codex abre los registros completos con `getDocument` cuando hace falta.
+- La redacción fija del bloque `<remnifold-index>` inyectado, de los resultados de búsqueda y de los avisos de recuperación sigue el idioma del entorno que los escribe: `REMNIFOLD_LANGUAGE`, luego `LC_ALL`, `LC_MESSAGES` y `LANG`, y después el idioma de pantalla del sistema operativo (idioma de la interfaz de usuario de Windows, `AppleLanguages` de macOS). Los entornos en japonés reciben la redacción en japonés y todos los demás, en inglés. Los títulos, las descripciones y los extractos almacenados se muestran tal como se guardaron, sin traducir.
+- La recuperación por tema devuelve por defecto como máximo tres registros. Establece `maxMemories` en `remnifold.json` como un entero de 1 a 5 para cambiar el límite de la recuperación automática y de la búsqueda manual; Setup conserva un valor existente al actualizar la conexión. El contexto automático también está limitado a 3000 unidades de código UTF-16, por lo que puede caber un número menor de registros.
+- El contexto automático rastrea las tareas recientes por separado de los índices de temas y omite las entradas sin cambios en prompts posteriores cuando hay información de sesión y de transcripción disponible. Los registros actualizados pueden volver a aparecer, y la compactación o el borrado del contexto restablece la supresión de duplicados. El estado local de recuperación permanece en `remnifold/recall-state/`, dentro del directorio principal de Codex seleccionado, sin copiar el texto de la conversación; si el estado no está disponible, la recuperación normal sigue habilitada. La coincidencia de consultas y los detalles del estado se describen en [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md#recall).
+- El servidor revisa los proyectos a diario a las 03:00 JST. Pide a Workers AI que cree un punto de control consolidado cuando un proyecto tiene al menos 20 registros sin consolidar, o cuando tiene registros sin consolidar y han pasado tres días desde el último punto de control correcto (antes del primer punto de control, desde el registro pendiente más antiguo). En la primera ejecución pendiente de un proyecto, el servidor drena automáticamente todo el trabajo atrasado existente en sucesivos lotes de IA acotados, de modo que los registros antiguos no requieren un comando manual de relleno. Los registros originales se conservan y se enlazan desde el punto de control. Los puntos de control anteriores quedan reemplazados, y modificar u olvidar un origen invalida el punto de control que dependía de él.
+- Usa la herramienta MCP `consolidate_memory` para avanzar un punto de control de proyecto en un lote de inmediato, sin esperar a la revisión diaria. El MCP remoto requiere `projectId`, el ID de procedencia almacenado. El plugin de Codex puede inferir el proyecto actual a partir de exactamente una raíz de espacio de trabajo, o aceptar `sourceFolder` o `projectId` de forma explícita. Cada llamada procesa como máximo 40 registros nuevos; repítela si queda un atraso mayor. La ejecución manual sigue requiriendo al menos un registro de origen sin consolidar.
+- La recuperación automática prefiere un punto de control vigente cuando la relevancia del tema es igual y evita repetir los originales cubiertos por un punto de control seleccionado. Los detalles específicos coincidentes que no figuran en el punto de control siguen mostrando sus originales. La búsqueda manual sigue mostrando los registros originales.
+- El contenido y los metadatos de un punto de control no se pueden editar directamente: las actualizaciones devuelven HTTP 409. Edita en su lugar los registros originales y regenera el punto de control. El reenriquecimiento y la eliminación siguen disponibles.
+- La captura redacta (oculta) la clave de API de memoria configurada y los patrones de secretos habituales, y reintenta los registros sin confirmar. El estado local de captura permanece en `capture-state/`, dentro de la carpeta de estado de la aplicación; los recibos de versiones anteriores en el directorio principal de Codex siguen siendo legibles.
+
+Los fallos de captura incluyen códigos fijos de `stage`, `cause` y `action` sin imprimir el texto de la excepción ni las credenciales. Un resultado con `action=repair-required`, como `stage=receipt; cause=invalid`, exige reparar el estado de captura local correspondiente; los reintentos por sí solos seguirán fallando. `action=retry-or-repair` conserva el comportamiento normal de reintento y permite investigar un problema persistente de conexión o de respuesta. Para comprobar por separado la accesibilidad de la API, ejecuta esto desde la carpeta del plugin extraído:
+
+```sh
+remnifold status
+```
+
+Los temas se derivan del contenido de los registros durante el paso de enriquecimiento ya existente con Workers AI. La clasificación es asíncrona. Los acuses de recibo breves sin un resultado sustancial y otros registros de poca información siguen disponibles para la búsqueda manual, pero se excluyen de la recuperación automática y del enriquecimiento; las etiquetas de tema explícitas se siguen conservando. Los nombres de carpeta se conservan como metadatos de origen. Los registros existentes mantienen sus ID de documento y ubicaciones de almacenamiento originales y aparecen en el mismo explorador de temas.
+
+Actualiza el servidor y aplica sus migraciones antes de instalar un cliente que use la exploración por temas o la consolidación. Para clasificar registros antiguos, obtén una vista previa de un lote acotado con el ejecutable de la plataforma, usando la conexión de memoria existente:
+
+```sh
+remnifold topics-setup --limit 10
+```
+
+El lote por defecto es 10; `--limit` acepta de 1 a 50. Añade `--apply` para poner en cola ese lote finito cuando se desee el enriquecimiento remoto. Esto usa la facturación existente de Workers AI, actualiza el enriquecimiento derivado de IA/vectores/hechos e invalida los puntos de control de proyecto afectados, preservando las exclusiones voluntarias (opt-outs) y las protecciones de revisión. El resultado informa de los trabajos aceptados, no de la clasificación completada. Espera a que termine el procesamiento antes de seleccionar el siguiente lote; inspecciona `getDocument` y `listTopics` para verificar el resultado.
+
+La clave de API da acceso a los registros de una instalación de servidor. Usa instalaciones separadas para límites de confianza separados. La redacción reduce la captura accidental de secretos; revisa lo que decides almacenar en tu propio backend.
+
+## Organización de la memoria
+
+Tras instalar la aplicación y aplicar las [migraciones actuales del servidor](#crear-o-actualizar-un-servidor), incluido el esquema de organización de `0009_memory_organization.sql` y el índice de organización por rangos de `0013_memory_created_index.sql`, organiza la memoria bajo demanda con la [skill organize-memory](skills/organize-memory/SKILL.md), por ejemplo `$organize-memory 7` o “organiza los últimos 7 días de memoria”. El número de días (1–3650) selecciona las memorias creadas en los últimos N días según la hora del servidor; la ejecución repite lotes hasta que ese rango no tiene trabajo pendiente o se alcanza un límite opcional de lotes (por defecto 3, como máximo 20). Sin un número de días, se toma un lote de la cola global. La organización ya no se registra como tarea programada de Codex; [setup-remnifold](skills/setup-remnifold/SKILL.md) solo pausa las tareas dejadas por versiones anteriores.
+
+Cada ejecución usa el ejecutable instalado en ese momento. Un lote procesa como máximo veinte registros de destino y 48 000 unidades de origen UTF-16, incluido el trabajo parcial o aplazado. No son recuentos de registros completados ni garantías del total de lectura o de tokens: los resúmenes candidatos y las lecturas de evidencia dirigidas son adicionales. La consulta (lookup) está limitada a dos llamadas por lote. El trabajo sin resolver se aplaza en lugar de ampliarse a una exploración masiva; una ejecución por rangos detenida por su límite simplemente puede volver a ejecutarse.
+
+Para el uso directo de la CLI, ejecuta el ejecutable instalado:
+
+```text
+remnifold memory-organize prepare [--days N]
+remnifold memory-organize lookup --line
+remnifold memory-organize commit --line
+remnifold memory-organize sources <summary-document-id> [cursor]
+```
+
+Estos comandos usan la conexión existente con la clave de API del propietario; las credenciales OAuth de MCP remoto no pueden autorizar la organización. No programan Codex ni despliegan ni migran un servidor. `prepare` crea una concesión (lease) de treinta minutos; `--days N` la limita a las memorias creadas en los últimos N días sin mover la cola de descubrimiento global; cada respuesta por rangos devuelve `range.cursor`/`range.exhausted`, y la siguiente llamada pasa un cursor no nulo como `--range-cursor <cursor>`; un servidor más antiguo lo rechaza en lugar de recurrir a otra vía. Devuelve ID, revisiones y fragmentos de origen, notas de continuación y resúmenes candidatos; no es una comprobación de conectividad de solo lectura. `lookup` lee `{"query":"a concise topic"}` de stdin. `commit` lee un objeto JSON que contiene `batchId`, `summaries` y `coverage`. Sigue los límites exactos de campos, las reglas de partición y el procedimiento de `groupProgress` multiparte de la skill de ejecución. Declara `complete` solo cuando todos los fragmentos y los temas importantes estén representados, conservando conclusiones, razones, evidencias e incertidumbre; usa la continuación parcial o el aplazamiento cuando eso no sea posible. Codex hace este juicio. Revisa el recibo del commit y distingue los resúmenes publicados del progreso sin terminar.
+
+Antes de `prepare`, establece una vía segura de stdin y una forma de conservar y paginar su respuesta completa; en Windows, sigue la prueba local de PTY sintético de la skill de ejecución antes de adquirir una concesión. Lee todos los fragmentos de origen, las notas de continuación y los resúmenes candidatos de la misma respuesta conservada. Una visualización truncada se recupera a partir de esa misma invocación, no preparando otro lote. Antes del commit, valida en memoria el JSON exacto: cada entrada de cobertura necesita su ID y revisión preparados y un arreglo `summaries` explícito, incluido `summaries:[]` para las entradas parciales o aplazadas. Sigue la [skill de ejecución](skills/organize-memory/SKILL.md#one-batch) para la paginación, la comprobación previa y la recuperación tras una ejecución interrumpida.
+
+El stdin JSON tiene un plazo de treinta segundos y un límite de 128 000 bytes UTF-8, incluido el escape. `--line` requiere una sola línea JSON compacta y su salto de línea final; sin él, cierra stdin tras el objeto. Usa un canal de entrada sin eco y mantén el texto generado fuera de los argumentos de shell y de los registros de comandos. Los servidores no compatibles se detienen de forma explícita, sin una alternativa de guardar/olvidar.
+
+Para la entrada por PTY en Windows, lanza el ejecutable nativo directamente en un PTY dedicado con `memory-organize lookup --line --private-stdin` o `memory-organize commit --line --private-stdin`. Espera a `REMNIFOLD_STDIN_READY` en stderr antes de enviar exactamente una línea JSON compacta y su salto de línea final, sin ningún byte posterior. Mantén la carga útil más el salto de línea en 127 000 bytes UTF-8 o menos, para dejar margen a las transformaciones del terminal. El modo privado desactiva el eco y la edición de línea, y restaura el modo original de la consola tras el terminador. Si falta la señal de disponibilidad o falla cualquier paso, deja de enviar entrada y cierra ese PTY; no lo reutilices ni restaures el eco mientras pueda quedar entrada pendiente. No uses una consola compartida ni un envoltorio de Git Bash. La stdin redirigida y los hosts que no son Windows rechazan `--private-stdin`; en macOS/Linux, usa un pipe sin eco con entrada por línea o por EOF. Consulta la [skill de ejecución](skills/organize-memory/SKILL.md#safe-stdin-and-failures) para el procedimiento de entrada completo.
+
+No se elimina ningún original. Los originales totalmente representados dejan de aparecer en la búsqueda normal y en la recuperación por tema solo mientras sus resúmenes sigan siendo válidos; los ID y los cuerpos de los originales siguen siendo recuperables directamente, y la conciencia de tareas recientes conserva su elegibilidad actual. Las capturas en conflicto permanecen visibles y aplazadas, salvo que el servidor verifique claves de captura v2 distintas de una sola parte y hashes exactos del cuerpo como evidencia independiente. Esa verificación no establece cuál es la versión más reciente; las contradicciones sin resolver deben permanecer en el resumen. Los aplazamientos ordinarios pasan a ser elegibles tras una hora, mientras que los conflictos de captura sin resolver siguen bloqueando los reintentos automáticos. Las colas acotadas reparten el progreso entre el trabajo pendiente más antiguo, las continuaciones y los registros sin tocar; una ejecución no establece la finalización de todo el archivo. Los cambios o el olvido invalidan los resúmenes dependientes y vuelven a exponer los originales que sobreviven. Los puntos de control de proyecto más antiguos aún pueden exponer información hasta que se procesen como registros completos. Con la IA habilitada, los originales que ya sostienen la búsqueda semántica esperan a que haya embeddings/vectores de resumen verificados antes de desaparecer. Con la IA desactivada, basta la cobertura léxica; habilitar la IA puede volver a revelar originales hasta que los reemplazos semánticos estén listos. La recuperación de vectores es asíncrona, y el cron de quince minutos no es un plazo de finalización. Los embeddings de resumen usan la facturación existente de Workers AI; Codex genera la prosa.
+
+`sources` es de solo lectura y pagina hasta cincuenta ID de origen registrados, con sus espacios y fechas. Recupera los cuerpos con getDocument; sigue la vista previa de origen o el cursor propio de un punto de control hasta sus miembros registrados. Las vías de procedencia distintas pueden repetir un ID. Las respuestas actuales de getDocument, tanto del MCP nativo como del remoto, también incluyen una vista previa de origen y paginación opcional `sourceCursor`; los plugins nativos más antiguos pueden usar la CLI cuando omiten estos campos. Los cursores se detienen con un conflicto si cambia su elemento padre. El [diseño de la organización](DESIGN.md#memory-organization) describe en detalle la cobertura, la invalidación y la recuperación de vectores.
+
+## Actualizar desde los nombres de la versión 1.x
+
+Elimina un plugin de Codex `kagayoi-memory`, `cloudflare-supermemory` de la 1.x o `remnifold` instalado, e instala la aplicación independiente. El cliente lee primero `remnifold.json`, luego `kagayoi-memory.json` y `supermemory.json`, en su carpeta de configuración y después en el antiguo directorio principal de Codex. `REMNIFOLD_API_URL` y `REMNIFOLD_API_KEY` son las variables de entorno normales; los lectores de las antiguas `KAGAYOI_MEMORY_*`, `SUPERMEMORY_API_URL`, `SUPERMEMORY_CODEX_API_KEY` y `CLOUDFLARE_MEMORY_API_KEY` se mantienen por compatibilidad. Ejecuta `remnifold setup` para escribir el `remnifold.json` normal conservando los archivos anteriores. Los recibos de captura y el estado de recuperación existentes siguen siendo legibles desde las carpetas de los productos anteriores. La configuración del servidor reutiliza los recursos llamados `remnifold`, luego `kagayoi-memory` y luego `cloudflare-supermemory`; los nombres de recurso explícitos siempre prevalecen. Cambiar la aplicación local no despliega un Worker ni mueve una base de datos remota. Los ID de documento, los ID de captura, la procedencia de los proyectos y los metadatos `sm_*` persistidos existentes permanecen sin cambios. Los detalles de compatibilidad del almacenamiento están en [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md#storage-and-provenance).
+
+Remnifold implementa su propia API autoalojada. Es independiente del servicio alojado Supermemory y no lee ni modifica los archivos de memoria local integrados de Codex.
+
+Para la arquitectura y la estructura del repositorio, consulta [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md) del repositorio. Las restricciones para colaboradores, la validación y los comandos de empaquetado están en [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md).
+
+Con licencia [MIT License](LICENSE).
