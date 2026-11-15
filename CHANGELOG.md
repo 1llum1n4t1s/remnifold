@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.30 - 2026-11-16
+
+### 変更
+
+- Windowsで厳格な`install`による初回導入に使う署名済みbootstrap実行ファイルを、GitHub Releaseではなく、R2の版付き不変キー（`velopack/remnifold-bootstrap-<版>-x86_64-pc-windows-msvc.exe`）から配布するようにしました。利用者は、取得後にAuthenticode署名（状態`Valid`・署名者・タイムスタンプ）を確かめてから実行します。この方式の初回導入は、これを含む最初の版（1.0.30）以降が対象で、それ以前の版は信頼できるソースからのビルドのみです。READMEの9言語・`AGENTS.md`・`DESIGN.md`・`setup-remnifold`スキルの手順を合わせて更新しました。
+- Setup（Velopack）の配信ワークフロー`release-velopack.yml`が、`release/*`ブランチへのpushで起動するようにしました（手動起動も引き続き使えます）。同じコミットの`ci.yml`が成功し、R2へ公開する`publish-r2`が1件だけ成功するのを、Secretsを持たない`gate`ジョブで待ってから、署名・配信を始めます。
+- タグとGitHub Releaseを作らない運用に合わせ、GitHub Releaseへbootstrapを公開する保守者用のxtaskコマンドを廃止しました（`bootstrap-test`は残します）。
+- `publish-r2.ps1`が、公開中の`releases.<channel>.json`の最大版より低い版の配信を、配信前に拒否するようにしました（意図した巻き戻しは`-AllowOlderVersion`でのみ許可）。
+
 ## 1.0.29 - 2026-11-15
 
 ### 追加
