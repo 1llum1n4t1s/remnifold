@@ -33,7 +33,7 @@ jobs:
     # Environment deployment-branch policies are the credential boundary. Only
     # these environments own R2 secrets; validation has no distribution secrets.
     environment:
-      name: ${{ github.event_name == 'push' && github.repository == '1llum1n4t1s/remnifold' && github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) && ((matrix.target == 'x86_64-pc-windows-msvc' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/heads/release/')) && 'r2-staging' || 'validation' }}
+      name: ${{ github.event_name == 'push' && github.repository == '1llum1n4t1s/remnifold' && github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) && startsWith(github.ref, 'refs/heads/release/') && 'r2-staging' || 'validation' }}
     timeout-minutes: 90
     defaults:
       run:
@@ -175,7 +175,7 @@ jobs:
           github.event_name == 'push' &&
           github.repository == '1llum1n4t1s/remnifold' &&
           github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) &&
-          ((matrix.target == 'x86_64-pc-windows-msvc' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/heads/release/'))
+          startsWith(github.ref, 'refs/heads/release/')
         env:
           CI_R2_ENVIRONMENT: r2-staging
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}

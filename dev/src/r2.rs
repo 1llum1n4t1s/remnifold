@@ -655,8 +655,8 @@ fn identity(publishing: bool) -> Result<Identity> {
                 } else {
                     "r2-staging"
                 }
-            && (reference == format!("refs/heads/release/{version}")
-                || (!publishing && reference == "refs/heads/main"))
+            // ステージも公開も release/<version> の push だけを信頼する（main からのステージは行わない）。
+            && reference == format!("refs/heads/release/{version}")
             && env("GITHUB_WORKFLOW_REF")?
                 == format!(
                     "{}/.github/workflows/ci.yml@{reference}",

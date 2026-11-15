@@ -39,16 +39,19 @@ mod tests {
             assert!(scope.contains("github.repository == '1llum1n4t1s/remnifold'"));
             assert!(scope.contains("github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref)"));
         }
-        assert!(stage.contains("github.ref == 'refs/heads/main'"));
-        let scope = "((matrix.target == 'x86_64-pc-windows-msvc' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/heads/release/'))";
+        // r2-staging は release/* だけに許可する（main を許可しない）。main への push は
+        // Windows を含む全ターゲットが秘密情報を持たない validation Environment で検証だけを行う。
+        assert!(!workflow.contains("refs/heads/main"));
+        let scope = "startsWith(github.ref, 'refs/heads/release/')";
         assert!(
-            matrix.contains(scope),
-            "Unix main jobs must select the secret-free validation environment"
+            matrix.contains(&format!("{scope} && 'r2-staging' || 'validation'")),
+            "main jobs must select the secret-free validation environment"
         );
         assert!(
             stage.contains(scope),
-            "Unix main jobs must skip distribution calls"
+            "main jobs must skip distribution calls"
         );
+        assert!(!stage.contains("matrix.target == 'x86_64-pc-windows-msvc' &&"));
         assert!(!stage.contains("continue-on-error"));
         assert!(stage.contains("startsWith(github.ref, 'refs/heads/release/')"));
         assert!(publisher.contains("needs.native-package.result == 'success'"));
