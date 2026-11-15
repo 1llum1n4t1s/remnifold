@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.27 - 2026-11-15
+
+### 追加
+
+- Windows x64向けのSetup版（`RemnifoldApp-win-Setup.exe`）を追加しました。署名付きで管理者権限は不要です。インストールするとClaude Code・Codex（コマンドが見つかったものだけ）へ自動で登録し、サーバー接続（`remnifold setup`）の案内を表示します。GitHubアカウントは要りません。macOS・Linux向けのSetup版はまだ公開していません。
+- Setup版は自動で更新されます。MCPセッションの実行中に1日1回まで更新を確認して裏で取得し、次のログオン時に、ほかのRemnifoldが動いていないときだけ適用します。適用前に、取得したパッケージ内の全実行ファイルの署名を確かめます。`app-update.json`の`"auto_update": false`で無効にできます。
+- `remnifold connect claude-code --remove --apply`・`remnifold connect codex --remove --apply`で、Remnifold自身の登録だけを解除できるようにしました。
+- 端末から引数なしで起動したときに、使い方の案内を表示するようにしました。
+
 ## 1.0.26 - 2026-11-14
 
 ### 修正
