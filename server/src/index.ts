@@ -2,7 +2,7 @@ import { documentIndex } from "./shared/memory-index.ts";
 import { truncateUtf16 } from "./shared/unicode-text.ts";
 import packageMetadata from "../package.json" with { type: "json" };
 import { handleMcpRequest } from "./mcp.ts";
-import { organization, organizationVisible } from "./organization.ts";
+import { organization, organizationVisible, organizationVisibleId } from "./organization.ts";
 import { organizationSourcePage } from "./organization-sources.ts";
 import { authorizeMcp, oauthChallenge, routeOAuth } from "./mcp-oauth.ts";
 
@@ -2043,6 +2043,30 @@ function searchConditions(containerTag: string | undefined, scope: string | unde
   return { clause: conditions.join(" AND "), parameters };
 }
 
+// searchConditions と同じ絞り込みを、射影テーブル memory_search_projection（別名 p）の列で書いたもの。
+// 射影は migration 0014 のトリガーで書込みのたびに保守され、忘却済みの行を含まないため is_forgotten の条件は不要。
+// 列の値は旧来の json_extract 式と同じ値（ビュー memory_search_projection_source が唯一の定義）なので、絞り込み結果も同じになる。
+// 束縛値の順序は searchConditions と同じ（コンテナ、スコープ）。
+// 非表示判定（organizationVisibleId）は他テーブルに依存するため含めない。呼び出し元が、判定回数が最も少なくなる段で加える。
+// containerColumn は、memories を外側で読む文（本文の部分一致）で memories 側の列を指定し、
+// idx_memories_container_updated による絞り込みを使うためのもの（射影の container_tag は memories と常に同じ値）。
+function projectionSearchConditions(containerTag: string | undefined, scope: string | undefined, indexOnly: boolean, manualContext = false, containerColumn = "p.container_tag") {
+  const conditions: string[] = [];
+  const parameters: (string | number)[] = [];
+  if (containerTag !== undefined) {
+    conditions.push(`${containerColumn} = ?`);
+    parameters.push(containerTag);
+  }
+  if (scope) {
+    // sm_scope は型宣言のない列に生の値で保存しているため、旧式の json_extract(...) = ? と同じ比較になる。
+    conditions.push("p.sm_scope = ?");
+    parameters.push(scope);
+  }
+  if (indexOnly) conditions.push("p.recallable = 1");
+  if (indexOnly && !manualContext) conditions.push("NOT (p.manual_only_marker = 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=p.memory_id))");
+  return { clause: conditions.length ? conditions.join(" AND ") : "1 = 1", parameters };
+}
+
 type IndexPattern = { weight: number; pattern: string };
 
 // indexQueryPatterns の JSON を、文ごとに個別の束縛値へ展開できる形に戻す。
@@ -2055,19 +2079,12 @@ function indexPatternList(json: string): IndexPattern[] {
   return patterns;
 }
 
-// 索引テキストと現行改訂の分類を、1行につき1回だけ連結した照合対象を作る。
-// 旧実装は検索語ごと（最大30語）に JSON 抽出と memory_topics の索引探索を繰り返し、
-// 並べ替えでも同じ評価をやり直していたため、本番 D1 で1文あたり百万行規模の読み取りになっていた。
+// 照合対象（索引タイトル・保存タイトル・説明・節・現行改訂の分類を改行などで連結し小文字化したもの）は、
+// migration 0014 のビュー memory_search_projection_source が唯一の定義で、射影テーブルの index_text 列に保存されている。
+// 以前は検索のたびに全行で JSON 抽出と分類の相関サブクエリを評価しており、本番 D1 で1入力あたり約1.2秒かかっていた。
 // 分類は改行で区切る。検索語は Intl.Segmenter の語要素から作るため改行を含まず、
 // `*語*` 形式の GLOB が区切りをまたいで一致することはない。よって「索引一致 OR いずれかの分類一致」と同値になる。
-function indexHaystackSql(alias: string): string {
-  return `replace(lower(COALESCE(json_extract(${alias}.metadata_json, '$.memoryIndex.title'), '') || ' ' ||
-                      COALESCE(json_extract(${alias}.metadata_json, '$.title'), '') || ' ' ||
-                      COALESCE(json_extract(${alias}.metadata_json, '$.memoryIndex.description'), '') || ' ' ||
-                      COALESCE(json_extract(${alias}.metadata_json, '$.memoryIndex.sections'), '') || char(10) ||
-                      COALESCE((SELECT group_concat(topic.topic, char(10)) FROM memory_topics AS topic
-                                WHERE topic.memory_id = ${alias}.id AND topic.source_revision = ${alias}.topic_revision), '')), 'İ', 'i̇')`;
-}
+// 式を変えるときは、ビューを作り直して全行を再度埋め戻す新しいマイグレーションが必要（server/tests/search-projection.test.mjs 参照）。
 
 // 一致した検索語の重みの合計。照合対象は外側の列を参照するだけで再計算しない。
 function indexWeightSql(haystack: string, patterns: IndexPattern[]): string {
@@ -2082,12 +2099,6 @@ function indexWeightSql(haystack: string, patterns: IndexPattern[]): string {
 function indexLexicalPrioritySql(indexV1: string, indexText: string, patterns: IndexPattern[]): string {
   const matches = patterns.map(() => ` OR ${indexText} GLOB ?`).join("");
   return `CASE WHEN NOT ${indexV1}${matches} THEN 0 ELSE 1 END`;
-}
-
-// 優先度判定用の列。版が確定的に1以外の行では照合対象を作らない（判定に不要なため）。
-function indexPriorityColumnsSql(alias: string): string {
-  return `${memoryIndexV1Sql(`${alias}.metadata_json`)} AS index_v1,
-                    CASE WHEN ${memoryIndexV1Sql(`${alias}.metadata_json`)} IS NOT 0 THEN ${indexHaystackSql(alias)} END AS index_text`;
 }
 
 // Node.js 24のUnicode小文字変換で、通常のupper逆写像では戻せない単文字の対応。
@@ -2113,25 +2124,27 @@ function indexQueryPatterns(terms: string[]): string {
 }
 
 async function indexedMemories(getPattern: () => string, containerTag: string | undefined, scope: string | undefined, env: Env, indexOnly: boolean, manualContext = false): Promise<RankedMemoryRow[]> {
-  const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
+  const { clause, parameters } = projectionSearchConditions(containerTag, scope, indexOnly, manualContext);
   const patterns = indexPatternList(getPattern());
   // 分類・索引だけの一致はVectorize topKや本文FTSの順位に依存させない。
-  // `LIMIT -1 OFFSET 0` は SQLite のサブクエリ平坦化を止める境界で、照合対象と重みを1行1回だけ計算させる。
+  // 照合対象は射影テーブルの保存済みの値を読むだけで、memories の metadata（embedding を含む大きな行）や分類は読まない。
+  // `LIMIT -1 OFFSET 0` は SQLite のサブクエリ平坦化を止める境界で、重みを1行1回だけ計算させる。
+  // 非表示判定は重みが正の行だけに行う（AND なので結果は同じで、判定回数が全行から一致行に減る）。
   // 同点は走査順（rowid昇順）と同じ順にするため row_order を最後の並べ替えキーに置き、
   // 上限内の行だけを rowid で読み直して本文・metadata の一時保持を避ける。
   const result = await env.DB.prepare(
     `SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at, m.topic_revision
      FROM (
-       SELECT candidate.row_order, candidate.updated_at, ${indexWeightSql("candidate.index_text", patterns)} AS weight
+       SELECT candidate.row_order, candidate.memory_id, candidate.updated_at, ${indexWeightSql("candidate.index_text", patterns)} AS weight
        FROM (
-         SELECT m.rowid AS row_order, m.updated_at, ${indexHaystackSql("m")} AS index_text
-         FROM memories AS m WHERE ${clause}
+         SELECT p.memory_rowid AS row_order, p.memory_id, p.updated_at, p.index_text
+         FROM memory_search_projection AS p WHERE ${clause}
          LIMIT -1 OFFSET 0
        ) AS candidate
        LIMIT -1 OFFSET 0
      ) AS ranked
      CROSS JOIN memories AS m ON m.rowid = ranked.row_order
-     WHERE ranked.weight > 0
+     WHERE ranked.weight > 0 AND ${organizationVisibleId("ranked.memory_id", enrichmentEnabled(env))}
      ORDER BY ranked.weight DESC, ranked.updated_at DESC, ranked.row_order LIMIT ?`,
   // 重みの GLOB は文中で検索条件より前に現れるため、束縛値も検索語、条件、上限の順に渡す。
   ).bind(...patterns.map(({ pattern }) => pattern), ...parameters, MAX_LIMIT).all<RankedMemoryRow>();
@@ -2152,23 +2165,36 @@ async function lexicalMemories(
   const candidateLimit = Math.min(MAX_LIMIT, Math.max(limit * 3, 10));
   let normalizedFtsRows: RankedMemoryRow[] = [];
   if (ftsQuery) {
-    const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
+    const { clause, parameters } = indexOnly
+      ? projectionSearchConditions(containerTag, scope, true, manualContext)
+      : searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
     try {
-      // 索引優先の判定は一致行ごとに1回だけ照合対象を作る（平坦化を止める境界は indexedMemories と同じ）。
-      // 同点はFTSの走査順のまま残す。全文検索だけの経路は従来の文をそのまま使う。
+      // 索引優先の判定は射影テーブルの保存済みの版・照合対象で行い、一致行の memories は読まない。
+      // fts（平坦化を止める境界つき）で絞り込み・非表示判定・bm25 を求め、selected で優先度・順位の上位だけに切ってから、
+      // その行だけを rowid で memories から読み直す。読み直した後も同じキーで並べ直す。
+      // 同点の最後のキーは row_order（rowid）にする。FTS5 の走査は rowid 昇順なので、従来の「走査順のまま」と同じ並びになる
+      // （server/tests/search-projection.test.mjs が bm25 の同点を作って旧文と比べている）。
+      // 束縛値の順序（FTS 語、条件、索引語、上限）を従来と同じに保つため、? が文面のこの順に現れる CTE の形にしている。
+      // CROSS JOIN は FTS を外側に固定し、射影の全走査から FTS を引く計画を選ばせないためのもの。
+      // 全文検索だけの経路は従来の文をそのまま使う。
       const patterns = indexOnly ? indexPatternList(getPattern()) : [];
       const result = await env.DB.prepare(indexOnly
-        ? `SELECT id, container_tag, content, metadata_json, created_at, updated_at, topic_revision, rank
-           FROM (
-             SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at,
-                    m.topic_revision, bm25(memories_fts) AS rank,
-                    ${indexPriorityColumnsSql("m")}
+        ? `WITH fts AS (
+             SELECT p.memory_rowid AS row_order, bm25(memories_fts) AS rank, p.index_v1, p.index_text
              FROM memories_fts
-             JOIN memories AS m ON m.rowid = memories_fts.rowid
-             WHERE memories_fts MATCH ? AND ${clause}
+             CROSS JOIN memory_search_projection AS p ON p.memory_rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ? AND ${clause} AND ${organizationVisibleId("p.memory_id", enrichmentEnabled(env))}
              LIMIT -1 OFFSET 0
-           ) AS fts
-           ORDER BY ${indexLexicalPrioritySql("fts.index_v1", "fts.index_text", patterns)}, fts.rank LIMIT ?`
+           ), selected AS (
+             SELECT fts.row_order, fts.rank, ${indexLexicalPrioritySql("fts.index_v1", "fts.index_text", patterns)} AS priority
+             FROM fts
+             ORDER BY priority, fts.rank, fts.row_order LIMIT ?
+           )
+           SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at,
+                  m.topic_revision, selected.rank
+           FROM selected
+           CROSS JOIN memories AS m ON m.rowid = selected.row_order
+           ORDER BY selected.priority, selected.rank, selected.row_order`
         : `SELECT m.id, m.container_tag, ${searchContentColumn(indexOnly, "m")}, m.metadata_json, m.created_at, m.updated_at,
                   m.topic_revision, bm25(memories_fts) AS rank
            FROM memories_fts
@@ -2189,19 +2215,28 @@ async function lexicalMemories(
   }
 
   if (query.length > 0 && query.length <= 1_000) {
-    const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
+    const { clause, parameters } = indexOnly
+      ? projectionSearchConditions(containerTag, scope, true, manualContext, "m.container_tag")
+      : searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
     const patterns = indexOnly ? indexPatternList(getPattern()) : [];
-    // 索引優先の判定は FTS と同じく、一致行ごとに1回だけ照合対象を作る。
+    // 本文の部分一致は memories の本文を読むしかないため memories を外側に置き、本文が一致した行だけ射影を rowid で引く
+    // （条件の文面上の順序は束縛値の順序を従来と同じに保つためのもので、評価の順序は SQLite が列の依存から決める）。
+    // コンテナ指定は memories 側の列で書き、従来どおり idx_memories_container_updated で読む行を絞る。
+    // 射影には content 列が無いので、修飾なしの content は memories の本文を指す（既存テストが文面で分岐を見分けている）。
+    // 絞り込み・索引の版・照合対象は射影の保存済みの値を使い、metadata の JSON 抽出と分類の読み取りをしない。
+    // 同点は従来どおり走査順（rowid 昇順）にし、それを row_order で明示する。
     const result = await env.DB.prepare(indexOnly
         ? `SELECT id, container_tag, content, metadata_json, created_at, updated_at, topic_revision
            FROM (
-             SELECT id, container_tag, ${searchContentColumn(true)}, metadata_json, created_at, updated_at, topic_revision,
-                    ${indexPriorityColumnsSql("memories")}
-             FROM memories
-             WHERE ${clause} AND instr(lower(content), lower(?)) > 0
+             SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at, m.topic_revision,
+                    m.rowid AS row_order, p.index_v1, p.index_text
+             FROM memories AS m
+             CROSS JOIN memory_search_projection AS p ON p.memory_rowid = m.rowid
+             WHERE m.is_forgotten = 0 AND ${clause} AND instr(lower(content), lower(?)) > 0
+               AND ${organizationVisibleId("p.memory_id", enrichmentEnabled(env))}
              LIMIT -1 OFFSET 0
            ) AS lexical
-           ORDER BY ${indexLexicalPrioritySql("lexical.index_v1", "lexical.index_text", patterns)}, lexical.updated_at DESC LIMIT ?`
+           ORDER BY ${indexLexicalPrioritySql("lexical.index_v1", "lexical.index_text", patterns)}, lexical.updated_at DESC, lexical.row_order LIMIT ?`
         : `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at, topic_revision
          FROM memories
          WHERE ${clause} AND instr(lower(content), lower(?)) > 0
@@ -2212,6 +2247,33 @@ async function lexicalMemories(
     return result.results.length > 0 ? result.results : normalizedFtsRows;
   }
   return [];
+}
+
+// 非表示行（整理済みで隠された原本）のベクトルが Vectorize に残っている可能性を判定する。
+// 非表示行は必ず memory_organization_coverage か memory_organization_group_members に含まれる（migration 0009）。
+// vector_status='disabled' かつ vector_attempted_at ありは「削除済みで照合済み」なので topK を占有しない。
+// CROSS JOIN は読む順序を固定して memories の全走査を避けるためのもので、OR で1文にまとめると読み取り行数が急増するため分けている。
+// 判定に失敗したときは安全側（可能性あり）に倒し、従来どおり状態で絞らない。
+async function hiddenVectorsMayRemain(env: Env): Promise<boolean> {
+  const pending = `(hidden_memory.vector_status <> 'disabled' OR hidden_memory.vector_attempted_at IS NULL)
+        AND EXISTS(SELECT 1 FROM memory_organization_hidden AS h WHERE h.memory_id = hidden_source.memory_id)`;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT EXISTS(
+         SELECT 1 FROM memory_organization_coverage AS hidden_source
+         CROSS JOIN memories AS hidden_memory ON hidden_memory.id = hidden_source.memory_id
+         WHERE ${pending}
+         UNION ALL
+         SELECT 1 FROM memory_organization_group_members AS hidden_source
+         CROSS JOIN memories AS hidden_memory ON hidden_memory.id = hidden_source.memory_id
+         WHERE ${pending}
+       ) AS needed`,
+    ).first<{ needed: number }>();
+    return row?.needed !== 0;
+  } catch (error) {
+    console.error(JSON.stringify({ event: "hidden_vector_check_failed", error: diagnosticError(error, env) }));
+    return true;
+  }
 }
 
 async function semanticMemories(
@@ -2226,11 +2288,16 @@ async function semanticMemories(
   const MAX_D1_VECTOR_SCAN = 200;
   if (!enrichmentEnabled(env)) return [];
   try {
+    // 非表示行のベクトルが残り得るかの判定は埋め込み生成と並行して始める（scope 指定時は不要）。
+    const hiddenVectorsPending = scope ? Promise.resolve(false) : hiddenVectorsMayRemain(env);
     const vector = await embedText(query, env);
     const candidateLimit = Math.min(MAX_LIMIT, Math.max(limit * 3, 10));
     const { clause, parameters: fallbackParameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
     // Vectorizeはsm_scopeで絞れないため、scope検索ではD1のindexed行も候補に戻す。
-    const vectorStatusClause = scope ? "" : " AND (vector_status <> 'indexed' OR EXISTS(SELECT 1 FROM memory_organization_hidden LIMIT 1))";
+    // 非表示行のベクトルが削除済み・照合済みなら topK を占有しないので、未索引状態の行だけを D1 から探す。
+    // CHECK 制約上 IN 句は `<> 'indexed'` と同値で、索引を直接使える。
+    const hiddenPending = await hiddenVectorsPending;
+    const vectorStatusClause = scope || hiddenPending ? "" : " AND vector_status IN ('pending','queued','failed','disabled')";
     fallbackParameters.push(MAX_D1_VECTOR_SCAN);
     let vectorQueryFailed = false;
     const [vectorResult, unindexedFallbackRows] = await Promise.all([
@@ -3410,22 +3477,19 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   const limit = positiveInteger(body.limit, 10, MAX_LIMIT);
   const offset = (page - 1) * limit;
   const conditions = ["m.is_forgotten = 0"];
-  if (body.enrichmentEligible === true) {
+  if (body.enrichmentEligible === true && !recentTasks) {
     conditions.push("json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0");
   }
   const parameters: (string | number)[] = [];
-  if (recentTasks) {
-    conditions.push(
-      "json_extract(m.metadata_json, '$.memoryIndex.recallable') IS NOT 0",
-      "json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1",
-      "json_extract(m.metadata_json, '$.type') = 'conversation'",
-      "json_type(m.metadata_json, '$.sessionId') = 'text'",
-      "length(trim(json_extract(m.metadata_json, '$.sessionId'))) > 0",
-    );
-    if (typeof body.excludeSessionId === "string") {
-      conditions.push("json_extract(m.metadata_json, '$.sessionId') <> ?");
-      parameters.push(body.excludeSessionId);
-    }
+  // 直近作業は、射影テーブル p の保存済みの値で絞る（migration 0014）。
+  // recent_eligible は従来の5条件（想起可能・チェックポイント以外・会話・空白以外の文字列 sessionId）をまとめた値で、
+  // 忘却済みの行は射影に無い。enrichmentEligible の想起可能条件は recent_eligible に含まれるため、重ねて書かない
+  // （書くと部分索引に無い列を読むことになり、索引だけで候補を作れなくなる）。
+  // `p.recent_eligible = 1` は部分索引 idx_memory_search_projection_recent の条件と文字どおり同じ形にしておく。
+  const recentConditions = ["p.recent_eligible = 1"];
+  if (recentTasks && typeof body.excludeSessionId === "string") {
+    recentConditions.push("p.task_session <> ?");
+    parameters.push(body.excludeSessionId);
   }
   if (containerTag) {
     conditions.push("m.container_tag = ?");
@@ -3461,27 +3525,14 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
       : projection === "capture"
         ? "m.id, m.metadata_json"
         : DOCUMENT_DISPLAY_COLUMNS;
-  // 元の作業日時で比較し、再importによるupdated_atの更新を最近の作業と誤認しない。
-  // SQLiteの日時変換はtimezoneを正規化する。日付の繰上がりと非文字列も除外する。
-  const sourceDate = (path: string) => {
-    const value = `json_extract(m.metadata_json, '${path}')`;
-    return `CASE WHEN json_type(m.metadata_json, '${path}') = 'text'
-      AND ${value} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*'
-      AND strftime('%Y-%m-%d', substr(${value}, 1, 10), '+0 days') = substr(${value}, 1, 10)
-      THEN julianday(${value}) END`;
-  };
-  const taskProject = `COALESCE(CASE WHEN json_type(m.metadata_json, '$.sm_project_id') = 'text'
-        THEN NULLIF(trim(json_extract(m.metadata_json, '$.sm_project_id')), '') END, m.container_tag)`;
-  const taskSession = `json_extract(m.metadata_json, '$.sessionId')`;
+  // 直近作業のキー（元の作業日時・プロジェクト・セッション・turn/part）は射影テーブルに保存済みの値を使う。
+  // 元の作業日時は再importによるupdated_atの更新を最近の作業と誤認しないためのもので、timezoneの正規化・
+  // 日付の繰上がりと非文字列の除外・作成日時へのフォールバックを含めて、式はビュー memory_search_projection_source にある。
+  // 候補は部分索引 idx_memory_search_projection_recent だけで作れる（窓関数の PARTITION BY / ORDER BY と同じ列順）。
+  const recentWhere = recentConditions.join(" AND ");
   const recentPrefix = recentTasks ? `WITH candidates AS (
-    SELECT m.id, m.created_at, m.updated_at,
-      CASE WHEN json_type(m.metadata_json, '$.turn') = 'integer' THEN json_extract(m.metadata_json, '$.turn') ELSE 0 END AS task_turn,
-      CASE WHEN json_type(m.metadata_json, '$.part') = 'integer' THEN json_extract(m.metadata_json, '$.part') ELSE 1 END AS task_part,
-      COALESCE(${["$.memoryIndex.sourceUpdatedAt", "$.sourceTimestamp", "$.sourceUpdatedAt", "$.completedAt"].map(sourceDate).join(", ")},
-      julianday(m.created_at)) AS source_date,
-      ${taskProject} AS task_project,
-      ${taskSession} AS task_session
-    FROM memories AS m WHERE ${where}
+    SELECT p.memory_id AS id, p.created_at, p.updated_at, p.task_turn, p.task_part, p.source_date, p.task_project, p.task_session
+    FROM memory_search_projection AS p WHERE ${recentWhere}
   ), ranked AS (
     SELECT candidates.*, ROW_NUMBER() OVER (
       PARTITION BY task_project, task_session
@@ -3499,7 +3550,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
   // 以前は同じ全件走査を件数用にもう一度行っており、プロンプトごとの D1 負荷が2倍になっていた。
   // D1 は1データベースを単一スレッドで処理するため、同時セッションが重なると過負荷で失敗しやすい。
   const countStatement = env.DB.prepare(recentTasks
-    ? `SELECT COUNT(*) AS total FROM (SELECT 1 FROM memories AS m WHERE ${where} GROUP BY ${taskProject}, ${taskSession})`
+    ? `SELECT COUNT(*) AS total FROM (SELECT 1 FROM memory_search_projection AS p WHERE ${recentWhere} GROUP BY p.task_project, p.task_session)`
     : `SELECT COUNT(*) AS total FROM ${table} AS m WHERE ${selection}`).bind(...parameters);
   const rowsStatement = env.DB.prepare(
     `${recentPrefix}SELECT ${columns}${recentTasks ? ", recent.recent_total" : ""} FROM ${table} AS m ${recentTasks ? "JOIN recent ON recent.id = m.id" : ""} WHERE ${selection}

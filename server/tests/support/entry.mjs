@@ -16,6 +16,7 @@ import "../organization-core-conflicts.test.mjs";
 import "../organization-days.test.mjs";
 import "../recent-tasks-load.test.mjs";
 import "../search-load.test.mjs";
+import "../search-projection.test.mjs";
 import "../consolidation-due.test.mjs";
 import "../add-memory-load.test.mjs";
 class TestDatabase {

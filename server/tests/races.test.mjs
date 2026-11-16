@@ -2262,7 +2262,8 @@ test("Vectorize hits are hydrated even when the speculative D1 fallback query fa
     const DB = {
       ...baseDB,
       prepare(sql) {
-        if (sql.includes("vector_status <> 'indexed'")) {
+        // 非表示行がない場合の fallback は状態で絞る（IN 句）ため、本体の SQL を embedding_json の条件で特定する。
+        if (sql.includes("embedding_json IS NOT NULL")) {
           return {
             bind() { return this; },
             async all() {

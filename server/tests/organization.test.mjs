@@ -606,3 +606,59 @@ scenario('ordinary metadata markers do not impersonate generated organization st
   const previews=[];for(const summary of committed.body.summaries){const document=await f.api(`/v3/documents/${summary.memoryId}`,undefined,'GET');assert.equal(document.status,200);previews.push(...document.body.organizationSources.sources)}
   assert.ok(previews.some(source=>source.id===original));
 });
+
+// 照合済みでベクトル削除済みの非表示行は topK を占有しないので、D1 の semantic fallback は未索引状態の行だけを探す。
+// 非表示行のベクトルが残り得る間（queued/pending、または未照合）は、従来どおり indexed 行も候補に戻す。
+scenario('semantic fallback ignores reconciled hidden rows but keeps indexed candidates while hidden vectors may remain', async f => {
+  const original=await f.save('# FallbackOriginal\nVerified source evidence',{title:'FallbackOriginal'});
+  const other=await f.save('# FallbackIndexed\nAnother indexed fact',{title:'FallbackIndexed'});
+  const vector=semanticFixture(f);vector.seedEmbedding(original);vector.seedEmbedding(other,1);vector.control.hits=[other];
+  f.env.AI_ENRICHMENT_MODE='on';
+  const body=f.payload(await f.prepare());
+  body.summaries[0].sources=[original];body.coverage.find(item=>item.id===other).status='deferred';body.coverage.find(item=>item.id===other).summaries=[];
+  assert.equal((await f.api('/v4/organize/commit',body)).status,200);await f.drain();
+  // 削除と照合の完了（vector_status='disabled'）まで cron を進める。
+  for(let n=0;n<8&&f.db.prepare('SELECT vector_status FROM memories WHERE id=?').get(original).vector_status!=='disabled';n++)await tick(f);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM memory_organization_hidden WHERE memory_id=?').get(original).n,1);
+  assert.ok(!vector.vectors.has(original),'hidden vector must be deleted by reconciliation');
+  const hidden=f.db.prepare('SELECT vector_status,vector_attempted_at FROM memories WHERE id=?').get(original);
+  assert.equal(hidden.vector_status,'disabled');assert.ok(hidden.vector_attempted_at);
+  const probe=async()=>{
+    const statements=[];
+    f.DB.hooks.all=(sql,values)=>{if(/embedding_json IS NOT NULL/.test(sql))statements.push({kind:'fallback',sql,values})};
+    f.DB.hooks.first=(sql,values)=>{if(/AS needed/.test(sql))statements.push({kind:'check',sql,values})};
+    try{
+      const result=await f.api('/v4/search',{q:'SemanticFallbackProbe',allContainers:true});assert.equal(result.status,200,JSON.stringify(result.body));
+      let rowsRead=0,fallbackRows=[];
+      for(const statement of statements){
+        const cursor=f.db.storage.sql.exec(statement.sql,...statement.values);const rows=cursor.toArray();rowsRead+=cursor.rowsRead;
+        if(statement.kind==='fallback')fallbackRows=rows.map(row=>row.id);
+      }
+      return {statements,rowsRead,fallbackRows,ids:result.body.results.map(item=>item.id)};
+    }finally{f.DB.hooks.all=undefined;f.DB.hooks.first=undefined}
+  };
+  // (a) 照合済みで削除済みなら、fallback は状態で絞られ indexed 行の embedding_json を返さない。
+  const small=await probe();
+  assert.equal(small.statements.filter(item=>item.kind==='check').length,1);
+  assert.match(small.statements.find(item=>item.kind==='fallback').sql,/vector_status IN \('pending','queued','failed','disabled'\)/);
+  assert.deepEqual(small.fallbackRows,[]);assert.ok(small.ids.includes(other));
+  // 読み取り行数（判定文と本体の合計）はコーパスの行数に比例しない。
+  const fillerEmbedding=JSON.stringify(Array.from({length:1024},(_,index)=>index===2?1:0));
+  f.env.AI_ENRICHMENT_MODE='off';
+  for(let n=0;n<100;n++)await f.save(`# Filler ${n}
+Bulk indexed row`,{title:`Filler ${n}`});
+  f.env.AI_ENRICHMENT_MODE='on';
+  f.db.prepare("UPDATE memories SET embedding_json=?,embedding_status='done',vector_status='indexed' WHERE content LIKE '# Filler %'").run(fillerEmbedding);
+  const large=await probe();
+  assert.deepEqual(large.fallbackRows,[]);
+  assert.ok(large.rowsRead<=small.rowsRead+10,`rowsRead small=${small.rowsRead} large=${large.rowsRead}`);
+  assert.ok(large.rowsRead<100,`rowsRead large=${large.rowsRead}`);
+  // (b) 非表示行が queued/pending、または未照合（vector_attempted_at IS NULL）なら従来どおり indexed 行も候補に戻る。
+  for(const [status,attempted] of [['queued','2000-01-01'],['pending','2000-01-01'],['disabled',null]]){
+    f.db.prepare('UPDATE memories SET vector_status=?,vector_attempted_at=? WHERE id=?').run(status,attempted,original);
+    const widened=await probe();
+    assert.doesNotMatch(widened.statements.find(item=>item.kind==='fallback').sql,/vector_status IN/,`${status}/${attempted}`);
+    assert.ok(widened.fallbackRows.includes(other),`${status}/${attempted}`);
+  }
+  // group_members 側の非表示行でも同じ判定になることは、判定文が両表を UNION ALL で見ることで担保する。
+});

@@ -15,8 +15,12 @@ const fail = (message: string): never => { throw new Failure(400, message); };
 const object = (value: unknown): ObjectValue => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as ObjectValue : fail('Expected an object');
 const text = (value: unknown, max: number): string => typeof value === 'string' && value.trim().length > 0 && value.length <= max ? value : fail('Invalid text field');
 const list = (value: unknown, max: number): unknown[] => Array.isArray(value) && value.length <= max ? value : fail('Invalid array field');
-const visible = (alias: string, semanticEnabled = true) => `NOT EXISTS(SELECT 1 FROM ${semanticEnabled ? 'memory_organization_hidden' : 'memory_organization_complete'} h WHERE h.memory_id=${alias}.id)`;
+// 整理で隠された原本を除く条件。id 式を直接受け取る版は、memories 以外（検索用の射影テーブルなど）の
+// 記憶 ID 列で同じ判定をするために使う。生成される SQL は alias 版と同じ形にし、判定の意味を一か所に保つ。
+const visibleId = (idExpression: string, semanticEnabled = true) => `NOT EXISTS(SELECT 1 FROM ${semanticEnabled ? 'memory_organization_hidden' : 'memory_organization_complete'} h WHERE h.memory_id=${idExpression})`;
+const visible = (alias: string, semanticEnabled = true) => visibleId(`${alias}.id`, semanticEnabled);
 export const organizationVisible = visible;
+export const organizationVisibleId = visibleId;
 const eligible = `m.is_forgotten=0 AND NOT EXISTS(SELECT 1 FROM memory_organization_versions v WHERE v.memory_id=m.id)`;
 const databaseNow = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const captureParts = (alias:string)=>`CASE WHEN json_type(${alias}.metadata_json,'$.sessionId')='text'
