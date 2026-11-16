@@ -2,6 +2,25 @@
 members = ["native", "dev"]
 resolver = "3"
 
+# 開発用（debug）ビルドでも、ハッシュ計算と gzip 展開に使う crate だけは最適化する。
+# `cargo xtask` は呼ばれるたびに tools::prepare で固定ツール（cloudflare_types・esbuild・tsc・workerd）の
+# キャッシュを SHA-512 と gzip 展開で検証し直すため、最適化なしだと1回に約30秒かかる（CI の Windows job で
+# 合計約4分）。検証の内容と回数は変えず（AGENTS.md の整合性検査を弱めない方針）、計算だけを速くする。
+# sha2 0.11 の compress512 は #[inline] ではないため、crate 単位の opt-level が効く。
+# flate2 のバックエンドは zip の deflate-flate2-zlib-rs 機能で zlib-rs が選ばれる（miniz_oxide は
+# 有効でも使われないため対象外）。gzip の CRC は crc32fast が計算する。sha1 はパッケージ検証での
+# Git blob の同一性計算（dev/src/source.rs）に使う。release プロファイルには影響しない。
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.sha1]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 strip = true

@@ -1,8 +1,23 @@
-# Native workflows have no executable Actions; one Cargo workspace owns dependencies.
-# Major updates remain separate from the minor/patch groups.
+# Rust の依存は1つの Cargo ワークスペースが持つ。ci.yml は許可リスト（dev/src/ci.rs）の Action だけを
+# 40 桁のコミット SHA で固定して使い、その SHA と版コメントは github-actions の更新で毎週追う。
+# major の更新は minor/patch のグループと分けたままにする。
 version: 2
 updates:
   - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '09:00'
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+  - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly

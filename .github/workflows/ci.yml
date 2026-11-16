@@ -48,7 +48,7 @@ jobs:
       linux_x64: ${{ steps.stage.outputs.linux_x64 }}
       linux_arm64: ${{ steps.stage.outputs.linux_arm64 }}
     steps:
-      - name: Check out exact source commit without executable Actions
+      - name: Check out exact source commit with git
         env:
           CHECKOUT_TOKEN: ${{ github.token }}
         run: |
@@ -77,12 +77,19 @@ jobs:
           # Windows は後段のパス比較と揃えるため、cygpath -m で区切りを / にした絶対パスへ変える。
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             temp="$(cygpath -m "$RUNNER_TEMP")"
+            workspace="$(cygpath -m "$GITHUB_WORKSPACE")"
             executable=.exe
           else
             temp="$RUNNER_TEMP"
+            workspace="$GITHUB_WORKSPACE"
             executable=
           fi
           root="$temp/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_TARGET"
+          # release 以外の run は、rust-cache が復元・保存する固定パスの target を使う（キャッシュのキーに
+          # CARGO_TARGET_DIR が入るため、run 別のパスでは一致しない）。release の run はキャッシュを使わず、
+          # 従来どおり run/attempt 別の build を使う。
+          build="$root/build"
+          if [[ "$GITHUB_REF" != refs/heads/release/* ]]; then build="$workspace/target"; fi
           export CI_ROOT="$root"
           rustup run 1.100.0 rustc --edition 2024 dev/src/ci_runner.rs -o "$RUNNER_TEMP/remnifold-ci-paths.exe"
           "$RUNNER_TEMP/remnifold-ci-paths.exe" ensure-directory "$root"
@@ -90,9 +97,9 @@ jobs:
           {
             printf 'CI_ROOT=%s\n' "$root"
             printf 'TEMP=%s/tmp\nTMP=%s/tmp\nTMPDIR=%s/tmp\n' "$root" "$root" "$root"
-            printf 'CARGO_TARGET_DIR=%s/build\nREMNIFOLD_TOOL_ROOT=%s/tools\n' "$root" "$root"
+            printf 'CARGO_TARGET_DIR=%s\nREMNIFOLD_TOOL_ROOT=%s/tools\n' "$build" "$root"
             printf 'REMNIFOLD_VALIDATION_DIR=%s/validation\n' "$root"
-            printf 'REMNIFOLD_PACKAGE_BINARY=%s/build/%s/release/remnifold%s\n' "$root" "$CI_TARGET" "$executable"
+            printf 'REMNIFOLD_PACKAGE_BINARY=%s/%s/release/remnifold%s\n' "$build" "$CI_TARGET" "$executable"
             printf 'REMNIFOLD_NODE_GUARD_LOG=%s/validation/node-invocations.log\n' "$root"
           } >> "$GITHUB_ENV"
       - name: Reject Node and JavaScript package-manager subprocesses
@@ -122,21 +129,20 @@ jobs:
           if REMNIFOLD_NODE_GUARD_CANARY=1 node --version; then exit 1; else test "$?" = 91; fi
           printf '%s/guard\n' "$CI_ROOT" >> "$GITHUB_PATH"
           printf 'REMNIFOLD_NODE_GUARD_READY=1\n' >> "$GITHUB_ENV"
+      # 型チェックとテストは windows-server-contracts / windows-native-contracts の2 job へ分けて並列に走らせる。
+      # ここには公開する実アーカイブの作成・検証・updater-test とステージだけを残す（package の build.rs が
+      # esbuild を使うため prepare も残す）。公開は publish-r2 の needs で全 job の成功に縛る。
+      # Cargo のキャッシュ（SHA 固定の rust-cache）は release 以外の run の Windows 要素だけで使う。release の run は
+      # ステージ用の資格情報を持つため Action を実行しない。保存は main の run だけが行う。
+      - name: Restore Cargo cache outside release runs
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' && !startsWith(github.ref, 'refs/heads/release/') }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Prepare pinned native build tools
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask prepare
-      - name: Type-check Worker source
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo xtask type-check
-      - name: Test native runtime and development contracts
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo xtask native-test
-      - name: Test authenticated Worker in local workerd
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo xtask server-test --work-root "$CI_ROOT/validation/server"
-      - name: Test native client, capture, recall, and ranking
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo xtask client-test --work-root "$CI_ROOT/validation/client"
       - name: Build native consumer archive
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask package --target "$CI_TARGET" --source-commit "$GITHUB_SHA"
@@ -189,11 +195,243 @@ jobs:
             cargo xtask local-input import --target "$CI_TARGET" --work-root "$CI_ROOT/local-input" --apply
           fi
 
+  # Worker の型チェックと real-workerd のサーバーテスト。native-package から分けて並列に走らせる。
+  # 配布の資格情報を持たない検証専用 job で、Environment を選ばず、読み取り権限だけで動く。
+  # matrix を使わず runs-on を直接書く（native-package の Windows 要素4件の数え方と job 名を変えないため）。
+  windows-server-contracts:
+    name: windows-server-contracts
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_LABEL: server-contracts
+    steps:
+      - name: Check out exact source commit with git
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\r\n')"
+          printf '::add-mask::%s\n' "$authorization"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install locked Rust toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
+      - name: Configure isolated output directories
+        run: |
+          set -euo pipefail
+          # native-package と同じく $RUNNER_TEMP 配下に run/attempt/job 別の作業ルートを置く。
+          temp="$(cygpath -m "$RUNNER_TEMP")"
+          root="$temp/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_LABEL"
+          # release 以外の run は rust-cache の固定パスの target を使う（native-package と同じ理由）。
+          build="$root/build"
+          if [[ "$GITHUB_REF" != refs/heads/release/* ]]; then build="$(cygpath -m "$GITHUB_WORKSPACE")/target"; fi
+          export CI_ROOT="$root"
+          rustup run 1.100.0 rustc --edition 2024 dev/src/ci_runner.rs -o "$RUNNER_TEMP/remnifold-ci-paths.exe"
+          "$RUNNER_TEMP/remnifold-ci-paths.exe" ensure-directory "$root"
+          mkdir -p "$root/tmp" "$root/tools" "$root/validation" "$root/guard"
+          {
+            printf 'CI_ROOT=%s\n' "$root"
+            printf 'TEMP=%s/tmp\nTMP=%s/tmp\nTMPDIR=%s/tmp\n' "$root" "$root" "$root"
+            printf 'CARGO_TARGET_DIR=%s\nREMNIFOLD_TOOL_ROOT=%s/tools\n' "$build" "$root"
+            printf 'REMNIFOLD_VALIDATION_DIR=%s/validation\n' "$root"
+            printf 'REMNIFOLD_NODE_GUARD_LOG=%s/validation/node-invocations.log\n' "$root"
+          } >> "$GITHUB_ENV"
+      - name: Reject Node and JavaScript package-manager subprocesses
+        run: |
+          set -euo pipefail
+          cat > "$CI_ROOT/guard/main.rs" <<'RUST'
+          use std::{env,fs::OpenOptions,io::Write};
+          fn main() {
+              if env::var_os("REMNIFOLD_NODE_GUARD_CANARY").is_none() {
+                  let path = env::var("REMNIFOLD_NODE_GUARD_LOG").expect("guard log required");
+                  let mut log = OpenOptions::new().create(true).append(true).open(path).expect("guard log unavailable");
+                  writeln!(log,"forbidden JavaScript tool invocation").expect("guard log failed");
+              }
+              eprintln!("Node.js and JavaScript package managers are excluded from this validation");
+              std::process::exit(91);
+          }
+          RUST
+          rustc --edition 2024 "$CI_ROOT/guard/main.rs" -o "$CI_ROOT/guard/node.exe"
+          for name in nodejs npm npx pnpm yarn corepack wrangler; do
+            cp "$CI_ROOT/guard/node.exe" "$CI_ROOT/guard/$name.exe"
+          done
+          guard_path="$(cygpath -u "$CI_ROOT/guard")"
+          export PATH="$guard_path:$PATH"
+          if REMNIFOLD_NODE_GUARD_CANARY=1 node --version; then exit 1; else test "$?" = 91; fi
+          printf '%s/guard\n' "$CI_ROOT" >> "$GITHUB_PATH"
+          printf 'REMNIFOLD_NODE_GUARD_READY=1\n' >> "$GITHUB_ENV"
+      # Cargo のキャッシュ（SHA 固定の rust-cache）。release の run では使わず、保存は main の run だけ。
+      - name: Restore Cargo cache outside release runs
+        if: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Type-check Worker source
+        run: cargo xtask type-check
+      - name: Test authenticated Worker in local workerd
+        run: cargo xtask server-test --work-root "$CI_ROOT/validation/server"
+      - name: Verify no JavaScript runtime was invoked through PATH
+        if: always()
+        run: |
+          set -euo pipefail
+          test "${REMNIFOLD_NODE_GUARD_READY:-0}" = 1
+          if [[ -s "$REMNIFOLD_NODE_GUARD_LOG" ]]; then
+            printf 'A forbidden JavaScript tool invocation was recorded.\n' >&2
+            exit 1
+          fi
+          printf '{"nativeGuard":true,"forbiddenPathInvocations":0,"scope":"PATH-resolved tools; absolute executable paths are not intercepted"}\n' > "$CI_ROOT/validation/node-free-validation.json"
+      - name: Retain validation evidence in job diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${CI_ROOT:-}/validation" ]]; then
+            {
+              printf '### Native validation: %s\n\n' "$CI_LABEL"
+              printf 'Validation reports retained during this job (PRs receive no distribution credentials):\n\n'
+              "$RUNNER_TEMP/remnifold-ci-paths.exe" reports "$CI_ROOT/validation"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # native のテスト（cargo test --workspace）と、ネイティブクライアントの E2E。native-package から分けて並列に走らせる。
+  # windows-server-contracts と同じく、資格情報を持たない検証専用 job。
+  windows-native-contracts:
+    name: windows-native-contracts
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_LABEL: native-contracts
+    steps:
+      - name: Check out exact source commit with git
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\r\n')"
+          printf '::add-mask::%s\n' "$authorization"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install locked Rust toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
+      - name: Configure isolated output directories
+        run: |
+          set -euo pipefail
+          # native-package と同じく $RUNNER_TEMP 配下に run/attempt/job 別の作業ルートを置く。
+          temp="$(cygpath -m "$RUNNER_TEMP")"
+          root="$temp/remnifold-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_LABEL"
+          # release 以外の run は rust-cache の固定パスの target を使う（native-package と同じ理由）。
+          build="$root/build"
+          if [[ "$GITHUB_REF" != refs/heads/release/* ]]; then build="$(cygpath -m "$GITHUB_WORKSPACE")/target"; fi
+          export CI_ROOT="$root"
+          rustup run 1.100.0 rustc --edition 2024 dev/src/ci_runner.rs -o "$RUNNER_TEMP/remnifold-ci-paths.exe"
+          "$RUNNER_TEMP/remnifold-ci-paths.exe" ensure-directory "$root"
+          mkdir -p "$root/tmp" "$root/tools" "$root/validation" "$root/guard"
+          {
+            printf 'CI_ROOT=%s\n' "$root"
+            printf 'TEMP=%s/tmp\nTMP=%s/tmp\nTMPDIR=%s/tmp\n' "$root" "$root" "$root"
+            printf 'CARGO_TARGET_DIR=%s\nREMNIFOLD_TOOL_ROOT=%s/tools\n' "$build" "$root"
+            printf 'REMNIFOLD_VALIDATION_DIR=%s/validation\n' "$root"
+            printf 'REMNIFOLD_NODE_GUARD_LOG=%s/validation/node-invocations.log\n' "$root"
+          } >> "$GITHUB_ENV"
+      - name: Reject Node and JavaScript package-manager subprocesses
+        run: |
+          set -euo pipefail
+          cat > "$CI_ROOT/guard/main.rs" <<'RUST'
+          use std::{env,fs::OpenOptions,io::Write};
+          fn main() {
+              if env::var_os("REMNIFOLD_NODE_GUARD_CANARY").is_none() {
+                  let path = env::var("REMNIFOLD_NODE_GUARD_LOG").expect("guard log required");
+                  let mut log = OpenOptions::new().create(true).append(true).open(path).expect("guard log unavailable");
+                  writeln!(log,"forbidden JavaScript tool invocation").expect("guard log failed");
+              }
+              eprintln!("Node.js and JavaScript package managers are excluded from this validation");
+              std::process::exit(91);
+          }
+          RUST
+          rustc --edition 2024 "$CI_ROOT/guard/main.rs" -o "$CI_ROOT/guard/node.exe"
+          for name in nodejs npm npx pnpm yarn corepack wrangler; do
+            cp "$CI_ROOT/guard/node.exe" "$CI_ROOT/guard/$name.exe"
+          done
+          guard_path="$(cygpath -u "$CI_ROOT/guard")"
+          export PATH="$guard_path:$PATH"
+          if REMNIFOLD_NODE_GUARD_CANARY=1 node --version; then exit 1; else test "$?" = 91; fi
+          printf '%s/guard\n' "$CI_ROOT" >> "$GITHUB_PATH"
+          printf 'REMNIFOLD_NODE_GUARD_READY=1\n' >> "$GITHUB_ENV"
+      # Cargo のキャッシュ（SHA 固定の rust-cache）。release の run では使わず、保存は main の run だけ。
+      - name: Restore Cargo cache outside release runs
+        if: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test native runtime and development contracts
+        run: cargo xtask native-test
+      - name: Test native client, capture, recall, and ranking
+        run: cargo xtask client-test --work-root "$CI_ROOT/validation/client"
+      - name: Verify no JavaScript runtime was invoked through PATH
+        if: always()
+        run: |
+          set -euo pipefail
+          test "${REMNIFOLD_NODE_GUARD_READY:-0}" = 1
+          if [[ -s "$REMNIFOLD_NODE_GUARD_LOG" ]]; then
+            printf 'A forbidden JavaScript tool invocation was recorded.\n' >&2
+            exit 1
+          fi
+          printf '{"nativeGuard":true,"forbiddenPathInvocations":0,"scope":"PATH-resolved tools; absolute executable paths are not intercepted"}\n' > "$CI_ROOT/validation/node-free-validation.json"
+      - name: Retain validation evidence in job diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${CI_ROOT:-}/validation" ]]; then
+            {
+              printf '### Native validation: %s\n\n' "$CI_LABEL"
+              printf 'Validation reports retained during this job (PRs receive no distribution credentials):\n\n'
+              "$RUNNER_TEMP/remnifold-ci-paths.exe" reports "$CI_ROOT/validation"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # 公開は検証 job の全成功を条件にする。needs に publish-r2 以外の全 job を並べ、if で各 result を確かめる
+  # （dev/src/ci.rs の契約テストが漏れを検査する。漏れるとテスト失敗のまま公開され得るため）。
   publish-r2:
     name: publish-r2
-    needs: native-package
+    needs:
+      - native-package
+      - windows-server-contracts
+      - windows-native-contracts
     if: >-
       needs.native-package.result == 'success' &&
+      needs.windows-server-contracts.result == 'success' &&
+      needs.windows-native-contracts.result == 'success' &&
       github.event_name == 'push' &&
       github.repository == '1llum1n4t1s/remnifold' &&
       github.workflow_ref == format('{0}/.github/workflows/ci.yml@{1}', github.repository, github.ref) &&

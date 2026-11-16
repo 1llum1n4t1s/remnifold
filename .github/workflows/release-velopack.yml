@@ -2,7 +2,8 @@
 # 厳格な install 用の releases/<version>/index.json を配信する ci.yml とは別のワークフローで、互いに触れない。
 #
 # 方針:
-# - 実行可能な Actions を使わない（ci.yml と同じ）。checkout は git のコマンドで行い、Sigilune は R2 配布の版と
+# - 実行可能な Actions を使わない（R2 と署名の Secrets を持つため。SHA 固定の Action を使う ci.yml とは異なる）。
+#   checkout は git のコマンドで行い、Sigilune は R2 配布の版と
 #   コミット SHA を固定して git で取得して導入する。成果物の受け渡しに upload-artifact が要らないよう、
 #   梱包・署名と配信は同じジョブで行う。
 # - 署名の Secrets と R2 の Secrets は、それぞれ使う step だけへ渡す（梱包・ビルドの step には渡さない）。
