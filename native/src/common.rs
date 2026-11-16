@@ -422,6 +422,8 @@ pub fn get_read_context(cwd: &Path, settings: &Value) -> Result<Value> {
 pub struct ApiError {
     pub status: Option<u16>,
     pub unsupported_global_search: bool,
+    /// 応答の Retry-After（秒指定のみ）をミリ秒にしたもの。想起の再試行間隔の判断にだけ使う。
+    pub retry_after_ms: Option<u64>,
 }
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -504,14 +506,23 @@ fn api_with_limit(
     let response = request.send().map_err(|_| ApiError {
         status: None,
         unsupported_global_search: false,
+        retry_after_ms: None,
     })?;
     let status = response.status();
+    // Retry-After は秒数の形式だけを読む（日付形式や不正値は無視して None）。上限は1時間。
+    let retry_after_ms = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|s| s.min(3600) * 1000);
     if let Some(maximum) = maximum_bytes {
         use std::io::Read;
         if !status.is_success() {
             return Err(ApiError {
                 status: Some(status.as_u16()),
                 unsupported_global_search: false,
+                retry_after_ms,
             }
             .into());
         }
@@ -538,6 +549,7 @@ fn api_with_limit(
         return Err(ApiError {
             status: Some(status.as_u16()),
             unsupported_global_search: unsupported,
+            retry_after_ms,
         }
         .into());
     }

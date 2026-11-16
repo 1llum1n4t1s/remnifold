@@ -5,6 +5,7 @@ use chrono::TimeZone;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::{thread, time::Duration};
 use unicode_normalization::UnicodeNormalization;
 
 fn re(pattern: &'static str) -> Regex {
@@ -839,13 +840,54 @@ fn timeout(options: &Value) -> Result<u64> {
     Ok(timeout)
 }
 fn request(config: &Config, path: &str, body: Option<&Value>, options: &Value) -> Result<Value> {
-    api(
-        config,
-        path,
-        if body.is_some() { "POST" } else { "GET" },
-        body,
-        timeout(options)?,
-    )
+    let method = if body.is_some() { "POST" } else { "GET" };
+    let Some(deadline) = options["deadlineEpochMs"].as_u64() else {
+        // 締切のない呼び出し（MCP の手動検索など）は従来どおり 1 回だけ送る。
+        return api(config, path, method, body, timeout(options)?);
+    };
+    // 締切のある呼び出し（フックの想起）: 複数プロセスの同時起動で D1 が過負荷（503/429）になるため、
+    // (1) プロセス間で同時に API へ出す読み取り数を絞り、(2) 一時エラーは締切内で短く再試行する。
+    // どちらも締切を超えて待たない。待ち切れなければエラーを返し、呼び出し側が通知して続行する（フェイルオープン）。
+    let locks = config.roots.state_dir("recall-locks");
+    let mut attempt = 0;
+    loop {
+        let milliseconds = timeout(options)?;
+        let give_up_at = std::time::Instant::now()
+            + Duration::from_millis(
+                remaining_ms(deadline).saturating_sub(crate::throttle::MIN_ATTEMPT_MS),
+            );
+        let permit = crate::throttle::acquire(&locks, crate::throttle::SLOTS, give_up_at)
+            .map_err(|_| anyhow::anyhow!("Memory request deadline exceeded"))?;
+        // スロット待ちで時間を使ったため、送信直前に残り時間から試行の上限を計り直す。
+        let milliseconds = milliseconds.min(timeout(options)?);
+        let result = api(config, path, method, body, milliseconds);
+        // 再試行の待ち時間はスロットを持たない（他のプロセスに譲る）。
+        drop(permit);
+        let error = match result {
+            Err(error) => error,
+            ok => return ok,
+        };
+        let (status, retry_after) = match error.downcast_ref::<crate::common::ApiError>() {
+            Some(e) => (e.status, e.retry_after_ms),
+            None => (None, None),
+        };
+        if attempt + 1 >= crate::throttle::MAX_ATTEMPTS
+            || !crate::throttle::retryable_status(status)
+        {
+            return Err(error);
+        }
+        match crate::throttle::retry_delay(attempt, retry_after, remaining_ms(deadline)) {
+            Some(delay) => thread::sleep(Duration::from_millis(delay)),
+            None => return Err(error),
+        }
+        attempt += 1;
+    }
+}
+fn remaining_ms(deadline: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    deadline.saturating_sub(now)
 }
 pub fn discover_search_containers(config: &Config) -> Result<Value> {
     discover(config, &json!({}))

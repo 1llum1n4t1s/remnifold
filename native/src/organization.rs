@@ -439,7 +439,8 @@ mod tests {
                 true,
                 anyhow::Error::new(common::ApiError {
                     status: Some(400),
-                    unsupported_global_search: false
+                    unsupported_global_search: false,
+                    retry_after_ms: None
                 })
             )
             .to_string()
@@ -497,6 +498,7 @@ mod tests {
             common::ApiError {
                 status: Some(404),
                 unsupported_global_search: false,
+                retry_after_ms: None,
             }
             .into()
         };

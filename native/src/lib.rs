@@ -14,5 +14,6 @@ pub mod paths;
 pub mod provision;
 pub mod release_manifest;
 pub mod search;
+pub mod throttle;
 pub mod topics_setup;
 pub mod updater;
