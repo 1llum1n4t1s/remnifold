@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    # Dependabot PRs validate Windows consumers; Unix inputs are verified on release pushes.
+    # Dependabot の PR は別の検証 workflow で扱う。
     branches-ignore:
       - 'dependabot/**'
     # Release publication is verified on release/*, not on tag pushes.
@@ -21,13 +21,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 4 ターゲットとも GitHub 提供ランナーが自分のネイティブ環境でビルドする（クロスビルド・手元ビルドは使わない）。
+          # Linux x64 は glibc の下限を保つため latest ではなく ubuntu-24.04 に固定する。
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: windows-latest
+          - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: windows-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     # Environment deployment-branch policies are the credential boundary. Only
@@ -70,6 +72,11 @@ jobs:
       - name: Install locked Rust toolchain
         # Bootstrap uses the hosted runner's managed TEMP until isolation is configured.
         run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
+      - name: Assert the runner builds the matrix target natively
+        # matrix の runs-on の取り違え（例: ARM ランナーで x64 を作る）を、ビルド前に失敗させて防ぐ。
+        run: |
+          set -euo pipefail
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$CI_TARGET"
       - name: Configure isolated output directories
         run: |
           set -euo pipefail
@@ -141,16 +148,12 @@ jobs:
           workspaces: '. -> target'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Prepare pinned native build tools
-        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask prepare
       - name: Build native consumer archive
-        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask package --target "$CI_TARGET" --source-commit "$GITHUB_SHA"
       - name: Verify final native archive before publication
-        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask verify --target "$CI_TARGET" --binary "$REMNIFOLD_PACKAGE_BINARY" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --source-commit "$GITHUB_SHA"
       - name: Exercise native plugin update and recovery
-        if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo xtask updater-test --binary "$REMNIFOLD_PACKAGE_BINARY" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --work-root "$CI_ROOT/validation/updater"
       - name: Verify no JavaScript runtime was invoked through PATH
         if: always()
@@ -189,11 +192,7 @@ jobs:
           R2_CI_SECRET_ACCESS_KEY: ${{ secrets.R2_CI_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          if [[ "$CI_TARGET" == "x86_64-pc-windows-msvc" ]]; then
-            cargo xtask r2-stage --target "$CI_TARGET" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --binary "$REMNIFOLD_PACKAGE_BINARY" --source-commit "$GITHUB_SHA" --apply
-          else
-            cargo xtask local-input import --target "$CI_TARGET" --work-root "$CI_ROOT/local-input" --apply
-          fi
+          cargo xtask r2-stage --target "$CI_TARGET" --archive "$GITHUB_WORKSPACE/dist/remnifold-$CI_TARGET.tar.gz" --binary "$REMNIFOLD_PACKAGE_BINARY" --source-commit "$GITHUB_SHA" --apply
 
   # Worker の型チェックと real-workerd のサーバーテスト。native-package から分けて並列に走らせる。
   # 配布の資格情報を持たない検証専用 job で、Environment を選ばず、読み取り権限だけで動く。

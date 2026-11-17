@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 変更
+
+- macOS と Linux（x64/ARM64）の配布物を、手元ビルドして private R2 へ置く `local-input` 方式から、`release/*` の push で CI が GitHub 提供ランナー（`macos-latest`、`ubuntu-24.04`、`ubuntu-24.04-arm`）上で直接ビルド・検証・ステージする方式へ移しました。4 ターゲットとも prepare・package・verify・updater-test を同じ手順で行い、main と PR でも秘密なしの validation Environment で同じビルドと検証を実際に実行します。各 leg は、ビルド前に `rustc` の host が対象 target と一致することを確かめ、ランナーの取り違えを防ぎます。
+- 廃止した `local-input` コマンドとその private R2 の入力記録を削除しました。公開側（publish-r2）の検証と契約は変えていません。1.0.31 以前の Unix 配布物は local input 経由でした。
 ## 1.0.31 - 2026-11-16
 
 ### 修正

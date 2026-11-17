@@ -46,9 +46,6 @@ fn run() -> Result<()> {
         .to_path_buf();
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());
-    if command == "local-input" {
-        return r2::local_input(&args.collect::<Vec<_>>());
-    }
     if command == "r2-stage" {
         return r2::stage(&args.collect::<Vec<_>>());
     }

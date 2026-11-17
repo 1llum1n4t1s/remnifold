@@ -446,21 +446,62 @@ mod tests {
         }
         // Action の許可・固定・配置は ci_actions_are_allowlisted_sha_pinned_and_kept_out_of_release_credentials が検査する。
         assert!(!workflow.contains("setup-node") && !workflow.contains("upload-artifact"));
-        assert_eq!(
-            workflow.matches("          - os: windows-latest").count(),
-            4
-        );
+        // 4 ターゲットは GitHub 提供ランナーがネイティブにビルドする。target と runs-on の対応を厳密に照合する
+        // （Linux x64 は glibc の下限を保つため ubuntu-latest ではなく ubuntu-24.04 に固定）。
+        for (os, target) in [
+            ("windows-latest", "x86_64-pc-windows-msvc"),
+            ("macos-latest", "aarch64-apple-darwin"),
+            ("ubuntu-24.04", "x86_64-unknown-linux-gnu"),
+            ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+        ] {
+            assert_eq!(
+                workflow
+                    .matches(&format!("          - os: {os}\n            target: {target}\n"))
+                    .count(),
+                1,
+                "{target} must run on {os}"
+            );
+        }
+        assert_eq!(workflow.matches("          - os: ").count(), 4);
         assert!(!workflow.contains("target: x86_64-apple-darwin"));
-        assert!(workflow.contains("cargo xtask local-input import --target"));
+        // 手元ビルドの local-input 方式は廃止した。
+        assert!(!workflow.contains("local-input"));
+        let blocks = job_blocks(workflow);
+        let matrix = job(&blocks, "native-package");
+        // 4 つの step は全ターゲットで無条件に動く（main / PR でも実際にビルドと検証を行う）。
         for name in [
+            "Prepare pinned native build tools",
             "Build native consumer archive",
             "Verify final native archive before publication",
             "Exercise native plugin update and recovery",
         ] {
-            assert!(workflow.contains(&format!(
-                "      - name: {name}\n        if: matrix.target == 'x86_64-pc-windows-msvc'"
-            )));
+            let step = matrix
+                .split_once(&format!("      - name: {name}\n"))
+                .unwrap_or_else(|| panic!("missing step {name}"))
+                .1
+                .split("\n      - name: ")
+                .next()
+                .unwrap();
+            assert!(!step.contains("if:"), "{name} must run for every target");
         }
+        // ステージは r2-stage を 1 回だけ、ターゲットで分岐せずに呼ぶ。
+        let stage = matrix
+            .split_once("      - name: Stage verified native archive")
+            .unwrap()
+            .1;
+        assert_eq!(stage.matches("cargo xtask r2-stage").count(), 1);
+        assert!(!stage.contains("$CI_TARGET\" ==") && !stage.contains("if [["));
+        // ランナーの取り違えは、toolchain の導入直後（ビルド前）に host と matrix.target の一致で防ぐ。
+        let install = matrix
+            .find("      - name: Install locked Rust toolchain")
+            .unwrap();
+        let assert_host = matrix
+            .find("test \"$(rustc -vV | sed -n 's/^host: //p')\" = \"$CI_TARGET\"")
+            .expect("host assertion must exist");
+        let prepare = matrix
+            .find("      - name: Prepare pinned native build tools")
+            .unwrap();
+        assert!(install < assert_host && assert_host < prepare);
         assert!(workflow.contains("absolute executable paths are not intercepted"));
         // SHA 固定の Action は Dependabot（github-actions）が SHA と版コメントを更新する。
         assert!(
