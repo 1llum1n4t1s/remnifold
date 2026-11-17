@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.32 - 2026-11-18
+
 ### 変更
 
 - macOS と Linux（x64/ARM64）の配布物を、手元ビルドして private R2 へ置く `local-input` 方式から、`release/*` の push で CI が GitHub 提供ランナー（`macos-latest`、`ubuntu-24.04`、`ubuntu-24.04-arm`）上で直接ビルド・検証・ステージする方式へ移しました。4 ターゲットとも prepare・package・verify・updater-test を同じ手順で行い、main と PR でも秘密なしの validation Environment で同じビルドと検証を実際に実行します。各 leg は、ビルド前に `rustc` の host が対象 target と一致することを確かめ、ランナーの取り違えを防ぎます。
