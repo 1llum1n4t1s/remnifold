@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.33 - 2026-11-18
+
+### 変更
+
+- 配信の起点を、`release/<版>`ブランチのpushから、mainのコミットに付けた軽量タグ`v<x.y.z>`のpushへ移しました（GitHub Releaseは作りません）。Setup（Velopack）の配信ワークフロー`release-velopack.yml`は、Secretsを持たない`gate`ジョブ（`scripts/velopack/wait-main-ci.sh`）で、タグが厳密な`v<x.y.z>`で`plugin.json`の版と一致すること、軽量タグで対象コミットを指すこと、そのコミットが既定ブランチの祖先であることを確かめてから、同じコミットのmainへのpushで起動した`ci.yml`の成功を待ちます。各配信ジョブも`cargo xtask ci-release-tag`で版タグを照合します。やり直しは同じタグをrefにした手動起動です。
+- Setupの`osx`・`linux-x64`・`linux-arm64`チャネルを同じワークフローで自動配信するようにしました（`macos-latest`でDeveloper IDの署名・公証、`ubuntu-24.04`/`ubuntu-24.04-arm`でAppImageの梱包とglibc 2.39以下の検査）。4チャネルは互いに独立し、配信済みの版は飛ばし、より新しい版が載っているチャネルでは失敗します。`pack-macos.sh`に、事前にビルドしたtargetを使う`--cargo-target-dir`を追加しました。
+- 厳格な`install`経路は1.0.32で凍結しました。新しい版はSetupだけで配信し、`releases/<版>/index.json`の公開（`ci.yml`の`publish-r2`）は行いません。`install`・`--verify-only`のコード、`ci.yml`、既存の`release/*`ブランチと公開物は変えないので、インストール済みの版の検証は引き続き動きます。署名済みbootstrap実行ファイルの配信は続けます（`install`で導入できるのは1.0.32以前の版です）。READMEの9言語・`AGENTS.md`・`DESIGN.md`・`setup-remnifold`スキルを合わせて更新しました。
+
 ## 1.0.32 - 2026-11-18
 
 ### 変更
