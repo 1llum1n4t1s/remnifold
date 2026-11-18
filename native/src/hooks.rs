@@ -411,6 +411,12 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
     if !["SessionStart", "UserPromptSubmit", "Stop"].contains(&event) {
         return Ok(json!({}));
     }
+    // Claude Code の Code Mode では、バックグラウンドで動くコードの出力ごとに
+    // UserPromptSubmit が `source: "poll_event"` で呼ばれる。これはユーザーの依頼ではないため、
+    // 検索・索引の注入・注入済み状態の更新をせずに返す。
+    if event == "UserPromptSubmit" && payload["source"] == "poll_event" {
+        return Ok(json!({}));
+    }
     let owned;
     let config = if let Some(c) = config {
         c
@@ -703,6 +709,20 @@ mod tests {
             .unwrap(),
             json!({})
         );
+    }
+
+    #[test]
+    fn user_prompt_submit_ignores_code_mode_poll_events() {
+        let (root, mut payload) = fixture();
+        payload["source"] = json!("poll_event");
+        payload["prompt"] = json!("Cloudflare D1 migration recall topic output");
+        let config = config(&root);
+        assert_eq!(
+            run_hook("UserPromptSubmit", &payload, Some(&config)).unwrap(),
+            json!({})
+        );
+        let state_dir = &config.roots.state_dirs(&config.codex_home, "recall-state")[0];
+        assert!(!state_dir.exists() || fs::read_dir(state_dir).unwrap().next().is_none());
     }
 
     #[test]
