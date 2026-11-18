@@ -26,7 +26,7 @@ ChatGPT에서는 [비공개 플러그인 설정](https://developers.openai.com/p
 
 ### Setup 설치 프로그램 (권장)
 
-Windows x64에서는 [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe)(게시자 서명 포함, 관리자 권한 불필요)를 내려받아 실행하세요. 아래에 설명하는 macOS와 Linux용 Setup 패키지는 아직 게시되지 않았으므로, 해당 플랫폼에서는 당분간 아래의 엄격한 설치를 사용하세요. Setup은 앱을 사용자 단위로 `%LOCALAPPDATA%\RemnifoldApp`에 설치하고, Claude Code와 Codex(명령줄 도구가 발견된 쪽만)에 등록한 뒤, 다음 단계인 서버 연결(`remnifold setup`)을 안내하는 첫 실행 가이드를 터미널에서 엽니다. 이 점검에는 GitHub 계정이 필요하지 않습니다. macOS(Apple Silicon)에서는 `RemnifoldApp-osx-Setup.pkg`(게시자의 Developer ID로 서명 및 공증됨)를 여세요. `Remnifold.app`이 설치되며("나만을 위해 설치"를 선택하면 `~/Applications`에, 모든 사용자용 설치는 `/Applications`에 들어갑니다. 후자에서는 업데이트를 적용할 때 관리자 암호를 묻는 경우가 있습니다), 앱을 한 번 실행하여 Claude Code와 Codex에 등록합니다. 클라이언트의 명령줄 도구를 나중에 설치한 경우에는 다음 Remnifold 시작 시 등록됩니다. 서버에 연결하려면 `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>`을 실행하세요(`~/Applications`에 설치했다면 경로를 조정하세요). Linux(x64 또는 ARM64)에서 Setup은 AppImage 하나(`RemnifoldApp-linux-x64.AppImage` 또는 `RemnifoldApp-linux-arm64.AppImage`)입니다. 보관할 위치(예: `~/Applications`)에 두고 실행 권한을 부여한 뒤 인수 없이 한 번 실행하면 해당 AppImage가 Claude Code와 Codex에 등록되며, 나중에 파일을 옮기면 다음 시작 시 새 위치가 등록됩니다. 서버에 연결하려면 `<path-to-AppImage> setup --base-url <URL>`을 실행하세요. AppImage에는 코드 서명이 없으므로, Linux에서 앱은 업데이트 사이트의 HTTPS와 업데이트 피드의 체크섬을 신뢰합니다.
+Windows x64에서는 [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe)(게시자 서명 포함, 관리자 권한 불필요)를 내려받아 실행하세요. 아래에 설명하는 macOS와 Linux용 Setup 패키지는 1.0.32 다음 버전부터 Windows용과 함께 게시됩니다. Setup은 앱을 사용자 단위로 `%LOCALAPPDATA%\RemnifoldApp`에 설치하고, Claude Code와 Codex(명령줄 도구가 발견된 쪽만)에 등록한 뒤, 다음 단계인 서버 연결(`remnifold setup`)을 안내하는 첫 실행 가이드를 터미널에서 엽니다. 이 점검에는 GitHub 계정이 필요하지 않습니다. macOS(Apple Silicon)에서는 `RemnifoldApp-osx-Setup.pkg`(게시자의 Developer ID로 서명 및 공증됨)를 여세요. `Remnifold.app`이 설치되며("나만을 위해 설치"를 선택하면 `~/Applications`에, 모든 사용자용 설치는 `/Applications`에 들어갑니다. 후자에서는 업데이트를 적용할 때 관리자 암호를 묻는 경우가 있습니다), 앱을 한 번 실행하여 Claude Code와 Codex에 등록합니다. 클라이언트의 명령줄 도구를 나중에 설치한 경우에는 다음 Remnifold 시작 시 등록됩니다. 서버에 연결하려면 `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>`을 실행하세요(`~/Applications`에 설치했다면 경로를 조정하세요). Linux(x64 또는 ARM64)에서 Setup은 AppImage 하나(`RemnifoldApp-linux-x64.AppImage` 또는 `RemnifoldApp-linux-arm64.AppImage`)입니다. 보관할 위치(예: `~/Applications`)에 두고 실행 권한을 부여한 뒤 인수 없이 한 번 실행하면 해당 AppImage가 Claude Code와 Codex에 등록되며, 나중에 파일을 옮기면 다음 시작 시 새 위치가 등록됩니다. 서버에 연결하려면 `<path-to-AppImage> setup --base-url <URL>`을 실행하세요. AppImage에는 코드 서명이 없으므로, Linux에서 앱은 업데이트 사이트의 HTTPS와 업데이트 피드의 체크섬을 신뢰합니다.
 
 업데이트는 자동입니다. MCP 세션이 실행되는 동안 앱은 하루에 최대 한 번 업데이트 피드를 확인하고(확인에 실패해도 하루를 기다립니다), 새 버전을 백그라운드에서 아무것도 방해하지 않고 내려받습니다. 새 버전은 다음 로그온 시에 적용되며(Windows: `Run` 항목, macOS: LaunchAgent `~/Library/LaunchAgents/com.kagayoi.RemnifoldApp.update.plist`, Linux: 자동 시작 항목 `~/.config/autostart/com.kagayoi.RemnifoldApp.update.desktop`), 다른 Remnifold 프로세스가 실행 중이 아닐 때만 적용되므로 열려 있는 세션이 닫히는 일은 없습니다. 적용하기 전에 앱은 내려받은 패키지의 모든 실행 파일이 게시자의 서명을 받았는지 검증합니다(macOS: 게시자의 Developer ID, Linux: 서명은 없지만 다운로드 폴더 `/var/tmp/velopack/RemnifoldApp`이 본인 소유이고 다른 사용자가 쓸 수 없어야 함). 이 기능을 끄려면 앱의 상태 폴더(`%APPDATA%\Remnifold`, `~/Library/Application Support/Remnifold`, Linux에서는 `$XDG_STATE_HOME/remnifold`(기본값 `~/.local/state/remnifold`), 또는 `<REMNIFOLD_HOME>/remnifold`)에 있는 `app-update.json`에 `"auto_update": false`를 설정하세요. 진단 정보는 같은 폴더의 `app-update.log`에 기록됩니다. 아래의 엄격한 설치를 이미 사용 중이라면, Setup은 Claude Code와 Codex 등록을 자신으로 전환하고 같은 연결과 메모리 상태를 사용합니다. 엄격한 설치의 파일은 그대로 남으므로 더 이상 필요 없으면 `%LOCALAPPDATA%\Programs\Remnifold`를 직접 삭제하세요. Setup 중에 등록을 끝내지 못한 경우(예: 클라이언트 CLI가 느린 경우)에는 다음 로그온 시 자동으로 다시 시도합니다. 제거는 Windows 설정에서 하며, Claude Code와 Codex 등록 및 로그온 항목이 함께 제거되고 연결과 메모리 상태는 유지됩니다. 이후 엄격한 설치로 되돌아가려면 해당 설치의 `connect claude-code --apply`와 `connect codex --apply`로 다시 등록하세요. 제거하지 않고 등록만 해제하려면 `remnifold connect claude-code --remove --apply`와 `remnifold connect codex --remove --apply`를 실행하세요.
 
@@ -47,6 +47,8 @@ Linux에도 제거 프로그램이 없습니다. AppImage를 삭제하기 전에
 `~/.config/remnifold`와 `~/.local/state/remnifold`의 연결, 구성, 메모리 상태는 유지되며, 내려받은 업데이트 캐시 `/var/tmp/velopack/RemnifoldApp`은 삭제해도 됩니다.
 
 ### 엄격한 설치 (고급)
+
+엄격한 설치는 최종 버전인 1.0.32에서 동결되었습니다. 새 버전은 위의 Setup 설치 프로그램(Windows, macOS, Linux x64 및 ARM64)으로만 게시되므로 `remnifold install`로 설치할 수 있는 버전은 1.0.32까지입니다. 이미 설치된 버전과 `--verify-only`는 계속 동작합니다. 새 버전으로 옮기려면 Setup 설치 프로그램을 실행하세요. Claude Code와 Codex 등록은 Setup이 넘겨받습니다.
 
 게시된 네이티브 패키지는 [Remnifold updates](https://remnifold-updates.kagayoi.com)에서 제공됩니다. 버전 인덱스는 `releases/<version>/index.json`이며, 그 매니페스트가 아래 각 대상에 대해 해시 이름의 아카이브를 선택합니다. 내려받은 실행 파일을 실행하기 전에 GitHub를 통해 게시를 인증하세요. R2 URL이나 커밋 상태 링크만으로는 출처가 증명되지 않습니다.
 
@@ -71,7 +73,7 @@ Mac Intel은 지원하지 않습니다.
 
 ### 최초 설치
 
-Windows에서는 릴리스 워크플로가 서명된 bootstrap 실행 파일을 R2의 버전이 붙은 변경 불가능한 키에 올립니다. 버전 1.0.30 이후에만 존재하며, 그보다 이전 버전은 신뢰할 수 있는 소스에서 첫 실행 파일을 직접 빌드하세요. 검증과 실행 사이에 다른 사용자가 내려받은 파일을 바꿔치기할 수 없는, 신뢰할 수 있는 기존 비공개 디렉터리를 선택하세요. 아래의 따옴표 안 버전과 경로를 바꾼 뒤 PowerShell에서 실행하세요.
+Windows에서는 릴리스 워크플로가 서명된 bootstrap 실행 파일을 R2의 버전이 붙은 변경 불가능한 키에 올립니다. 버전 1.0.30 이후에만 존재하며, 그보다 이전 버전은 신뢰할 수 있는 소스에서 첫 실행 파일을 직접 빌드하세요. `install`은 엄격한 설치 버전만 받으므로 버전은 1.0.30부터 1.0.32 중 하나로 지정하세요. 검증과 실행 사이에 다른 사용자가 내려받은 파일을 바꿔치기할 수 없는, 신뢰할 수 있는 기존 비공개 디렉터리를 선택하세요. 아래의 따옴표 안 버전과 경로를 바꾼 뒤 PowerShell에서 실행하세요.
 
 ```powershell
 $version = '<published-version>'

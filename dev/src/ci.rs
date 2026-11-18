@@ -21,6 +21,42 @@ pub fn release_branch(repo: &std::path::Path) -> Result<()> {
     release_identity(&manifest["version"], &std::env::var("GITHUB_REF")?)
 }
 
+/// Setup（Velopack）の配信タグの照合。ref は `refs/tags/v<版>` に完全一致し、ref の種類は tag であること。
+/// 版は先頭の 0 を持たない数字 3 つ（`v1`、`v1.2.3-rc`、`v01.2.3` などのタグでは配信しない）。
+fn release_tag_identity(version: &Value, reference: &str, reference_type: &str) -> Result<()> {
+    let version = version
+        .as_str()
+        .filter(|version| {
+            let parts: Vec<&str> = version.split('.').collect();
+            parts.len() == 3
+                && parts.iter().all(|part| {
+                    !part.is_empty()
+                        && part.bytes().all(|b| b.is_ascii_digit())
+                        && (*part == "0" || !part.starts_with('0'))
+                })
+        })
+        .context("Invalid package version")?;
+    ensure!(
+        reference_type == "tag",
+        "Publication starts only from a tag"
+    );
+    ensure!(
+        reference == format!("refs/tags/v{version}"),
+        "Release tag does not match package version"
+    );
+    Ok(())
+}
+
+pub fn release_tag(repo: &std::path::Path) -> Result<()> {
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(repo.join(".codex-plugin/plugin.json"))?)?;
+    release_tag_identity(
+        &manifest["version"],
+        &std::env::var("GITHUB_REF")?,
+        &std::env::var("GITHUB_REF_TYPE")?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,32 +267,60 @@ mod tests {
         }
     }
 
-    // Setup（Velopack）の配信ワークフローの契約。release/* への push で起動し、公開バケットへ書くのは
-    // 「同じコミットの ci.yml が成功し publish-r2 が成功済み」を gate が確認した後の windows-installer だけ。
-    // gate は Secrets・Environment を持たない。ci.yml に署名を持ち込まないこと（署名の失敗が strict 公開の
-    // witness を壊さないため）も併せて確かめる。
+    /// release-velopack.yml の step を `      - name: ` ごとに切り分ける（各要素は名前の行から次の step の手前まで）。
+    fn steps(block: &str) -> Vec<&str> {
+        block.split("\n      - name: ").skip(1).collect()
+    }
+
+    // Setup（Velopack）の配信ワークフローの契約。main のコミットに付けた版タグ v<x.y.z> の push（またはそのタグを
+    // ref にした手動起動）で起動し、公開バケットへ書くのは、gate がタグと「同じコミットの main の ci.yml の成功」を
+    // 確かめた後の 4 チャネル（win・osx・linux-x64・linux-arm64）の配信 job だけ。gate は Secrets・Environment を
+    // 持たない。厳格な install 経路は 1.0.32 で凍結したので publish-r2 の成功は求めない。ci.yml に署名を持ち込まない
+    // ことも併せて確かめる。
     #[test]
-    fn release_velopack_starts_on_release_pushes_only_after_the_gate() {
+    fn release_velopack_starts_on_version_tags_only_after_the_gate() {
         let workflow = include_str!("../../.github/workflows/release-velopack.yml");
-        let (header, jobs) = workflow.split_once("\njobs:\n").unwrap();
+        let (header, _) = workflow.split_once("\njobs:\n").unwrap();
         let triggers = header.split_once("\non:\n").unwrap().1;
-        assert!(triggers.contains("  push:\n    branches:\n      - 'release/**'\n"));
+        assert!(triggers.contains("  push:\n    tags:\n      - 'v[0-9]+.[0-9]+.[0-9]+'\n"));
         assert!(triggers.contains("  workflow_dispatch:"));
-        for forbidden in ["tags", "workflow_run", "pull_request"] {
+        for forbidden in ["branches", "release/", "workflow_run", "pull_request"] {
             assert!(
                 !triggers.contains(forbidden),
                 "{forbidden} must not start the release"
             );
         }
-        // concurrency はワークフロー直下ではなく windows-installer だけに掛ける（gate の待機で枠を占有しない）。
+        // concurrency はワークフロー直下ではなく配信 job ごとに掛ける（gate の待機で枠を占有しない）。
         assert!(!workflow.contains("\nconcurrency:"));
+        // 実行可能な Actions を使わない。
+        assert!(!workflow.lines().any(|line| {
+            line.trim_start()
+                .trim_start_matches("- ")
+                .starts_with("uses:")
+        }));
+        assert!(!workflow.contains("refs/heads/release/"));
+        assert!(!workflow.contains("ci-release-branch"));
+        assert!(!workflow.contains("publish-r2\n") && !workflow.contains("wait-ci-publication"));
 
-        let (gate, installer) = jobs.split_once("\n  windows-installer:").unwrap();
+        let blocks = job_blocks(workflow);
+        let ids: Vec<&str> = blocks.iter().map(|block| block.0).collect();
+        assert_eq!(
+            ids,
+            [
+                "gate",
+                "windows-installer",
+                "macos-installer",
+                "linux-installer"
+            ]
+        );
+        let scope = "github.repository == '1llum1n4t1s/remnifold' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v')";
+
+        let gate = job(&blocks, "gate");
         assert!(gate.contains("  gate:\n    name: gate"));
+        assert!(gate.contains(&format!("    if: {scope}\n")));
         assert!(gate.contains("runs-on: ubuntu-latest"));
-        assert!(gate.contains("actions: read") && gate.contains("contents: read"));
-        assert!(gate.contains("scripts/velopack/wait-ci-publication.sh"));
-        assert!(gate.contains("startsWith(github.ref, 'refs/heads/release/')"));
+        assert!(gate.contains("    permissions:\n      actions: read\n      contents: read\n"));
+        assert!(gate.contains("run: bash scripts/velopack/wait-main-ci.sh"));
         for forbidden in [
             "environment:",
             "secrets.",
@@ -264,9 +328,10 @@ mod tests {
             "r2-release",
             "SIGILUNE",
             "R2_",
+            "APPLE_",
             "concurrency:",
             "statuses: write",
-            "uses:",
+            "needs:",
         ] {
             assert!(
                 !gate.contains(forbidden),
@@ -274,44 +339,139 @@ mod tests {
             );
         }
 
-        assert!(installer.contains("needs: gate"));
-        assert!(installer.contains("environment: r2-release"));
-        assert!(installer.contains(
-            "    concurrency:\n      group: release-velopack\n      cancel-in-progress: false\n"
-        ));
-        assert!(installer.contains("github.repository == '1llum1n4t1s/remnifold'"));
+        // 配信 job: gate だけを needs に持ち（互いに独立）、タグに限り、Secrets を使う step より前に版タグを照合し、
+        // 配信済みのチャネルは飛ばす。concurrency はチャネルごと（同じ group に入れると待機中の job が取り消される）。
+        for (id, group, feed) in [
+            (
+                "windows-installer",
+                "release-velopack",
+                "https://remnifold-updates.kagayoi.com/velopack/releases.win.json",
+            ),
+            (
+                "macos-installer",
+                "release-velopack-osx",
+                "https://remnifold-updates.kagayoi.com/velopack/releases.osx.json",
+            ),
+            (
+                "linux-installer",
+                "release-velopack-${{ matrix.channel }}",
+                "https://remnifold-updates.kagayoi.com/velopack/releases.${{ matrix.channel }}.json",
+            ),
+        ] {
+            let block = job(&blocks, id);
+            assert!(
+                block.contains("\n    needs: gate\n"),
+                "{id} must need gate only"
+            );
+            assert!(block.contains(&format!("    if: {scope}\n")), "{id} if");
+            assert!(
+                block.contains("\n    environment: r2-release\n"),
+                "{id} environment"
+            );
+            assert!(
+                block.contains(&format!(
+                    "    concurrency:\n      group: {group}\n      cancel-in-progress: false\n"
+                )),
+                "{id} concurrency"
+            );
+            assert!(block.contains(feed), "{id} must check its published feed");
+            assert!(block.contains("A newer version is already published"));
+            let steps = steps(block);
+            let tag_check = steps
+                .iter()
+                .position(|step| step.contains("cargo xtask ci-release-tag"))
+                .unwrap_or_else(|| panic!("{id} must run ci-release-tag"));
+            let skip = steps
+                .iter()
+                .position(|step| step.starts_with("Skip when this version is already published"))
+                .unwrap_or_else(|| panic!("{id} must skip published versions"));
+            assert!(tag_check < skip);
+            for (index, step) in steps.iter().enumerate() {
+                if step.contains("secrets.") {
+                    assert!(index > skip, "{id}: secrets before the tag check");
+                    assert!(
+                        step.contains("if: env.PUBLISHED != 'true'"),
+                        "{id}: a step with secrets must be skipped for published versions"
+                    );
+                }
+            }
+            let publish = steps
+                .iter()
+                .filter(|step| step.contains("scripts/velopack/publish-r2.ps1"))
+                .count();
+            assert_eq!(publish, 1, "{id} publishes once");
+        }
+
+        let windows = job(&blocks, "windows-installer");
+        assert!(windows.contains("runs-on: windows-latest"));
+        assert!(windows.contains("-Channel win"));
+        // Sigilune は版とコミット SHA の固定で取得する（リポジトリ変数の版指定は使わない）。
+        assert!(windows.contains("$sigiluneVersion") && windows.contains("$sigiluneCommit"));
+        assert!(!workflow.contains("vars.SIGILUNE_VERSION"));
+        assert!(windows.contains("secrets.SIGILUNE_EMAIL"));
+        assert!(windows.contains("secrets.R2_RELEASE_ACCESS_KEY_ID"));
+        assert!(windows.contains("remnifold-bootstrap-*-x86_64-pc-windows-msvc.exe"));
+
+        let macos = job(&blocks, "macos-installer");
+        assert!(macos.contains("runs-on: macos-latest"));
+        assert!(macos.contains("test \"$(uname -s)-$(uname -m)\" = 'Darwin-arm64'"));
         assert!(
-            installer.contains(
-                "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"
+            macos.contains(
+                "bash scripts/velopack/pack-macos.sh \"$work\" --sign --cargo-target-dir"
             )
         );
-        assert!(installer.contains("startsWith(github.ref, 'refs/heads/release/')"));
-        assert!(installer.contains("cargo xtask ci-release-branch"));
-        // Sigilune は版とコミット SHA の固定で取得する（リポジトリ変数の版指定は使わない）。
-        assert!(installer.contains("$sigiluneVersion") && installer.contains("$sigiluneCommit"));
-        assert!(!workflow.contains("vars.SIGILUNE_VERSION"));
-        // 署名と R2 の Secrets はこのジョブの専用 step にだけ渡す。
-        assert!(installer.contains("secrets.SIGILUNE_EMAIL"));
-        assert!(installer.contains("secrets.R2_RELEASE_ACCESS_KEY_ID"));
-        assert!(!workflow.lines().any(|line| {
-            line.trim_start()
-                .trim_start_matches("- ")
-                .starts_with("uses:")
-        }));
+        assert!(!macos.contains("--pack-id") && !macos.contains("--binary"));
+        assert!(macos.contains("-Channel osx"));
+        assert!(macos.contains("security delete-keychain"));
+        // Apple の Secrets はキーチェーンの準備 step にだけ渡す。
+        let macos_steps = steps(macos);
+        for step in &macos_steps {
+            if step.contains("secrets.APPLE_") {
+                assert!(step.starts_with("Prepare the signing keychain\n"));
+            }
+        }
+        assert_eq!(
+            macos_steps
+                .iter()
+                .filter(|step| step.contains("secrets.APPLE_"))
+                .count(),
+            1
+        );
+
+        let linux = job(&blocks, "linux-installer");
+        assert!(linux.contains(
+            "          - os: ubuntu-24.04\n            channel: linux-x64\n            machine: x86_64\n"
+        ));
+        assert!(linux.contains(
+            "          - os: ubuntu-24.04-arm\n            channel: linux-arm64\n            machine: aarch64\n"
+        ));
+        assert!(linux.contains("fail-fast: false"));
+        assert!(linux.contains("squashfs-tools"));
+        assert!(linux.contains("bash scripts/velopack/pack-linux.sh \"$work\"\n"));
+        assert!(linux.contains("[[ \"$highest\" == 2.39 ]]"));
+        assert!(linux.contains("-Channel '${{ matrix.channel }}'"));
+        assert!(!linux.contains("APPLE_") && !linux.contains("SIGILUNE"));
+
         // 署名は ci.yml へ入れない。
         let ci = include_str!("../../.github/workflows/ci.yml").to_ascii_lowercase();
         assert!(!ci.contains("sigilune") && !ci.contains("authenticode"));
     }
 
     #[test]
-    fn release_gate_script_requires_a_single_successful_publisher() {
-        let script = include_str!("../../scripts/velopack/wait-ci-publication.sh");
-        assert!(script.contains("publish-r2"));
-        assert!(script.contains("attempts/$run_attempt/jobs"));
+    fn release_gate_script_verifies_the_tag_and_waits_for_default_branch_ci() {
+        let script = include_str!("../../scripts/velopack/wait-main-ci.sh");
+        assert!(script.contains("[[ \"$ref_type\" == tag ]]"));
+        assert!(script.contains("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"));
+        assert!(script.contains("repos/$repository/git/ref/tags/$tag"));
+        assert!(script.contains("is not a lightweight tag"));
+        assert!(script.contains("repos/$repository/compare/$sha...$default_branch"));
         assert!(script.contains("workflows/ci.yml/runs"));
+        assert!(script.contains("r.get(\"head_branch\") == branch"));
         assert!(script.contains("head_sha"));
-        // 失敗・取消は待たずに即失敗にする。
+        // 失敗・取消は待たずに即失敗にする。厳格な公開（publish-r2）は求めない。
         assert!(script.contains("concluded"));
+        assert!(!script.contains("attempts/$run_attempt/jobs"));
+        assert!(!script.contains("== \"publish-r2\""));
     }
 
     #[test]
@@ -327,6 +487,39 @@ mod tests {
         }
         for version in [Value::Null, json!(16), json!(""), json!("1.0.16\n")] {
             assert!(release_identity(&version, "refs/heads/release/1.0.16").is_err());
+        }
+    }
+
+    #[test]
+    fn release_tag_must_match_manifest_version_exactly() {
+        assert!(release_tag_identity(&json!("1.0.33"), "refs/tags/v1.0.33", "tag").is_ok());
+        assert!(release_tag_identity(&json!("0.10.0"), "refs/tags/v0.10.0", "tag").is_ok());
+        for reference in [
+            "refs/tags/1.0.33",
+            "refs/heads/v1.0.33",
+            "refs/tags/v1.0.33-rc",
+            "refs/tags/v1.0.32",
+            "refs/tags/v1",
+            "refs/heads/release/1.0.33",
+            "refs/heads/main",
+        ] {
+            assert!(release_tag_identity(&json!("1.0.33"), reference, "tag").is_err());
+        }
+        // ref の名前が合っていても、ブランチなら拒否する。
+        assert!(release_tag_identity(&json!("1.0.33"), "refs/tags/v1.0.33", "branch").is_err());
+        assert!(release_tag_identity(&json!("1.0.33"), "refs/tags/v1.0.33", "").is_err());
+        for version in [
+            Value::Null,
+            json!(33),
+            json!(""),
+            json!("1.0.33\n"),
+            json!("1.0"),
+            json!("1.0.33-rc"),
+            json!("01.0.33"),
+            json!("1.0.033"),
+        ] {
+            let reference = format!("refs/tags/v{}", version.as_str().unwrap_or("1.0.33"));
+            assert!(release_tag_identity(&version, &reference, "tag").is_err());
         }
     }
 
@@ -456,7 +649,9 @@ mod tests {
         ] {
             assert_eq!(
                 workflow
-                    .matches(&format!("          - os: {os}\n            target: {target}\n"))
+                    .matches(&format!(
+                        "          - os: {os}\n            target: {target}\n"
+                    ))
                     .count(),
                 1,
                 "{target} must run on {os}"

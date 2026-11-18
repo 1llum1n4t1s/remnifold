@@ -61,6 +61,12 @@ fn run() -> Result<()> {
         }
         return ci::release_branch(&repo);
     }
+    if command == "ci-release-tag" {
+        if args.next().is_some() {
+            bail!("ci-release-tag does not accept arguments");
+        }
+        return ci::release_tag(&repo);
+    }
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         println!(
             "cargo xtask <prepare|type-check|native-test|server-test|client-test|updater-test|bootstrap-test|package|verify|check>\n\nOptions: --tool-root <absolute-cache> --work-root <absolute-output>\nPackage: --target <Rust target> --binary <executable> --output <archive>\nSource: --source-mode commit|checkout (package/verify default: commit)\nVerify/update tests: --archive <archive> [--legacy-archive <old-JS-package>] [--previous-archive <old-native-package>]"

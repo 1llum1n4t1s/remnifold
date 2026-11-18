@@ -26,7 +26,7 @@
 
 ### Setup 安裝程式（建議）
 
-在 Windows x64 上，下載 [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe)（由發行者簽署，不需要系統管理員權限）並執行。下文所述的 macOS 與 Linux Setup 套件尚未發布；在這些平台上，目前請先使用下方的嚴格安裝。Setup 會以你的使用者身分把應用程式安裝到 `%LOCALAPPDATA%\RemnifoldApp`，並將它註冊到 Claude Code 與 Codex（僅限找得到命令列工具的那些），然後在終端機開啟首次執行引導，說明下一步：連接你的伺服器（`remnifold setup`）。其檢查不需要 GitHub 帳號。在 macOS（Apple Silicon）上，請開啟 `RemnifoldApp-osx-Setup.pkg`（以發行者的 Developer ID 簽署並經過公證）。它會安裝 `Remnifold.app`（選擇「僅為我安裝」會放在 `~/Applications`；為所有使用者安裝則會放在 `/Applications`，此時套用更新可能需要系統管理員密碼），並啟動應用程式一次，藉此把它註冊到 Claude Code 與 Codex。若用戶端的命令列工具是稍後才安裝，下次啟動 Remnifold 時就會註冊它。執行 `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>`（若安裝在 `~/Applications`，請調整路徑）即可連接你的伺服器。在 Linux（x64 或 ARM64）上，Setup 是單一 AppImage（`RemnifoldApp-linux-x64.AppImage` 或 `RemnifoldApp-linux-arm64.AppImage`）：把它放在你想長期保存的位置（例如 `~/Applications`），設為可執行，然後不帶任何引數執行一次，即可將該 AppImage 註冊到 Claude Code 與 Codex；之後若移動檔案，下次啟動時會註冊新的位置。執行 `<path-to-AppImage> setup --base-url <URL>` 即可連接你的伺服器。AppImage 沒有程式碼簽章，因此在 Linux 上，應用程式信任的是來自更新網站的 HTTPS 與更新來源（feed）中的檢查碼。
+在 Windows x64 上，下載 [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe)（由發行者簽署，不需要系統管理員權限）並執行。下文所述的 macOS 與 Linux Setup 套件從 1.0.32 之後的第一個版本起，與 Windows 版同時發布。Setup 會以你的使用者身分把應用程式安裝到 `%LOCALAPPDATA%\RemnifoldApp`，並將它註冊到 Claude Code 與 Codex（僅限找得到命令列工具的那些），然後在終端機開啟首次執行引導，說明下一步：連接你的伺服器（`remnifold setup`）。其檢查不需要 GitHub 帳號。在 macOS（Apple Silicon）上，請開啟 `RemnifoldApp-osx-Setup.pkg`（以發行者的 Developer ID 簽署並經過公證）。它會安裝 `Remnifold.app`（選擇「僅為我安裝」會放在 `~/Applications`；為所有使用者安裝則會放在 `/Applications`，此時套用更新可能需要系統管理員密碼），並啟動應用程式一次，藉此把它註冊到 Claude Code 與 Codex。若用戶端的命令列工具是稍後才安裝，下次啟動 Remnifold 時就會註冊它。執行 `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>`（若安裝在 `~/Applications`，請調整路徑）即可連接你的伺服器。在 Linux（x64 或 ARM64）上，Setup 是單一 AppImage（`RemnifoldApp-linux-x64.AppImage` 或 `RemnifoldApp-linux-arm64.AppImage`）：把它放在你想長期保存的位置（例如 `~/Applications`），設為可執行，然後不帶任何引數執行一次，即可將該 AppImage 註冊到 Claude Code 與 Codex；之後若移動檔案，下次啟動時會註冊新的位置。執行 `<path-to-AppImage> setup --base-url <URL>` 即可連接你的伺服器。AppImage 沒有程式碼簽章，因此在 Linux 上，應用程式信任的是來自更新網站的 HTTPS 與更新來源（feed）中的檢查碼。
 
 更新是自動的。MCP 工作階段執行期間，應用程式每天最多檢查一次更新來源（檢查失敗時也會等一天），並在背景下載較新的版本，不會中斷任何作業。新版本會在你下次登入時套用（Windows：`Run` 項目；macOS：LaunchAgent `~/Library/LaunchAgents/com.kagayoi.RemnifoldApp.update.plist`；Linux：自動啟動項目 `~/.config/autostart/com.kagayoi.RemnifoldApp.update.desktop`），而且只在沒有其他 Remnifold 處理程序執行時才會套用，所以開啟中的工作階段絕不會被關閉。套用之前，應用程式會驗證下載套件中的每個執行檔都由發行者簽署（macOS：發行者的 Developer ID；Linux：沒有簽章，但下載資料夾 `/var/tmp/velopack/RemnifoldApp` 必須屬於你，且不可由其他使用者寫入）。若要關閉自動更新，請在應用程式狀態資料夾（`%APPDATA%\Remnifold`、`~/Library/Application Support/Remnifold`、Linux 上的 `$XDG_STATE_HOME/remnifold`（預設為 `~/.local/state/remnifold`），或 `<REMNIFOLD_HOME>/remnifold`）的 `app-update.json` 中設定 `"auto_update": false`；診斷資訊會寫入同一位置的 `app-update.log`。如果你已經在使用下方的嚴格安裝，Setup 會把 Claude Code 與 Codex 的註冊切換到它自己，並沿用相同的連線與記憶狀態；嚴格安裝的檔案會被保留，因此不再需要時，請自行刪除 `%LOCALAPPDATA%\Programs\Remnifold`。如果 Setup 期間某項註冊未能完成（例如用戶端 CLI 回應緩慢），會在你下次登入時自動重試。請從 Windows 設定中解除安裝；Claude Code 與 Codex 的註冊及登入項目會一併移除，而你的連線與記憶狀態會被保留。之後若要回到嚴格安裝，請用它自己的 `connect claude-code --apply` 與 `connect codex --apply` 重新註冊。若只想移除註冊而不解除安裝，請執行 `remnifold connect claude-code --remove --apply` 與 `remnifold connect codex --remove --apply`。
 
@@ -47,6 +47,8 @@ Linux 同樣沒有解除安裝程式。在刪除 AppImage 之前，請以相同�
 位於 `~/.config/remnifold` 與 `~/.local/state/remnifold` 的連線、設定與記憶狀態會被保留；已下載的更新快取 `/var/tmp/velopack/RemnifoldApp` 可以刪除。
 
 ### 嚴格安裝（進階）
+
+嚴格安裝已凍結在最終版本 1.0.32。更新的版本只透過上方的 Setup 安裝程式（Windows、macOS、Linux x64 與 ARM64）發布，因此 `remnifold install` 只能安裝到 1.0.32 為止；已安裝的版本與 `--verify-only` 仍可繼續使用。若要改用更新的版本，請執行 Setup 安裝程式，它會接手 Claude Code 與 Codex 中的註冊。
 
 已發布的原生套件由 [Remnifold updates](https://remnifold-updates.kagayoi.com) 提供。版本索引是 `releases/<version>/index.json`；其資訊清單會為下列每個目標選出一個以雜湊值命名的封存檔。執行下載的執行檔之前，請先透過 GitHub 驗證發布來源；僅憑 R2 URL 或 commit status 連結，無法確立其來源。
 
@@ -71,7 +73,7 @@ Linux 同樣沒有解除安裝程式。在刪除 AppImage 之前，請以相同�
 
 ### 首次安裝
 
-在 Windows 上，發布工作流程會把已簽章的 bootstrap 執行檔放到 R2 中帶版本號的不可變鍵下。它從 1.0.30 版開始提供；更早的版本請從可信任的原始碼建置第一個執行檔。請選擇一個已存在、受信任的私人目錄，使其他使用者無法在驗證與執行之間替換下載的檔案。替換下方引號內的版本與路徑後，從 PowerShell 執行：
+在 Windows 上，發布工作流程會把已簽章的 bootstrap 執行檔放到 R2 中帶版本號的不可變鍵下。它從 1.0.30 版開始提供；更早的版本請從可信任的原始碼建置第一個執行檔。由於 `install` 只接受嚴格安裝的版本，請將版本設為 1.0.30 到 1.0.32 之間的某個版本。請選擇一個已存在、受信任的私人目錄，使其他使用者無法在驗證與執行之間替換下載的檔案。替換下方引號內的版本與路徑後，從 PowerShell 執行：
 
 ```powershell
 $version = '<published-version>'

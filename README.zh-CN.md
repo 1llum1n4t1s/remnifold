@@ -26,7 +26,7 @@
 
 ### Setup 安装程序（推荐）
 
-在 Windows x64 上，下载 [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe)（由发布者签名，无需管理员权限）并运行。下文所述的 macOS 和 Linux Setup 安装包尚未发布；在这些平台上，目前请使用下面的严格安装方式。Setup 会为你的用户把应用安装到 `%LOCALAPPDATA%\RemnifoldApp`，将其注册到 Claude Code 和 Codex（仅限能找到命令行工具的那些），并在终端中打开首次运行向导，说明下一步：连接你的服务器（`remnifold setup`）。其检查不需要 GitHub 账户。在 macOS（Apple Silicon）上，打开 `RemnifoldApp-osx-Setup.pkg`（已使用发布者的 Developer ID 签名并经过公证）。它会安装 `Remnifold.app`（选择“仅为我安装”时会放在 `~/Applications`；为所有用户安装则放在 `/Applications`，此时应用更新可能需要管理员密码），并启动应用一次，从而将其注册到 Claude Code 和 Codex。如果之后才安装某个客户端的命令行工具，下次启动 Remnifold 时会注册它。运行 `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>`（如果装在 `~/Applications`，请相应调整路径）来连接你的服务器。在 Linux（x64 或 ARM64）上，Setup 是单个 AppImage（`RemnifoldApp-linux-x64.AppImage` 或 `RemnifoldApp-linux-arm64.AppImage`）：把它放在你想长期保存的位置（例如 `~/Applications`），赋予可执行权限并不带参数运行一次，这会把该 AppImage 注册到 Claude Code 和 Codex；之后如果移动了文件，下次启动时会注册新的位置。运行 `<path-to-AppImage> setup --base-url <URL>` 来连接你的服务器。AppImage 不带代码签名，因此在 Linux 上，应用信任来自更新站点的 HTTPS 以及更新源中的校验和。
+在 Windows x64 上，下载 [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe)（由发布者签名，无需管理员权限）并运行。下文所述的 macOS 和 Linux Setup 安装包从 1.0.32 之后的第一个版本起，与 Windows 版同时发布。Setup 会为你的用户把应用安装到 `%LOCALAPPDATA%\RemnifoldApp`，将其注册到 Claude Code 和 Codex（仅限能找到命令行工具的那些），并在终端中打开首次运行向导，说明下一步：连接你的服务器（`remnifold setup`）。其检查不需要 GitHub 账户。在 macOS（Apple Silicon）上，打开 `RemnifoldApp-osx-Setup.pkg`（已使用发布者的 Developer ID 签名并经过公证）。它会安装 `Remnifold.app`（选择“仅为我安装”时会放在 `~/Applications`；为所有用户安装则放在 `/Applications`，此时应用更新可能需要管理员密码），并启动应用一次，从而将其注册到 Claude Code 和 Codex。如果之后才安装某个客户端的命令行工具，下次启动 Remnifold 时会注册它。运行 `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>`（如果装在 `~/Applications`，请相应调整路径）来连接你的服务器。在 Linux（x64 或 ARM64）上，Setup 是单个 AppImage（`RemnifoldApp-linux-x64.AppImage` 或 `RemnifoldApp-linux-arm64.AppImage`）：把它放在你想长期保存的位置（例如 `~/Applications`），赋予可执行权限并不带参数运行一次，这会把该 AppImage 注册到 Claude Code 和 Codex；之后如果移动了文件，下次启动时会注册新的位置。运行 `<path-to-AppImage> setup --base-url <URL>` 来连接你的服务器。AppImage 不带代码签名，因此在 Linux 上，应用信任来自更新站点的 HTTPS 以及更新源中的校验和。
 
 更新是自动的。在 MCP 会话运行期间，应用每天最多检查一次更新源（检查失败也会等待一天），并在后台下载较新的版本，不会打断任何操作。新版本会在你下次登录时应用（Windows：`Run` 项；macOS：LaunchAgent `~/Library/LaunchAgents/com.kagayoi.RemnifoldApp.update.plist`；Linux：自启动项 `~/.config/autostart/com.kagayoi.RemnifoldApp.update.desktop`），并且仅在没有其他 Remnifold 进程运行时才会应用，因此不会关闭已打开的会话。应用前，应用会验证下载包中的每个可执行文件都由发布者签名（macOS：发布者的 Developer ID；Linux：没有签名，但下载文件夹 `/var/tmp/velopack/RemnifoldApp` 必须属于你，且其他用户不可写）。若要关闭此功能，请在应用的状态文件夹（`%APPDATA%\Remnifold`、`~/Library/Application Support/Remnifold`、Linux 上的 `$XDG_STATE_HOME/remnifold`（默认为 `~/.local/state/remnifold`），或 `<REMNIFOLD_HOME>/remnifold`）中的 `app-update.json` 里设置 `"auto_update": false`；诊断信息会写入同一位置的 `app-update.log`。如果你已经在使用下面的严格安装方式，Setup 会把 Claude Code 和 Codex 的注册切换到自身，并使用相同的连接和记忆状态；严格安装的文件会被保留，因此不再需要时请自行删除 `%LOCALAPPDATA%\Programs\Remnifold`。如果 Setup 期间某个注册未能完成（例如客户端 CLI 响应缓慢），会在你下次登录时自动重试。请在 Windows 设置中卸载；Claude Code 和 Codex 的注册以及登录项会随之移除，而你的连接和记忆状态会被保留。之后若要回到严格安装方式，请用它自己的 `connect claude-code --apply` 和 `connect codex --apply` 重新注册。若只想移除注册而不卸载，请运行 `remnifold connect claude-code --remove --apply` 和 `remnifold connect codex --remove --apply`。
 
@@ -47,6 +47,8 @@ Linux 同样没有卸载程序。在删除 AppImage 之前，请以相同方式�
 你位于 `~/.config/remnifold` 和 `~/.local/state/remnifold` 的连接、配置和记忆状态会被保留；已下载的更新缓存 `/var/tmp/velopack/RemnifoldApp` 可以删除。
 
 ### 严格安装（高级）
+
+严格安装已冻结在最终版本 1.0.32。更新的版本只通过上面的 Setup 安装程序（Windows、macOS、Linux x64 和 ARM64）发布，因此 `remnifold install` 只能安装到 1.0.32 为止；已安装的版本和 `--verify-only` 仍可正常使用。要升级到更新的版本，请运行 Setup 安装程序，它会接管 Claude Code 和 Codex 中的注册。
 
 已发布的原生安装包由 [Remnifold updates](https://remnifold-updates.kagayoi.com) 提供。版本索引为 `releases/<version>/index.json`；其清单会为下列每个目标选择一个以哈希命名的归档。在运行下载的可执行文件之前，请通过 GitHub 认证发布来源；仅凭 R2 URL 或提交状态链接并不能确立其来源。
 
@@ -71,7 +73,7 @@ Linux 同样没有卸载程序。在删除 AppImage 之前，请以相同方式�
 
 ### 首次安装
 
-在 Windows 上，发布工作流会把已签名的 bootstrap 可执行文件放到 R2 中带版本号的不可变键下。它从 1.0.30 版开始提供；更早的版本请从可信源码构建第一个可执行文件。选择一个已存在的可信私有目录，确保其他用户无法在验证与执行之间替换下载的文件。替换下面带引号的版本和路径，然后在 PowerShell 中运行：
+在 Windows 上，发布工作流会把已签名的 bootstrap 可执行文件放到 R2 中带版本号的不可变键下。它从 1.0.30 版开始提供；更早的版本请从可信源码构建第一个可执行文件。由于 `install` 只接受严格安装的版本，请将版本设为 1.0.30 到 1.0.32 之间的某个版本。选择一个已存在的可信私有目录，确保其他用户无法在验证与执行之间替换下载的文件。替换下面带引号的版本和路径，然后在 PowerShell 中运行：
 
 ```powershell
 $version = '<published-version>'
