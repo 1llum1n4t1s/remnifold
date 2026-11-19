@@ -14,23 +14,23 @@ on:
 permissions:
   contents: read
 
+# 同じ ref へ続けて push したとき、古い run を取り消して最新だけを検証する。
+# main と release/* は取り消さない。main は版タグの配信ゲート（wait-main-ci.sh）が同じコミットの run の成功を待つため、
+# 待機中（pending）の run が新しい push に置き換えられて消えないよう、group をコミット単位にする。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
+
 jobs:
   native-package:
     name: native-package (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # 4 ターゲットとも GitHub 提供ランナーが自分のネイティブ環境でビルドする（クロスビルド・手元ビルドは使わない）。
-          # Linux x64 は glibc の下限を保つため latest ではなく ubuntu-24.04 に固定する。
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+        # 4 ターゲットとも GitHub 提供ランナーが自分のネイティブ環境でビルドする（クロスビルド・手元ビルドは使わない）。
+        # Linux x64 は glibc の下限を保つため latest ではなく ubuntu-24.04 に固定する。
+        # 全行列は main・PR・release/*・手動実行のときだけ。それ以外のブランチへの push は ubuntu-24.04 の1構成だけ。
+        include: ${{ fromJSON((github.event_name != 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && '[{"os":"windows-latest","target":"x86_64-pc-windows-msvc"},{"os":"macos-latest","target":"aarch64-apple-darwin"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu"}]' || '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu"}]') }}
     runs-on: ${{ matrix.os }}
     # Environment deployment-branch policies are the credential boundary. Only
     # these environments own R2 secrets; validation has no distribution secrets.
@@ -199,6 +199,8 @@ jobs:
   # matrix を使わず runs-on を直接書く（native-package の Windows 要素4件の数え方と job 名を変えないため）。
   windows-server-contracts:
     name: windows-server-contracts
+    # main・PR・release/*・手動実行だけ。それ以外のブランチへの push は native-package の Linux 1構成だけで確かめる。
+    if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
@@ -311,6 +313,8 @@ jobs:
   # windows-server-contracts と同じく、資格情報を持たない検証専用 job。
   windows-native-contracts:
     name: windows-native-contracts
+    # windows-server-contracts と同じ条件（feature ブランチの push では Windows を回さない）。
+    if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:

@@ -124,12 +124,25 @@ mod tests {
             .lines()
             .filter(|line| line.contains("refs/heads/main"))
         {
-            assert_eq!(
-                line.trim(),
-                "save-if: ${{ github.ref == 'refs/heads/main' }}",
-                "main may only select cache saving"
+            // main を名指しするのは、キャッシュの保存条件と、実行量を絞る条件（concurrency・全行列・Windows 検証 job の if）だけ。
+            // どれも資格情報・Environment・ステージ・公開には関わらない。
+            let line = line.trim();
+            assert!(
+                line == "save-if: ${{ github.ref == 'refs/heads/main' }}"
+                    || line.starts_with("group: ci-${{ github.workflow }}-")
+                    || line
+                        .starts_with("cancel-in-progress: ${{ github.ref != 'refs/heads/main' &&")
+                    || line.starts_with("include: ${{ fromJSON(")
+                    || line.starts_with(
+                        "if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' ||"
+                    ),
+                "main may only select cache saving or the CI workload: {line}"
             );
         }
+        for scope in [stage, publisher] {
+            assert!(!scope.contains("refs/heads/main"));
+        }
+        assert!(!matrix.contains("environment:\n      name: ${{ github.ref == 'refs/heads/main'"));
         let scope = "startsWith(github.ref, 'refs/heads/release/')";
         assert!(
             matrix.contains(&format!("{scope} && 'r2-staging' || 'validation'")),
@@ -647,17 +660,26 @@ mod tests {
             ("ubuntu-24.04", "x86_64-unknown-linux-gnu"),
             ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
         ] {
+            // 全行列は fromJSON の1行の JSON にある。feature ブランチの push 用の縮小行列は Linux x64 だけを持つ。
+            let entry = format!("{{\"os\":\"{os}\",\"target\":\"{target}\"}}");
+            let expected = if target == "x86_64-unknown-linux-gnu" {
+                2
+            } else {
+                1
+            };
             assert_eq!(
-                workflow
-                    .matches(&format!(
-                        "          - os: {os}\n            target: {target}\n"
-                    ))
-                    .count(),
-                1,
+                workflow.matches(&entry).count(),
+                expected,
                 "{target} must run on {os}"
             );
         }
-        assert_eq!(workflow.matches("          - os: ").count(), 4);
+        assert_eq!(workflow.matches("{\"os\":").count(), 5);
+        assert!(workflow.contains("&& '[{\"os\":\"windows-latest\""));
+        assert!(
+            workflow.contains(
+                "|| '[{\"os\":\"ubuntu-24.04\",\"target\":\"x86_64-unknown-linux-gnu\"}]')"
+            )
+        );
         assert!(!workflow.contains("target: x86_64-apple-darwin"));
         // 手元ビルドの local-input 方式は廃止した。
         assert!(!workflow.contains("local-input"));
