@@ -4,6 +4,20 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, fs, process::Command, sync::OnceLock, time::Duration};
 
+pub(crate) fn compile_regex(p: &str) -> regex::Regex {
+    // JavaScript's word boundary is ASCII, including next to Japanese prose.
+    regex::Regex::new(&p.replace(r"\b", r"(?-u:\b)")).expect("constant regex")
+}
+// 固定式だけを呼出し箇所ごとに共有し、動的な式は保持しない。
+macro_rules! re {
+    ($pattern:literal) => {{
+        static PATTERN: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| $crate::common::compile_regex($pattern));
+        &*PATTERN
+    }};
+}
+pub(crate) use re;
+
 #[derive(Clone)]
 pub struct Config {
     pub base_url: String,

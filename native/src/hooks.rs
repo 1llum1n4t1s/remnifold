@@ -186,6 +186,46 @@ fn mismatched(row: &Value, session: &str) -> bool {
     row["type"] == "session_meta" && row["payload"]["id"].as_str() != Some(session)
 }
 
+/// ヘッダー窓の完全な行のうち、別 session の session_meta が無く、session の session_meta が 1 つ以上あれば true。
+/// 不一致が見つからないだけでは所属を証明できないため、明示的一致を要求する（先頭行以外の session_meta も許す）。
+fn header_matches(header: &[u8], session: &str) -> bool {
+    let mut matching_session = false;
+    for entry in header.split_inclusive(|&b| b == b'\n') {
+        if entry.last() != Some(&b'\n') {
+            break;
+        }
+        if let Ok(row) = serde_json::from_slice::<Value>(entry) {
+            if mismatched(&row, session) {
+                return false;
+            }
+            matching_session |= row["type"] == "session_meta";
+        }
+    }
+    matching_session
+}
+
+/// Codex の rollout 行からユーザー発言を取り出す。ユーザー発言でない行は空文字列。
+fn codex_user_message(row: &Value) -> String {
+    let record = &row["payload"];
+    if row["type"] == "event_msg" && record["type"] == "user_message" {
+        text(&record["message"]).to_owned()
+    } else if row["type"] == "response_item" && record["role"] == "user" {
+        record["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b["type"] == "input_text")
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
 fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String {
     fn read_topic(payload: &Value, current: &str, deadline: u64) -> Option<String> {
         let session = payload["session_id"]
@@ -208,19 +248,7 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
         file.read_exact(&mut header).ok()?;
         // 不一致が見つからないだけでは所属を証明できない。完全なヘッダー行で
         // 明示的一致を確認し、先頭行以外の session_meta も既存 reader 同様に許す。
-        let mut matching_session = false;
-        for entry in header.split_inclusive(|&b| b == b'\n') {
-            if entry.last() != Some(&b'\n') {
-                break;
-            }
-            if let Ok(row) = serde_json::from_slice::<Value>(entry) {
-                if mismatched(&row, session) {
-                    return None;
-                }
-                matching_session |= row["type"] == "session_meta";
-            }
-        }
-        if !matching_session {
+        if !header_matches(&header, session) {
             return None;
         }
         let lower = size.saturating_sub(TOPIC_BYTES);
@@ -279,27 +307,7 @@ fn previous_user_topic(payload: &Value, current: &str, deadline: u64) -> String 
                                 return recovered;
                             }
                             if recovered.is_none() {
-                                let record = &row["payload"];
-                                let message = if row["type"] == "event_msg"
-                                    && record["type"] == "user_message"
-                                {
-                                    text(&record["message"]).to_owned()
-                                } else if row["type"] == "response_item" && record["role"] == "user"
-                                {
-                                    record["content"]
-                                        .as_array()
-                                        .map(|blocks| {
-                                            blocks
-                                                .iter()
-                                                .filter(|b| b["type"] == "input_text")
-                                                .filter_map(|b| b["text"].as_str())
-                                                .collect::<Vec<_>>()
-                                                .join("\n")
-                                        })
-                                        .unwrap_or_default()
-                                } else {
-                                    String::new()
-                                };
+                                let message = codex_user_message(&row);
                                 let subagent = re!(r"^\s*(?:Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)\b|<subagent_notification\b)")
                                     .is_match(&message);
                                 if !message.is_empty() && !subagent {

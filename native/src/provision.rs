@@ -471,7 +471,7 @@ fn metadata_existing(
                     .as_str()
                     .ok_or_else(|| failure("reading configured binding"))?;
                 if name.is_empty()
-                    || matches!(name, "DB" | "MEMORY_VECTORS" | "AI" | "MEMORY_API_KEY")
+                    || reserved_binding(name)
                     || row[source].as_str().is_none_or(|s| s.is_empty())
                 {
                     return Err(failure("validating configured binding"));
@@ -489,9 +489,10 @@ fn metadata_existing(
     }
     if let Some(rows) = config["queues"]["producers"].as_array() {
         for row in rows {
-            if row["binding"].as_str().is_none_or(|s| {
-                s.is_empty() || matches!(s, "DB" | "MEMORY_VECTORS" | "AI" | "MEMORY_API_KEY")
-            }) || row["queue"].as_str().is_none_or(str::is_empty)
+            if row["binding"]
+                .as_str()
+                .is_none_or(|s| s.is_empty() || reserved_binding(s))
+                || row["queue"].as_str().is_none_or(str::is_empty)
             {
                 return Err(failure("validating Queue producer binding"));
             }
@@ -505,10 +506,7 @@ fn metadata_existing(
     }
     if let Some(vars) = config["vars"].as_object() {
         for (name, value) in vars {
-            if matches!(
-                name.as_str(),
-                "DB" | "MEMORY_VECTORS" | "AI" | "MEMORY_API_KEY"
-            ) {
+            if reserved_binding(name) {
                 bail!("Configuration vars must not contain binding or secret names.");
             }
             bindings.push(if value.is_string() {
@@ -582,8 +580,11 @@ fn metadata_existing(
     }
     Ok(metadata)
 }
+// Remnifold が管理するバインディング名と秘密名。設定の同名の項目は衝突として拒否する。
+fn reserved_binding(name: &str) -> bool {
+    matches!(name, "DB" | "MEMORY_VECTORS" | "AI" | "MEMORY_API_KEY")
+}
 fn validate_binding_names(config: &Value, existing: &Value) -> Result<()> {
-    let reserved = |name: &str| matches!(name, "DB" | "MEMORY_VECTORS" | "AI" | "MEMORY_API_KEY");
     let mut names = std::collections::HashSet::new();
     for field in [
         "d1_databases",
@@ -600,7 +601,7 @@ fn validate_binding_names(config: &Value, existing: &Value) -> Result<()> {
                     .ok_or_else(|| failure("validating binding name"))?;
                 let required = field == "d1_databases" && name == "DB"
                     || field == "vectorize" && name == "MEMORY_VECTORS";
-                if reserved(name) && !required || !names.insert(name.to_owned()) {
+                if reserved_binding(name) && !required || !names.insert(name.to_owned()) {
                     bail!(
                         "Configuration has a reserved or duplicate binding name; setup stopped before changes."
                     );
@@ -614,7 +615,7 @@ fn validate_binding_names(config: &Value, existing: &Value) -> Result<()> {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| failure("validating Queue binding name"))?;
-            if reserved(name) || !names.insert(name.to_owned()) {
+            if reserved_binding(name) || !names.insert(name.to_owned()) {
                 bail!(
                     "Configuration has a reserved or duplicate binding name; setup stopped before changes."
                 );
@@ -623,7 +624,7 @@ fn validate_binding_names(config: &Value, existing: &Value) -> Result<()> {
     }
     if let Some(vars) = config["vars"].as_object() {
         for name in vars.keys() {
-            if reserved(name) || !names.insert(name.to_owned()) {
+            if reserved_binding(name) || !names.insert(name.to_owned()) {
                 bail!(
                     "Configuration vars conflict with a required or configured binding; setup stopped before changes."
                 );

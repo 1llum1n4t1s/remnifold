@@ -9,6 +9,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// 非ブロッキングの待受（loopback）から次の接続を受け付け、ブロッキングのソケットで返す。
+/// 接続が無い間は `keep_waiting` が true の限り待ち、false になったら None を返す。
+/// Windows で accept したソケットは待受の nonblocking を引き継ぎ、読み取りの WouldBlock を EOF と誤る。
+/// 明示的に解除して、読み書きの期限を有効にする。
+pub fn accept_blocking(
+    listener: &std::net::TcpListener,
+    mut keep_waiting: impl FnMut() -> bool,
+) -> Option<std::net::TcpStream> {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return Some(stream);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if !keep_waiting() {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("loopback accept: {error}"),
+        }
+    }
+}
+
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 enum Completion {
     Stdout(io::Result<Vec<u8>>),

@@ -52,19 +52,8 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
     let fixture = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(25);
         for _ in 0..5 {
-            let (mut stream, _) = loop {
-                match listener.accept() {
-                    Ok(value) => break value,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && Instant::now() < deadline =>
-                    {
-                        thread::sleep(Duration::from_millis(10))
-                    }
-                    Err(error) => panic!("fixture accept: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
+            let mut stream = support::accept_blocking(&listener, || Instant::now() < deadline)
+                .expect("fixture accept timed out");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

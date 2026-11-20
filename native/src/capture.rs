@@ -1,5 +1,7 @@
 //! Local transcript capture. Persisted v2 identities deliberately use JavaScript UTF-16 slices.
-use crate::common::{self, Config, get_project_context, sha256, text, truncate_utf16};
+use crate::common::{
+    self, Config, compile_regex, get_project_context, re, sha256, text, truncate_utf16,
+};
 use anyhow::{Result, bail};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -44,17 +46,6 @@ pub fn failure_message(error: &anyhow::Error) -> String {
     format!(
         "Remnifold capture failed; unacknowledged records will be retried. [stage={s}; cause={c}; action={a}]\n"
     )
-}
-fn compile_regex(p: &str) -> Regex {
-    // JavaScript's word boundary is ASCII, including next to Japanese prose.
-    Regex::new(&p.replace(r"\b", r"(?-u:\b)")).expect("constant regex")
-}
-// 固定式だけを呼出し箇所ごとに共有し、動的なskill名は保持しない。
-macro_rules! re {
-    ($pattern:literal) => {{
-        static PATTERN: LazyLock<Regex> = LazyLock::new(|| compile_regex($pattern));
-        &*PATTERN
-    }};
 }
 fn strip_tag(s: &str, tag: &str) -> String {
     static TAGS: LazyLock<HashMap<&'static str, OnceLock<Regex>>> = LazyLock::new(|| {
@@ -957,12 +948,18 @@ pub fn run_import(args: &[String]) -> Result<()> {
     let mut planned = vec![];
     let mut turns = 0;
     let mut redactions = 0;
+    // 同じ cwd の git 呼び出し（1 回で 2 プロセス）を繰り返さない。
+    let mut projects: HashMap<String, Value> = HashMap::new();
     for c in &selected {
         let cwd = text(&c.meta["cwd"]);
         let project = if cwd.is_empty() {
             json!({})
+        } else if let Some(project) = projects.get(cwd) {
+            project.clone()
         } else {
-            get_project_context(Path::new(cwd))?
+            let project = get_project_context(Path::new(cwd))?;
+            projects.insert(cwd.to_owned(), project.clone());
+            project
         };
         let transcript = parse_task_transcript(&c.file_path, &[&config.api_key])?;
         turns += transcript.turns.len();
@@ -1031,8 +1028,19 @@ pub fn run_import(args: &[String]) -> Result<()> {
         if !path.exists() {
             return Ok(json!({"version":2,"documents":{}}));
         }
-        let state: Value = serde_json::from_slice(&fs::read(path)?)
+        let mut state: Value = serde_json::from_slice(&fs::read(path)?)
             .map_err(|_| anyhow::anyhow!("History import state is not valid JSON."))?;
+        // The former JavaScript client spread an array into an object (index keys) when it read
+        // its default state path; read an array that way for any path so later string-key
+        // assignment never indexes an array.
+        if let Some(items) = state["documents"].as_array() {
+            let map: serde_json::Map<String, Value> = items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), v.clone()))
+                .collect();
+            state["documents"] = Value::Object(map);
+        }
         if state["version"] != 2
             || (!state["documents"].is_object() && !state["documents"].is_array())
         {

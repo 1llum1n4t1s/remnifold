@@ -50,17 +50,9 @@ fn once_server() -> (String, thread::JoinHandle<String>) {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
         let start = std::time::Instant::now();
-        let mut socket = loop {
-            match listener.accept() {
-                Ok((socket, _)) => break socket,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(start.elapsed().as_secs() < 10, "client did not connect");
-                    thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("{error}"),
-            }
-        };
-        socket.set_nonblocking(false).unwrap();
+        let mut socket =
+            support::accept_blocking(&listener, || start.elapsed().as_secs() < 10)
+                .expect("client did not connect");
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();

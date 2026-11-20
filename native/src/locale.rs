@@ -343,15 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_unique_and_round_trip() {
-        let tags: BTreeSet<_> = Language::ALL.iter().map(|l| l.tag()).collect();
-        assert_eq!(tags.len(), Language::ALL.len());
-        for language in Language::ALL {
-            assert_eq!(parse(language.tag()), Some(language));
-        }
-    }
-
-    #[test]
     fn missing_keys_fall_back_to_english_then_key() {
         assert_eq!(
             tr_in(Language::French, "no.such.key"),

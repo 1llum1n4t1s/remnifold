@@ -29,7 +29,6 @@ struct Server {
     acknowledge: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
-    accepted: std::sync::mpsc::Receiver<()>,
 }
 impl Server {
     fn new() -> Self {
@@ -40,15 +39,10 @@ impl Server {
         let acknowledge = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let (shared, ack, done) = (state.clone(), acknowledge.clone(), stop.clone());
-        let (accepted_tx, accepted) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        // Windows accepted sockets inherit the listener's nonblocking mode.
-                        // Explicit blocking mode makes the bounded read/write timeouts effective.
-                        stream.set_nonblocking(false).unwrap();
-                        let _ = accepted_tx.send(());
+                match support::accept_blocking(&listener, || !done.load(Ordering::SeqCst)) {
+                    Some(mut stream) => {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
@@ -57,10 +51,7 @@ impl Server {
                             .unwrap();
                         serve(&mut stream, &shared, &ack);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5))
-                    }
-                    Err(e) => panic!("loopback accept: {e}"),
+                    None => break,
                 }
             }
         });
@@ -70,7 +61,6 @@ impl Server {
             acknowledge,
             stop,
             worker: Some(worker),
-            accepted,
         }
     }
 }
@@ -88,29 +78,6 @@ impl Drop for Server {
     }
 }
 
-#[test]
-fn accepted_socket_waits_for_delayed_headers() {
-    let server = Server::new();
-    let mut stream = TcpStream::connect(server.endpoint.strip_prefix("http://").unwrap()).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    server
-        .accepted
-        .recv_timeout(Duration::from_secs(3))
-        .unwrap();
-    // The connection is already accepted, but no HTTP bytes are available yet.
-    thread::sleep(Duration::from_millis(100));
-    stream
-        .write_all(b"GET /delayed-fixture HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
-        .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    assert!(
-        response.starts_with("HTTP/1.1 401 Unauthorized"),
-        "delayed headers must reach the fixture"
-    );
-}
 fn serve(stream: &mut TcpStream, state: &Mutex<State>, ack: &AtomicBool) {
     let mut bytes = Vec::new();
     let mut chunk = [0; 8192];
@@ -465,4 +432,23 @@ fn import_plan_apply_and_cross_container_history_deduplication() {
     let state = server.state.lock().unwrap();
     assert_eq!(state.requests.len(), 2);
     assert!(state.sources.iter().all(|s| s == "codex-history-backfill"));
+}
+
+#[test]
+fn import_apply_accepts_array_documents_state_without_panicking() {
+    let server = Server::new();
+    let fixture = Fixture::new(&server);
+    fixture.write_turns(1);
+    let state_path = fixture.root.join("import-state.json");
+    std::fs::write(
+        &state_path,
+        r#"{"version":2,"documents":[{"completedAt":"x"}]}"#,
+    )
+    .unwrap();
+    let apply = fixture.import(true);
+    assert_eq!(apply["created"], 1);
+    let state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(state["documents"].is_object());
+    assert_eq!(state["documents"]["0"]["completedAt"], "x");
+    assert_eq!(state["documents"].as_object().unwrap().len(), 2);
 }

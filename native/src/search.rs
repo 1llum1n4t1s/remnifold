@@ -1,28 +1,12 @@
-use crate::common::{Config, api, read_settings, text, truncate_utf16};
+use crate::common::{Config, api, re, read_settings, text, truncate_utf16};
 use crate::locale::{tr, tr_with};
 use anyhow::{Context, Result, bail};
 use chrono::TimeZone;
-use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::{thread, time::Duration};
 use unicode_normalization::UnicodeNormalization;
 
-fn re(pattern: &'static str) -> Regex {
-    // 同じ文書群の採点で正規表現を再コンパイルしない。
-    static PATTERNS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<&'static str, Regex>>,
-    > = std::sync::OnceLock::new();
-    PATTERNS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .entry(pattern)
-        .or_insert_with(|| {
-            Regex::new(&pattern.replace(r"\b", r"(?-u:\b)")).expect("constant regular expression")
-        })
-        .clone()
-}
 fn compact(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -48,7 +32,7 @@ fn unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
 }
 fn date(s: &str) -> Option<&str> {
     // 索引の公開日時には旧JSと同じT形式のshape guardを維持する。
-    re(r"^\d{4}-\d{2}-\d{2}T")
+    re!(r"^\d{4}-\d{2}-\d{2}T")
         .is_match(s)
         .then(|| date_millis(s))
         .flatten()
@@ -61,7 +45,7 @@ fn date_millis(s: &str) -> Option<i64> {
         return Some(date.timestamp_millis());
     }
     // ISOの分精度+offsetも既存APIで有効。offsetを保ったまま秒だけ補う。
-    if let Some(parts) = re(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$").captures(s)
+    if let Some(parts) = re!(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$").captures(s)
     {
         return chrono::DateTime::parse_from_rfc3339(&format!("{}:00{}", &parts[1], &parts[2]))
             .ok()
@@ -70,13 +54,13 @@ fn date_millis(s: &str) -> Option<i64> {
     if let Ok(date) = chrono::DateTime::parse_from_rfc2822(s) {
         return Some(date.timestamp_millis());
     }
-    if re(r"^\d{4}-\d{2}-\d{2}$").is_match(s) {
+    if re!(r"^\d{4}-\d{2}-\d{2}$").is_match(s) {
         return chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
             .ok()
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .map(|d| d.and_utc().timestamp_millis());
     }
-    if !re(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?$").is_match(s) {
+    if !re!(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?$").is_match(s) {
         return None;
     }
     let naive = [
@@ -110,7 +94,7 @@ fn date_millis(s: &str) -> Option<i64> {
     }
 }
 pub fn short_text(s: &str, limit: usize) -> String {
-    let s = re(r"<[^>]*>").replace_all(&compact(s), "").to_string();
+    let s = re!(r"<[^>]*>").replace_all(&compact(s), "").to_string();
     if s.encode_utf16().count() <= limit {
         s
     } else {
@@ -130,24 +114,24 @@ fn prompt(s: &str, limit: usize) -> String {
     )
 }
 fn plain_line(s: &str) -> String {
-    let s = re(r"^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)").replace(s, "");
-    let s = re(r"\[([^\]]+)\]\([^)]+\)").replace_all(&s, "$1");
-    re(r"(?i)^(?:desc|description|task|Rollout context):\s*")
+    let s = re!(r"^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)").replace(s, "");
+    let s = re!(r"\[([^\]]+)\]\([^)]+\)").replace_all(&s, "$1");
+    re!(r"(?i)^(?:desc|description|task|Rollout context):\s*")
         .replace(&s.replace(['*', '`'], ""), "")
         .trim()
         .to_owned()
 }
 fn meaningful(s: &str) -> impl Iterator<Item = String> + '_ {
     let mut fenced = false;
-    s.lines().filter_map(move |line|{if line.trim_start().starts_with("```"){fenced=!fenced;return None} if fenced||re(r"^\s*#{1,6}\s").is_match(line)||re(r"^\s*\[[^\]\n]*\]\((?:thread|codex)://[^)]+\)\s*$").is_match(line){return None} let l=plain_line(line);if l.is_empty()||re(r"(?i)^(?:(?:Session|Turn|Part|Source(?: SHA-256)?|Imported snapshot|updated_at|rollout_path|cwd|thread_id|git_branch|task_group|task_outcome|keywords)\s*:|rollout_summaries[\\/]|User request|User comment:|Referenced assistant response:|Final assistant response|Codex saved memory import|Historical memory evidence|v\d+$|<|:codex-|::)").is_match(&l){None}else{Some(l)}})
+    s.lines().filter_map(move |line|{if line.trim_start().starts_with("```"){fenced=!fenced;return None} if fenced||re!(r"^\s*#{1,6}\s").is_match(line)||re!(r"^\s*\[[^\]\n]*\]\((?:thread|codex)://[^)]+\)\s*$").is_match(line){return None} let l=plain_line(line);if l.is_empty()||re!(r"(?i)^(?:(?:Session|Turn|Part|Source(?: SHA-256)?|Imported snapshot|updated_at|rollout_path|cwd|thread_id|git_branch|task_group|task_outcome|keywords)\s*:|rollout_summaries[\\/]|User request|User comment:|Referenced assistant response:|Final assistant response|Codex saved memory import|Historical memory evidence|v\d+$|<|:codex-|::)").is_match(&l){None}else{Some(l)}})
 }
 fn first(s: &str) -> String {
-    meaningful(s).find(|l|!re(r"^(?:ゆーくん[、,。!！\s]*|ありがとう[。!！\s]*|了解(?:です)?[。!！\s]*|承知しました[。!！\s]*)$").is_match(l)).unwrap_or_default()
+    meaningful(s).find(|l|!re!(r"^(?:ゆーくん[、,。!！\s]*|ありがとう[。!！\s]*|了解(?:です)?[。!！\s]*|承知しました[。!！\s]*)$").is_match(l)).unwrap_or_default()
 }
 pub fn index_request_text(s: &str) -> String {
     let projected = crate::capture::project_request_text(s, false);
-    let ambient=re(r#"(?is)<in-app-browser-context\b[^>]*\bsource\s*=\s*["']ambient-ui-state["'][^>]*>.*?</in-app-browser-context\s*>"#).replace_all(&projected,"\n");
-    re(r"(?is)<send_user_message_question_reply\s*>(.*?)</send_user_message_question_reply\s*>")
+    let ambient=re!(r#"(?is)<in-app-browser-context\b[^>]*\bsource\s*=\s*["']ambient-ui-state["'][^>]*>.*?</in-app-browser-context\s*>"#).replace_all(&projected,"\n");
+    re!(r"(?is)<send_user_message_question_reply\s*>(.*?)</send_user_message_question_reply\s*>")
         .replace_all(&ambient, |c: &regex::Captures| {
             let Ok(v) = serde_json::from_str::<Value>(&c[1]) else {
                 return c[0].to_owned();
@@ -193,16 +177,16 @@ pub fn build_memory_index(
     let sections: Vec<_> = unique(
         response
             .lines()
-            .filter(|s| re(r"^#{1,4}\s+").is_match(s))
+            .filter(|s| re!(r"^#{1,4}\s+").is_match(s))
             .map(plain_line),
     )
     .into_iter()
     .take(4)
     .map(|s| short_text(&s, 60))
     .collect();
-    let brief=re(r"^(?:はい|いいえ|了解(?:です|しました)?|承知しました|ありがとう(?:ございます)?|お疲れ(?:様|さま)(?:です|でした)?|[Oo][Kk]|続けて|お願いします|よろしく(?:お願いします)?)[。！!\s]*$").is_match(&request_line);
+    let brief=re!(r"^(?:はい|いいえ|了解(?:です|しました)?|承知しました|ありがとう(?:ございます)?|お疲れ(?:様|さま)(?:です|でした)?|[Oo][Kk]|続けて|お願いします|よろしく(?:お願いします)?)[。！!\s]*$").is_match(&request_line);
     let invocation = request_line.is_empty()
-        && re(r"(?i)^[$/][a-z][a-z0-9_:-]*$")
+        && re!(r"(?i)^[$/][a-z][a-z0-9_:-]*$")
             .is_match(crate::capture::project_request_text(request, true).trim());
     let detailed = (brief || invocation)
         && (!sections.is_empty()
@@ -217,14 +201,14 @@ pub fn build_memory_index(
     } else {
         String::new()
     };
-    let mut v = json!({"version":1,"title":if !title.is_empty()&&!re(r"(?i)^(?:s|Codex task|Memory [a-f0-9]+)$").is_match(&title){title.clone()}else{short_text(if !request_line.is_empty(){&request_line}else if !fallback.is_empty(){&fallback}else{"保存された記録"},100)},"description":short_text(&if brief&&detailed{format!("{}の継続結果・詳細",if title.is_empty(){"作業"}else{&title})}else if !request_line.is_empty(){request_line.clone()}else{fallback},180),"sections":sections,"recallable":(!request_line.is_empty()||invocation&&detailed)&&(!brief||detailed),"sourceKind":source_kind});
+    let mut v = json!({"version":1,"title":if !title.is_empty()&&!re!(r"(?i)^(?:s|Codex task|Memory [a-f0-9]+)$").is_match(&title){title.clone()}else{short_text(if !request_line.is_empty(){&request_line}else if !fallback.is_empty(){&fallback}else{"保存された記録"},100)},"description":short_text(&if brief&&detailed{format!("{}の継続結果・詳細",if title.is_empty(){"作業"}else{&title})}else if !request_line.is_empty(){request_line.clone()}else{fallback},180),"sections":sections,"recallable":(!request_line.is_empty()||invocation&&detailed)&&(!brief||detailed),"sourceKind":source_kind});
     if let Some(d) = date(source_timestamp) {
         v["sourceUpdatedAt"] = json!(d)
     }
     v
 }
 fn matching_section(s: &str, terms: &[String]) -> String {
-    let r = re(r"(?m)^(#{1,4})\s+(.+)$");
+    let r = re!(r"(?m)^(#{1,4})\s+(.+)$");
     let h: Vec<_> = r.captures_iter(s).collect();
     let mut best = 0;
     let mut selected = None;
@@ -272,7 +256,7 @@ pub fn document_index(doc: &Value, fallback_container: &str, terms: &[String]) -
         Some("\n### Final assistant response"),
     );
     let response = section(&content, "Final assistant response", None);
-    let heading = re(r"(?m)^#{1,4}\s+(.+)$")
+    let heading = re!(r"(?m)^#{1,4}\s+(.+)$")
         .captures_iter(&content)
         .map(|c| c[1].to_owned())
         .collect::<Vec<_>>();
@@ -284,9 +268,9 @@ pub fn document_index(doc: &Value, fallback_container: &str, terms: &[String]) -
         .unwrap_or_default();
     let mut index = if has_saved {
         let mut description = text(&saved["description"]).to_owned();
-        let degraded = re(r#"(?i)^<(?:skill|name|path|external_codex_apps_open_page|send_user_message_question_reply)\b|^This block is automatically supplied ambient UI state|<in-app-browser-context\b[^>]*source\s*=\s*["']ambient-ui-state["']"#).is_match(&compact(&description))
-            || re(r"^\[\s*\{").is_match(&compact(&description))
-                && re(r#""questionItemId"\s*:"#).is_match(&description)
+        let degraded = re!(r#"(?i)^<(?:skill|name|path|external_codex_apps_open_page|send_user_message_question_reply)\b|^This block is automatically supplied ambient UI state|<in-app-browser-context\b[^>]*source\s*=\s*["']ambient-ui-state["']"#).is_match(&compact(&description))
+            || re!(r"^\[\s*\{").is_match(&compact(&description))
+                && re!(r#""questionItemId"\s*:"#).is_match(&description)
                 && description.contains("request_user_input_async");
         if degraded {
             description = index_request_text(&request).trim().to_owned();
@@ -307,14 +291,14 @@ pub fn document_index(doc: &Value, fallback_container: &str, terms: &[String]) -
         )
     } else {
         let dates = unique(
-            re(r"(?m)^updated_at:\s*(\S+)\s*$")
+            re!(r"(?m)^updated_at:\s*(\S+)\s*$")
                 .captures_iter(original)
                 .filter_map(|c| date(&c[1]).map(str::to_owned)),
         );
         let title = if !text(&m["title"]).is_empty() {
             text(&m["title"])
         } else if !text(&doc["title"]).is_empty()
-            && !re(r"(?i)^Memory [a-f0-9]+$").is_match(text(&doc["title"]))
+            && !re!(r"(?i)^Memory [a-f0-9]+$").is_match(text(&doc["title"]))
         {
             text(&doc["title"])
         } else {
@@ -324,7 +308,7 @@ pub fn document_index(doc: &Value, fallback_container: &str, terms: &[String]) -
                 .trim()
         };
         let req = if request.is_empty() {
-            re(r"(?m)^description:\s*(.+)$")
+            re!(r"(?m)^description:\s*(.+)$")
                 .captures(&content)
                 .map(|c| c[1].to_owned())
                 .unwrap_or_else(|| first(&content))
@@ -638,7 +622,7 @@ fn automatic_stop_ranges(query: &str) -> Vec<(usize, usize)> {
 fn path_topic(s: &str) -> String {
     let normalized = s.replace('\\', "/");
     let normalized = normalized.trim_end_matches('/');
-    let normalized_no_drive = re(r"(?i)^[a-z]:/").replace(normalized, "");
+    let normalized_no_drive = re!(r"(?i)^[a-z]:/").replace(normalized, "");
     let mut parts: Vec<_> = normalized_no_drive
         .split('/')
         .filter(|s| !s.is_empty())
@@ -654,7 +638,7 @@ fn path_topic(s: &str) -> String {
     }
     if let Some(i) = parts
         .iter()
-        .position(|p| re(r"(?i)^(?:dev|projects?|workspaces?|repos?|work)$").is_match(p))
+        .position(|p| re!(r"(?i)^(?:dev|projects?|workspaces?|repos?|work)$").is_match(p))
     {
         parts.get(i + 1).copied().unwrap_or("").to_owned()
     } else {
@@ -663,7 +647,7 @@ fn path_topic(s: &str) -> String {
 }
 pub fn automatic_search_text(query: &str) -> String {
     let normalized: String = query.nfkc().collect();
-    let quoted = re(r#"(?i)["']([a-z]:[\\/][^\r\n]*?|\\\\[^"'\r\n]*?|/[^\r\n]*?)["']"#)
+    let quoted = re!(r#"(?i)["']([a-z]:[\\/][^\r\n]*?|\\\\[^"'\r\n]*?|/[^\r\n]*?)["']"#)
         .replace_all(&normalized, |c: &regex::Captures| path_topic(&c[1]));
     static PATH_PATTERN: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
     let pattern = PATH_PATTERN.get_or_init(|| fancy_regex::Regex::new(
@@ -696,7 +680,7 @@ pub fn query_terms(query: &str, automatic: bool) -> Vec<String> {
         query.to_owned()
     };
     let identifiers: Vec<_> = if automatic {
-        re(r"(?i)\b[a-z\d]+(?:[._-][a-z\d]+)+\b")
+        re!(r"(?i)\b[a-z\d]+(?:[._-][a-z\d]+)+\b")
             .find_iter(&query)
             .map(|m| (m.as_str().to_lowercase(), m.start(), m.end()))
             .collect()
@@ -717,7 +701,7 @@ pub fn query_terms(query: &str, automatic: bool) -> Vec<String> {
                 && !identifiers.iter().any(|(_, a, b)| start >= a && start < b)
         })
         .collect();
-    let japanese = re(r"^[\p{Han}\p{Hiragana}\p{Katakana}ー]+$");
+    let japanese = re!(r"^[\p{Han}\p{Hiragana}\p{Katakana}ー]+$");
     let mut compounded = HashSet::new();
     let mut compounds = vec![];
     for pair in useful.windows(2) {
@@ -765,7 +749,7 @@ pub fn recall_topic_terms(query: &str) -> Vec<String> {
         .collect()
 }
 fn normalized(s: &str) -> String {
-    re(r"[._-]+")
+    re!(r"[._-]+")
         .replace_all(&s.nfkc().collect::<String>().to_lowercase(), " ")
         .to_string()
 }
@@ -783,7 +767,7 @@ fn prepare_terms(terms: &[String]) -> (Vec<PreparedTerm<'_>>, usize) {
             let normalized = normalized(term);
             PreparedTerm {
                 original: term,
-                token_like: re(r"^[a-z\d ]+$").is_match(&normalized),
+                token_like: re!(r"^[a-z\d ]+$").is_match(&normalized),
                 ends_ascii_digit: normalized.ends_with(|c: char| c.is_ascii_digit()),
                 normalized,
                 weight: term.encode_utf16().count().min(12),
@@ -931,7 +915,7 @@ fn score(candidate: &mut Candidate, terms: &[PreparedTerm<'_>], total: usize, au
     if !automatic {
         project = text(&index["provenance"]["project"]).to_owned();
         if project.is_empty() {
-            if let Some(c) = re(r"(?i)^repo_(.+)__[a-f0-9]{16}$")
+            if let Some(c) = re!(r"(?i)^repo_(.+)__[a-f0-9]{16}$")
                 .captures(text(&index["provenance"]["projectId"]))
             {
                 project = c[1].to_owned()
@@ -1034,21 +1018,126 @@ fn latest(candidates: Vec<Candidate>) -> Vec<Candidate> {
         .map(|(_, c)| c)
         .collect()
 }
+fn source_date(index: &Value) -> i64 {
+    date_number(choose(&[&index["sourceUpdatedAt"], &index["updatedAt"]]))
+}
 fn compare_project(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.project_only.cmp(&a.project_only).then_with(|| {
         if a.project_only && b.project_only {
-            date_number(choose(&[
-                &b.index["sourceUpdatedAt"],
-                &b.index["updatedAt"],
-            ]))
-            .cmp(&date_number(choose(&[
-                &a.index["sourceUpdatedAt"],
-                &a.index["updatedAt"],
-            ])))
+            source_date(&b.index).cmp(&source_date(&a.index))
         } else {
             std::cmp::Ordering::Equal
         }
     })
+}
+/// 今のセッションだけを許す指定（自動想起）の絞り込み。送信と retain のどちらも呼び出し側が automatic で守る。
+/// 今の ID に上限は付かず、旧 ID（再開で変わった同じ会話の ID）には時刻の上限（until）が付く。
+#[derive(Default)]
+struct SessionFilter {
+    ids: Vec<(String, Option<(i64, String)>)>,
+    source: String,
+}
+impl SessionFilter {
+    // 今の ID（onlySessionId）が空なら絞り込みなし。旧 ID は重複を除き、今の ID を含めて最大 8 件、ID は 160 バイトまで。
+    // until が空なら上限なし、解釈できない旧 ID は使わない（fail closed）。
+    fn from_options(options: &Value) -> Self {
+        let current = text(&options["onlySessionId"]).trim();
+        if current.is_empty() {
+            return Self::default();
+        }
+        let mut ids: Vec<(String, Option<(i64, String)>)> = vec![(current.to_string(), None)];
+        for entry in options["onlySessionIds"].as_array().into_iter().flatten() {
+            let id = text(&entry["id"]).trim();
+            let until = text(&entry["until"]).trim();
+            let bound = if until.is_empty() {
+                None
+            } else {
+                date_millis(until).map(|m| (m, until.to_string()))
+            };
+            let usable = until.is_empty() || bound.is_some();
+            if !id.is_empty()
+                && id.len() <= 160
+                && usable
+                && !ids.iter().any(|s| s.0 == id)
+                && ids.len() < 8
+            {
+                ids.push((id.to_string(), bound))
+            }
+        }
+        // 種別（記録の sm_source: codex / claude-code）が分かるときは (種別, sessionId) の組で絞る。
+        let source = text(&options["onlySessionSource"]).trim().to_string();
+        Self { ids, source }
+    }
+    fn is_active(&self) -> bool {
+        !self.ids.is_empty()
+    }
+    // サーバーへ渡す絞り込み。複数 ID は sessionIds（上限は sessionUntil、原文のまま）で、1 件なら従来の sessionId で送る。
+    fn request_fields(&self) -> Value {
+        let mut fields = json!({});
+        if self.ids.len() > 1 {
+            fields["sessionIds"] = json!(self.ids.iter().map(|s| s.0.as_str()).collect::<Vec<_>>());
+            let until: serde_json::Map<String, Value> = self
+                .ids
+                .iter()
+                .filter_map(|(id, bound)| bound.as_ref().map(|b| (id.clone(), json!(b.1))))
+                .collect();
+            if !until.is_empty() {
+                fields["sessionUntil"] = Value::Object(until)
+            }
+        } else if let Some((id, _)) = self.ids.first() {
+            fields["sessionId"] = json!(id)
+        }
+        if self.is_active() && !self.source.is_empty() {
+            fields["sessionSource"] = json!(self.source)
+        }
+        fields
+    }
+    fn apply_to(&self, body: &mut Value) {
+        for (key, value) in self.request_fields().as_object().into_iter().flatten() {
+            body[key] = value.clone()
+        }
+    }
+    // 旧サーバーは未知の引数を無視するため、クライアント側でも絞る。sessionId の無い記録は一致しない（fail closed）。
+    // 種別が返った候補だけを突き合わせ、返らない候補は sessionId の一致だけで通す。
+    // 上限があるときは、元ターンの時刻（索引の sourceUpdatedAt）が上限以下のものだけを通す。無い・解釈できない記録は落とす。
+    fn accepts(&self, index: &Value) -> bool {
+        self.ids.iter().any(|(id, bound)| {
+            id == text(&index["sessionId"])
+                && bound.as_ref().is_none_or(|(until, _)| {
+                    date_millis(text(&index["sourceUpdatedAt"])).is_some_and(|t| t <= *until)
+                })
+        }) && (self.source.is_empty()
+            || text(&index["sessionSource"]).is_empty()
+            || text(&index["sessionSource"]) == self.source)
+    }
+}
+// 8 件ずつ区切り、区切りごとに全員の完了を待ってから次へ進む。skip の項目は spawn せず None を返す。結果は入力順。
+fn fan_out<T: Sync, R: Send>(
+    items: &[T],
+    skip: impl Fn(&T) -> bool,
+    job: impl Fn(&T) -> Result<R> + Sync,
+) -> Vec<Option<Result<R>>> {
+    let job = &job;
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(8) {
+        let responses = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|item| (!skip(item)).then(|| scope.spawn(move || job(item))))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("Memory request worker failed")))
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        out.extend(responses)
+    }
+    out
 }
 pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
     let automatic = options["automatic"] == true;
@@ -1086,52 +1175,13 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
         .unwrap_or(3);
     let minimum = settings["minimumSimilarity"].as_f64().unwrap_or(0.7);
     // 今のセッションだけを許す指定では、サーバーにも sessionId を渡して候補窓を決める前に絞らせる。
-    // 未対応の旧サーバーは未知の引数を無視するため、下のクライアント側の絞り込みも残す。
-    let only_session = text(&options["onlySessionId"]).trim();
-    // 種別（記録の sm_source: codex / claude-code）が分かるときは (種別, sessionId) の組で絞る。
-    // 種別を持たない旧記録は、対応サーバーが検索の時点で落とす（fail closed）。旧サーバーは種別を返さないため、
-    // クライアント側では種別が返った候補だけを突き合わせ、返らない候補は sessionId の一致だけで通す。
-    // 種別が分からないクライアントは sessionId だけで絞る。
-    let only_source = text(&options["onlySessionSource"]).trim();
-    // 再開で ID が変わった同じ会話の ID 群（今の ID を含む）。2 件以上のときだけ sessionIds として送り、1 件なら従来の sessionId のまま。
-    // 旧 ID には時刻の上限（until）が付く。フォーク・再開で引き継いだ旧 ID の記録のうち、元ターンの時刻が上限以下のものだけを通す。
-    // 上限が解釈できない旧 ID は使わない（fail closed）。今の ID に上限は付かない。
-    let mut only_ids: Vec<(String, Option<(i64, String)>)> = vec![];
-    if !only_session.is_empty() {
-        only_ids.push((only_session.to_string(), None));
-        for entry in options["onlySessionIds"].as_array().into_iter().flatten() {
-            let id = text(&entry["id"]).trim();
-            let until = text(&entry["until"]).trim();
-            let bound = if until.is_empty() { None } else { date_millis(until).map(|m| (m, until.to_string())) };
-            let usable = until.is_empty() || bound.is_some();
-            if !id.is_empty() && id.len() <= 160 && usable && !only_ids.iter().any(|s| s.0 == id) && only_ids.len() < 8 {
-                only_ids.push((id.to_string(), bound))
-            }
-        }
-    }
-    // サーバーへ渡す絞り込み。複数 ID は sessionIds（上限は sessionUntil）で、1 件なら従来の sessionId で送る。
-    let mut session_fields = json!({});
-    if only_ids.len() > 1 {
-        session_fields["sessionIds"] = json!(only_ids.iter().map(|s| s.0.as_str()).collect::<Vec<_>>());
-        let until: serde_json::Map<String, Value> = only_ids.iter().filter_map(|(id, bound)| bound.as_ref().map(|b| (id.clone(), json!(b.1)))).collect();
-        if !until.is_empty() {
-            session_fields["sessionUntil"] = Value::Object(until)
-        }
-    } else if !only_session.is_empty() {
-        session_fields["sessionId"] = json!(only_session)
-    }
-    if !only_session.is_empty() && !only_source.is_empty() {
-        session_fields["sessionSource"] = json!(only_source)
-    }
-    let session_fields = &session_fields;
+    let session = SessionFilter::from_options(options);
     let mut global = None;
     if container.is_empty() {
         let mut body = json!({"allContainers":true,"q":query,"limit":40});
         if automatic {
             body["indexOnly"] = json!(true);
-            for (key, value) in session_fields.as_object().into_iter().flatten() {
-                body[key] = value.clone()
-            }
+            session.apply_to(&mut body);
         }
         match request(config, "/v4/search", Some(&body), options) {
             Ok(response) => {
@@ -1189,38 +1239,21 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
     if let Some(g) = &global {
         add(g, "")?
     } else {
-        for chunk in tags.chunks(8) {
-            let responses = std::thread::scope(|scope| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|tag| {
-                        let query = &query;
-                        scope.spawn(move || {
-                            let mut body = json!({"containerTag":tag,"q":query,"limit":20});
-                            if automatic {
-                                body["indexOnly"] = json!(true);
-                                if !only_session.is_empty() {
-                                    for (key, value) in session_fields.as_object().into_iter().flatten() {
-                                        body[key] = value.clone()
-                                    }
-                                }
-                            }
-                            request(config, "/v4/search", Some(&body), options)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err(anyhow::anyhow!("Memory search worker failed")))
-                    })
-                    .collect::<Vec<_>>()
-            });
-            for (tag, response) in chunk.iter().zip(responses) {
-                if response.and_then(|r| add(&r, tag)).is_err() {
-                    failed.push(tag.clone())
+        let responses = fan_out(
+            &tags,
+            |_| false,
+            |tag| {
+                let mut body = json!({"containerTag":tag,"q":query,"limit":20});
+                if automatic {
+                    body["indexOnly"] = json!(true);
+                    session.apply_to(&mut body);
                 }
+                request(config, "/v4/search", Some(&body), options)
+            },
+        );
+        for (tag, response) in tags.iter().zip(responses) {
+            if !matches!(response, Some(Ok(r)) if add(&r, tag).is_ok()) {
+                failed.push(tag.clone())
             }
         }
         if !tags.is_empty() && failed.len() == tags.len() {
@@ -1229,19 +1262,8 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
     }
     // 今のセッションだけを許す指定では、改訂選択・件数上限・ハイドレーションより前に絞る。
     // sessionId の無い記録は一致しないため落ちる（fail closed）。
-    if automatic && !only_session.is_empty() {
-        candidates.retain(|c| {
-            only_ids.iter().any(|(id, bound)| {
-                id == text(&c.index["sessionId"])
-                    && bound.as_ref().is_none_or(|(until, _)| {
-                        // 元ターンの時刻（capture が保存する sourceTimestamp。索引の sourceUpdatedAt）。無い・解釈できない記録は落とす。
-                        date_millis(text(&c.index["sourceUpdatedAt"])).is_some_and(|t| t <= *until)
-                    })
-            })
-                && (only_source.is_empty()
-                    || text(&c.index["sessionSource"]).is_empty()
-                    || text(&c.index["sessionSource"]) == only_source)
-        })
+    if automatic && session.is_active() {
+        candidates.retain(|c| session.accepts(&c.index))
     }
     for c in &mut candidates {
         score(c, &prepared_terms, total_weight, automatic)
@@ -1279,54 +1301,36 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
     });
     candidates.truncate((limit * 8).clamp(20, 80));
     let mut failed_documents = vec![];
-    for chunk in candidates.chunks_mut(8) {
-        let responses = std::thread::scope(|scope| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|c| {
-                    if c.row["metadata"]["memoryIndex"]["version"] == 1 {
-                        return None;
-                    }
-                    Some(scope.spawn(move || {
-                        let id = text(&c.index["id"]);
-                        let path = format!("/v3/documents/{}", encode(id));
-                        request(config, &path, None, options).and_then(|d| {
-                            if text(&d["id"]) != id || !d["content"].is_string() {
-                                bail!("Invalid memory document response")
-                            }
-                            Ok(d)
-                        })
-                    }))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.map(|h| {
-                        h.join().unwrap_or_else(|_| {
-                            Err(anyhow::anyhow!("Memory hydration worker failed"))
-                        })
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-        for (c, response) in chunk.iter_mut().zip(responses) {
-            if let Some(response) = response {
-                match response {
-                    Ok(d) => c.index = document_index(&d, text(&c.index["containerTag"]), &terms),
-                    Err(_) => {
-                        failed_documents.push(text(&c.index["id"]).to_owned());
-                        c.index["title"] = json!(if text(&c.row["metadata"]["title"]).is_empty() {
-                            "保存された記録"
-                        } else {
-                            text(&c.row["metadata"]["title"])
-                        });
-                        c.index["description"] = json!("");
-                        c.index["recallable"] = json!(false)
-                    }
+    let responses = fan_out(
+        &candidates,
+        |c| c.row["metadata"]["memoryIndex"]["version"] == 1,
+        |c| {
+            let id = text(&c.index["id"]);
+            let path = format!("/v3/documents/{}", encode(id));
+            request(config, &path, None, options).and_then(|d| {
+                if text(&d["id"]) != id || !d["content"].is_string() {
+                    bail!("Invalid memory document response")
                 }
-                score(c, &prepared_terms, total_weight, automatic)
+                Ok(d)
+            })
+        },
+    );
+    for (c, response) in candidates.iter_mut().zip(responses) {
+        if let Some(response) = response {
+            match response {
+                Ok(d) => c.index = document_index(&d, text(&c.index["containerTag"]), &terms),
+                Err(_) => {
+                    failed_documents.push(text(&c.index["id"]).to_owned());
+                    c.index["title"] = json!(if text(&c.row["metadata"]["title"]).is_empty() {
+                        "保存された記録"
+                    } else {
+                        text(&c.row["metadata"]["title"])
+                    });
+                    c.index["description"] = json!("");
+                    c.index["recallable"] = json!(false)
+                }
             }
+            score(c, &prepared_terms, total_weight, automatic)
         }
     }
     if automatic {
@@ -1356,16 +1360,7 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
             })
             .then(a.rank.cmp(&b.rank))
             .then_with(|| compare_date(&b.index, &a.index, "consolidationCreatedAt"))
-            .then_with(|| {
-                date_number(choose(&[
-                    &b.index["sourceUpdatedAt"],
-                    &b.index["updatedAt"],
-                ]))
-                .cmp(&date_number(choose(&[
-                    &a.index["sourceUpdatedAt"],
-                    &a.index["updatedAt"],
-                ])))
-            })
+            .then_with(|| source_date(&b.index).cmp(&source_date(&a.index)))
     });
     let mut selected: Vec<Candidate> = vec![];
     let mut seen = HashSet::new();
@@ -2454,6 +2449,83 @@ mod tests {
                 assert!(format_recent_task(index).contains("storedDate=2020-01-01T00:00:00Z"));
             }
         }
+    }
+    #[test]
+    fn session_filter_reads_options_with_bounds() {
+        // 今の ID が空なら、追加 ID・種別があっても絞り込みなし。
+        let none = SessionFilter::from_options(&json!({
+            "onlySessionId": "  ",
+            "onlySessionIds": [{"id": "old"}],
+            "onlySessionSource": "codex"
+        }));
+        assert!(!none.is_active() && none.request_fields() == json!({}));
+        // 今の ID は 160 バイトを超えても使い、追加 ID の長さだけを検査する。
+        let long = "x".repeat(200);
+        let filter = SessionFilter::from_options(&json!({
+            "onlySessionId": long,
+            "onlySessionIds": [
+                {"id": "y".repeat(161)}, {"id": "y".repeat(160)}, {"id": long},
+                {"id": "bad", "until": "not a date"}, {"id": "ok", "until": "2026-01-01T00:00:00Z"}
+            ]
+        }));
+        let ids: Vec<_> = filter.ids.iter().map(|(id, _)| id.len()).collect();
+        assert_eq!(ids, [200, 160, 2]);
+        // 今の ID を含めて最大 8 件。
+        let many: Vec<_> = (0..20).map(|i| json!({"id": format!("s{i}")})).collect();
+        let filter = SessionFilter::from_options(&json!({"onlySessionId": "now", "onlySessionIds": many}));
+        assert_eq!(filter.ids.len(), 8);
+        assert_eq!(filter.ids[7].0, "s6");
+    }
+    #[test]
+    fn session_filter_request_fields_keep_the_wire_shape() {
+        let one = SessionFilter::from_options(&json!({"onlySessionId": "a"}));
+        assert_eq!(one.request_fields(), json!({"sessionId": "a"}));
+        let one = SessionFilter::from_options(&json!({"onlySessionId": "a", "onlySessionSource": "codex"}));
+        assert_eq!(one.request_fields(), json!({"sessionId": "a", "sessionSource": "codex"}));
+        let two = SessionFilter::from_options(&json!({
+            "onlySessionId": "a",
+            "onlySessionIds": [{"id": "b", "until": " 2026-01-01T00:00:00.000Z "}, {"id": "c"}, {"id": "a"}]
+        }));
+        assert_eq!(
+            two.request_fields(),
+            json!({"sessionIds": ["a", "b", "c"], "sessionUntil": {"b": "2026-01-01T00:00:00.000Z"}})
+        );
+    }
+    #[test]
+    fn session_filter_accepts_fail_closed() {
+        let filter = SessionFilter::from_options(&json!({
+            "onlySessionId": "now",
+            "onlySessionIds": [{"id": "old", "until": "2026-01-01T00:00:00Z"}],
+            "onlySessionSource": "codex"
+        }));
+        let doc = |id: &str, source: Option<&str>, at: Option<&str>| {
+            let mut v = json!({"sessionId": id});
+            if let Some(source) = source {
+                v["sessionSource"] = json!(source)
+            }
+            if let Some(at) = at {
+                v["sourceUpdatedAt"] = json!(at)
+            }
+            v
+        };
+        // 今の ID に上限は無く、時刻が無くても通る。種別が無い旧記録は ID の一致だけで通る。
+        assert!(filter.accepts(&doc("now", Some("codex"), None)));
+        assert!(filter.accepts(&doc("now", None, None)));
+        assert!(!filter.accepts(&doc("now", Some("claude-code"), None)));
+        assert!(!filter.accepts(&doc("other", Some("codex"), None)));
+        assert!(!filter.accepts(&json!({})));
+        // 旧 ID は上限以下の元ターンだけ。時刻が無い・解釈できない記録は落とす。
+        assert!(filter.accepts(&doc("old", None, Some("2026-01-01T00:00:00Z"))));
+        assert!(!filter.accepts(&doc("old", None, Some("2026-01-01T00:00:01Z"))));
+        assert!(!filter.accepts(&doc("old", None, None)));
+        assert!(!filter.accepts(&doc("old", None, Some("garbage"))));
+        // 上限が空の旧 ID は上限なしで採用するので、時刻が無い記録も通る。
+        let unbounded = SessionFilter::from_options(&json!({
+            "onlySessionId": "now",
+            "onlySessionIds": [{"id": "nolimit"}]
+        }));
+        assert!(unbounded.accepts(&doc("nolimit", None, None)));
+        assert!(unbounded.accepts(&doc("nolimit", None, Some("garbage"))));
     }
     #[test]
     fn expired_deadline_rejects_before_network() {

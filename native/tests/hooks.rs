@@ -43,11 +43,8 @@ impl Fixture {
         );
         let worker = thread::spawn(move || {
             while !stopping.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        // Windows accepts inherit the listener's nonblocking mode.
-                        // Wait for request bytes instead of treating WouldBlock as EOF.
-                        stream.set_nonblocking(false).unwrap();
+                match support::accept_blocking(&listener, || !stopping.load(Ordering::Relaxed)) {
+                    Some(mut stream) => {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
@@ -177,10 +174,7 @@ impl Fixture {
                         );
                         let _ = stream.write_all(&output);
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10))
-                    }
-                    Err(_) => break,
+                    None => break,
                 }
             }
         });
@@ -200,7 +194,12 @@ impl Drop for Fixture {
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(self.url.trim_start_matches("http://"));
         if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
+            if let Err(error) = worker.join() {
+                // テストが失敗して巻き戻している最中に二重 panic でバイナリごと止めない。
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(error);
+                }
+            }
         }
     }
 }
