@@ -735,7 +735,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
     fs::write(
         home.join("remnifold.json"),
         serde_json::to_vec(
-            &json!({"baseUrl":fixture.base_url,"apiKey":API_KEY,"maxRecentTasks":0}),
+            &json!({"baseUrl":fixture.base_url,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all"}),
         )?,
     )?;
     let endpoint = &fixture.base_url;
@@ -999,6 +999,92 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
         "Claude capture disclosed internal rows or secrets"
     );
     checks.push("native Stop captures Claude Code transcripts final-only with claude-code provenance and suppresses acknowledged retries");
+    // 既定の recallScope=session で、再開前の同じ会話（旧 ID A）の記録だけが、A の時刻の上限以下に限って注入されること。
+    // クライアントが transcript の timestamp（ミリ秒付き ISO 8601・Z）をそのまま sessionUntil として送り、
+    // 実 workerd のサーバーが julianday() で射影の source_date と比べる。書式が噛み合わなければ 0 件になるため、実物の書式で通す。
+    let turn_rows = |session: &str, marker: &str, start: &str, end: &str| {
+        [
+            json!({"type":"user","sessionId":session,"cwd":project,"timestamp":start,"origin":{"kind":"human"},"message":{"role":"user","content":format!("ZephyrQuill {marker} capture request")}}),
+            json!({"type":"assistant","sessionId":session,"timestamp":end,"message":{"id":format!("msg-{marker}"),"role":"assistant","content":[{"type":"text","text":format!("ZephyrQuill {marker} final answer")}]}}),
+        ]
+    };
+    let write_rows = |path: &Path, rows: &[Value]| -> Result<()> {
+        fs::write(path, rows.iter().map(Value::to_string).collect::<Vec<_>>().join("
+") + "
+")?;
+        Ok(())
+    };
+    let early = turn_rows("resume-parent-a", "EarlyAlphaMark", "2026-03-01T10:00:00.123Z", "2026-03-01T10:00:05.456Z");
+    let late = turn_rows("resume-parent-a", "LateAlphaMark", "2026-03-01T10:30:00.000Z", "2026-03-01T10:30:04.000Z");
+    let child = turn_rows("resume-child-b", "ChildBetaMark", "2026-03-01T11:00:00.789Z", "2026-03-01T11:00:03.000Z");
+    let stranger = turn_rows("resume-stranger-c", "StrangerGammaMark", "2026-03-01T10:10:00.000Z", "2026-03-01T10:10:02.000Z");
+    // 親 A は、フォーク前（上限以下）とフォーク後（上限より後）のターンを保存する。
+    let mut parent_rows = early.to_vec();
+    parent_rows.extend(late);
+    for (id, rows) in [
+        ("resume-parent-a", parent_rows),
+        ("resume-child-b", child.to_vec()),
+        ("resume-stranger-c", stranger.to_vec()),
+    ] {
+        let path = claude_dir.join(format!("{id}.jsonl"));
+        write_rows(&path, &rows)?;
+        let saved = hook(
+            binary,
+            &home,
+            &project,
+            endpoint,
+            "Stop",
+            json!({"session_id":id,"transcript_path":path,"cwd":project,"hook_event_name":"Stop","stop_hook_active":false}),
+        )?;
+        ensure!(
+            saved["systemMessage"].as_str().unwrap_or("").contains("pending 0"),
+            "resume fixture capture {id}: {saved}"
+        );
+    }
+    // 再開後の B の transcript: A の行（再開でコピーされたもの。最後の行が上限）に続いて B の行が来る。
+    let resumed_path = claude_dir.join("resume-child-b-resumed.jsonl");
+    let mut resumed_rows = early.to_vec();
+    resumed_rows.extend(child);
+    write_rows(&resumed_path, &resumed_rows)?;
+    let recall_with = |scope: &str| -> Result<String> {
+        fs::write(
+            home.join("remnifold.json"),
+            serde_json::to_vec(
+                &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":scope,"maxMemories":8}),
+            )?,
+        )?;
+        let output = hook(
+            binary,
+            &home,
+            &project,
+            endpoint,
+            "UserPromptSubmit",
+            json!({"session_id":"resume-child-b","transcript_path":resumed_path,"cwd":project,"prompt":"ZephyrQuill capture request"}),
+        )?;
+        Ok(output["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("").to_string())
+    };
+    let scoped = recall_with("session")?;
+    ensure!(
+        scoped.contains("EarlyAlphaMark") && scoped.contains("ChildBetaMark"),
+        "resume scope must inject the old-id turn up to the bound and the current turn: {scoped}"
+    );
+    ensure!(
+        !scoped.contains("LateAlphaMark") && !scoped.contains("StrangerGammaMark"),
+        "resume scope must not inject the parent's later turn or another session: {scoped}"
+    );
+    let everything = recall_with("all")?;
+    ensure!(
+        everything.contains("StrangerGammaMark") && everything.contains("LateAlphaMark"),
+        "recallScope all keeps the cross-session behavior: {everything}"
+    );
+    // 以降のケースは従来どおり all で動かす。
+    fs::write(
+        home.join("remnifold.json"),
+        serde_json::to_vec(
+            &json!({"baseUrl":fixture.base_url,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all"}),
+        )?,
+    )?;
+    checks.push("native session recall through real workerd: resume-copied old session ids are bounded by the copied rows' timestamps");
     #[cfg(windows)]
     let recall = packaged_windows_hook(
         &home,
@@ -1205,7 +1291,7 @@ fn organization_contracts(
     fs::write(
         recall_home.join("remnifold.json"),
         serde_json::to_vec(
-            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"maxMemories":5,"minimumSimilarity":0.7}),
+            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all","maxMemories":5,"minimumSimilarity":0.7}),
         )?,
     )?;
     let recalled = hook(
@@ -1417,7 +1503,7 @@ fn organization_numeric_conflict_journey(
     fs::write(
         recall_home.join("remnifold.json"),
         serde_json::to_vec(
-            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"maxMemories":5,"minimumSimilarity":0.7}),
+            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all","maxMemories":5,"minimumSimilarity":0.7}),
         )?,
     )?;
     let result = hook(
@@ -1574,7 +1660,9 @@ fn diagnostic_contracts(
         fs::create_dir_all(&home)?;
         fs::write(
             home.join("remnifold.json"),
-            serde_json::to_vec(&json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0}))?,
+            serde_json::to_vec(
+                &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all"}),
+            )?,
         )?;
         let transcript = home.join("fixture-sensitive-marker.jsonl");
         let rows = [
@@ -1826,7 +1914,7 @@ impl Recall<'_> {
         fs::write(
             self.home.join("remnifold.json"),
             serde_json::to_vec(
-                &json!({"baseUrl":self.endpoint,"apiKey":API_KEY,"maxMemories":count,"maxRecentTasks":recent,"minimumSimilarity":0.7}),
+                &json!({"baseUrl":self.endpoint,"apiKey":API_KEY,"maxMemories":count,"maxRecentTasks":recent,"recallScope":"all","minimumSimilarity":0.7}),
             )?,
         )?;
         Ok(())

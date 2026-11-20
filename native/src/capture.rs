@@ -1198,6 +1198,43 @@ mod tests {
         );
         assert_eq!(n, 4);
     }
+    // 新規の記録は、Codex・Claude Code のどちらも明示的な種別（sm_source / sm_client）を保存する。
+    // 種別は捕捉キー・customId に混ぜない（再試行時の重複防止を保つ）ため、同じ本文なら両者で同一になる。
+    #[test]
+    fn captures_store_explicit_client_kind_without_changing_identity() {
+        let t = Transcript {
+            turns: vec![Turn {
+                user: "request".into(),
+                assistant: "response".into(),
+                source_timestamp: "2026-01-01T00:00:00Z".into(),
+            }],
+            redactions: 0,
+        };
+        let build = |meta: Value| {
+            let c = Candidate {
+                file_path: PathBuf::new(),
+                meta,
+                size: 0,
+                modified: SystemTime::UNIX_EPOCH,
+                recent: false,
+            };
+            build_turn_documents(&c, &t, &json!({"containerTag":"project"}), "Task", 120000, None)
+                .unwrap()
+        };
+        let codex = build(json!({"id":"session","rootSessionId":"session","isSubagent":false}));
+        let claude = build(
+            json!({"id":"session","rootSessionId":"session","isSubagent":false,"format":"claude"}),
+        );
+        assert_eq!(codex[0]["metadata"]["sm_source"], "codex");
+        assert_eq!(codex[0]["metadata"]["sm_client"], "codex-kagayoi-memory");
+        assert_eq!(claude[0]["metadata"]["sm_source"], "claude-code");
+        assert_eq!(claude[0]["metadata"]["sm_client"], "claude-code-remnifold");
+        assert_eq!(codex[0]["customId"], claude[0]["customId"]);
+        assert_eq!(
+            codex[0]["metadata"]["captureKey"],
+            claude[0]["metadata"]["captureKey"]
+        );
+    }
     #[test]
     fn stable_ids() {
         let c = Candidate {

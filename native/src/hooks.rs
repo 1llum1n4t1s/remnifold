@@ -119,6 +119,69 @@ pub fn recall_query(value: &str) -> String {
     truncate_utf16(re!(r"\n{3,}").replace_all(&stripped, "\n\n").trim(), 1000)
 }
 
+/// フックを呼んだクライアントの種別（記録の `sm_source` と同じ値）を、transcript の先頭の行から判定する。
+/// Codex の rollout は `session_meta` 行で始まり、Claude Code の transcript は各行が文字列の `sessionId` を持つ。
+/// 読めない・どちらにも当たらない場合は None（呼び出し側は種別なしの sessionId 一致に倒す）。
+fn client_source(payload: &Value) -> Option<&'static str> {
+    use std::io::{BufRead, BufReader};
+    let path = payload["transcript_path"].as_str().filter(|s| !s.trim().is_empty())?;
+    let reader = BufReader::new(File::open(path).ok()?.take(MIB));
+    for line in reader.lines().take(16) {
+        let Ok(row) = serde_json::from_str::<Value>(&line.ok()?) else {
+            continue;
+        };
+        if row["type"] == "session_meta" {
+            return Some("codex");
+        }
+        if row["sessionId"].is_string() {
+            return Some("claude-code");
+        }
+    }
+    None
+}
+
+/// 再開で引き継がれた同じ会話の sessionId を集める上限。
+const RESUME_IDS: usize = 8;
+const RESUME_BYTES: u64 = 4 * MIB;
+const RESUME_LINES: usize = 20_000;
+
+/// Claude Code の transcript の先頭から、再開でコピーされた旧 sessionId を集める。
+/// 今の ID（上限なし）を先頭に、残りは transcript の中で後ろに現れたもの（今の再開に近いもの）を先に並べ、最大 RESUME_IDS 件にする。
+/// 旧 ID には時刻の上限（コピーされた行のうち、その ID を持つ行の timestamp の最大値）を付ける。フォークや、元のセッションが
+/// 別の場所で動き続ける再開では、親が引き継ぎ後に保存した記録を含めないため。timestamp が解釈できる行の無い旧 ID は使わない。
+/// sidechain・meta・会話以外の行、文字列でない・空・160 文字超の ID は使わない。読む量は RESUME_BYTES・RESUME_LINES で抑える。
+fn session_ids_with_resumed(path: &str, current: &str) -> Vec<(String, Option<String>)> {
+    let mut bytes = vec![];
+    if File::open(path).and_then(|file| file.take(RESUME_BYTES).read_to_end(&mut bytes)).is_err() {
+        return vec![(current.to_string(), None)];
+    }
+    // (ID, 上限の時刻（ミリ秒）, 上限の時刻の原文)。後ろに現れた ID ほど末尾に置く。
+    let mut seen: Vec<(String, i64, String)> = vec![];
+    for line in bytes.split(|b| *b == 0x0a).take(RESUME_LINES).filter(|l| l.len() <= RECORD) {
+        let Ok(row) = serde_json::from_slice::<Value>(line) else { continue };
+        let id = text(&row["sessionId"]).trim();
+        let counted = matches!(text(&row["type"]), "user" | "assistant")
+            && row["isSidechain"] != true
+            && row["isMeta"] != true;
+        if counted && !id.is_empty() && id.len() <= 160 && id != current {
+            let stamp = text(&row["timestamp"]);
+            let millis = chrono::DateTime::parse_from_rfc3339(stamp).map(|t| t.timestamp_millis()).ok();
+            let position = seen.iter().position(|s| s.0 == id);
+            let previous = position.map(|i| seen.remove(i));
+            let newest = match (previous, millis) {
+                (Some(p), Some(m)) if p.1 >= m => Some((p.0, p.1, p.2)),
+                (_, Some(m)) => Some((id.to_string(), m, stamp.to_string())),
+                (Some(p), None) => Some(p),
+                (None, None) => None,
+            };
+            seen.extend(newest);
+        }
+    }
+    let mut ids = vec![(current.to_string(), None)];
+    ids.extend(seen.into_iter().rev().take(RESUME_IDS - 1).map(|(id, _, stamp)| (id, Some(stamp))));
+    ids
+}
+
 fn mismatched(row: &Value, session: &str) -> bool {
     row["type"] == "session_meta" && row["payload"]["id"].as_str() != Some(session)
 }
@@ -479,9 +542,37 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
             )
         };
     }
-    let limit = settings["maxRecentTasks"].as_i64().unwrap_or(2).clamp(0, 3);
+    // 既定の recallScope=session は今のセッションの記録だけを注入する。他セッションの記録を
+    // 返す「直近の作業」は呼ばず、トピック検索は同じ session_id の項目だけに絞る（空なら注入しない）。
+    let session_only = settings["recallScope"] != "all";
+    let session = text(&payload["session_id"]).trim().to_string();
+    let limit = if session_only {
+        0
+    } else {
+        settings["maxRecentTasks"].as_i64().unwrap_or(2).clamp(0, 3)
+    };
     let (topic, recent) = std::thread::scope(|scope| {
-        let topic = scope.spawn(|| if query.is_empty() { Ok(Value::Null) } else { search::search_index(config, &json!({"query":query,"automatic":true,"settings":settings,"deadlineEpochMs":deadline,"timeoutMs":4000})) });
+        let topic = scope.spawn(|| if query.is_empty() || session_only && session.is_empty() { Ok(Value::Null) } else {
+            let mut options = json!({"query":query,"automatic":true,"settings":settings,"deadlineEpochMs":deadline,"timeoutMs":4000});
+            if session_only {
+                options["onlySessionId"] = json!(session);
+                // 同じ ID が別クライアントで衝突しないよう、種別が分かるときは (種別, sessionId) の組で絞る。
+                let source = client_source(payload);
+                if let Some(source) = source {
+                    options["onlySessionSource"] = json!(source);
+                }
+                // Claude Code は再開でコピーされた旧 sessionId も同じ会話として含める。Codex は実挙動が未確認のため今の ID のままにする。
+                if source == Some("claude-code") {
+                    if let Some(path) = payload["transcript_path"].as_str() {
+                        let ids = session_ids_with_resumed(path, &session);
+                        if ids.len() > 1 {
+                            options["onlySessionIds"] = json!(ids.iter().map(|(id, until)| json!({"id":id,"until":until})).collect::<Vec<_>>());
+                        }
+                    }
+                }
+            }
+            search::search_index(config, &options)
+        });
         let recent = scope.spawn(|| if limit == 0 { Ok(json!([])) } else { search::recent_task_index(config, &json!({"sessionId":payload["session_id"],"limit":limit,"deadlineEpochMs":deadline,"timeoutMs":4000})) });
         (
             topic
@@ -492,7 +583,14 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("hook recent tasks failed"))),
         )
     });
-    Ok(render_recall(event, payload, config, topic, recent))
+    Ok(render_recall(
+        event,
+        payload,
+        config,
+        topic,
+        recent,
+        session_only,
+    ))
 }
 
 fn render_recall(
@@ -501,6 +599,7 @@ fn render_recall(
     config: &Config,
     topic: Result<Value>,
     recent: Result<Value>,
+    session_only: bool,
 ) -> Value {
     let mut notices = Vec::new();
     let result = match topic {
@@ -539,7 +638,14 @@ fn render_recall(
     // 索引の案内文・見出しは、索引を書き込む環境の言語（crate::locale）で出す。
     // タグ名 <remnifold-index> は capture 側の除外判定が依存するため、言語によらず固定する。
     // AI への指示文（案内文・末尾の注意）は日本語と英語だけを持ち、他の言語は英語のままにする。
-    let prefix = format!("<remnifold-index>\n{}", tr("recall.index_prefix"));
+    let prefix = format!(
+        "<remnifold-index>\n{}",
+        if session_only {
+            tr("recall.index_prefix_session")
+        } else {
+            tr("recall.index_prefix")
+        }
+    );
     let prefix = prefix.as_str();
     let mut suffix = format!("\n\n{}", tr("recall.index_suffix"));
     if failed_spaces > 0 || failed_documents > 0 {
@@ -949,6 +1055,7 @@ mod tests {
             &config,
             Ok(topic.clone()),
             Ok(json!([small])),
+            false,
         );
         assert!(units(text(&response["hookSpecificOutput"]["additionalContext"])) <= 3000);
         let state = RecallState::load(&payload, &config, "UserPromptSubmit").unwrap();
@@ -959,6 +1066,7 @@ mod tests {
             &config,
             Ok(topic),
             Ok(json!([small])),
+            false,
         );
         assert!(again.get("hookSpecificOutput").is_none());
     }
@@ -977,6 +1085,7 @@ mod tests {
             &config,
             Ok(json!({"results":[first,skipped,short],"failedContainers":[],"failedDocuments":[]})),
             Ok(json!([])),
+            false,
         );
         let context = text(&response["hookSpecificOutput"]["additionalContext"]);
         assert!(units(context) <= 3000);

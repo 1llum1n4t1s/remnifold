@@ -20,6 +20,7 @@ struct Fixture {
     requests: Arc<Mutex<Vec<(String, Value)>>>,
     revision: Arc<AtomicUsize>,
     recent_failure: Arc<AtomicBool>,
+    mixed: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -31,11 +32,13 @@ impl Fixture {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let revision = Arc::new(AtomicUsize::new(1));
         let recent_failure = Arc::new(AtomicBool::new(false));
+        let mixed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let (request_log, rev, fail, stopping) = (
+        let (request_log, rev, fail, mix, stopping) = (
             requests.clone(),
             revision.clone(),
             recent_failure.clone(),
+            mixed.clone(),
             stop.clone(),
         );
         let worker = thread::spawn(move || {
@@ -109,9 +112,47 @@ impl Fixture {
                         let (status, output) = if !authorized {
                             (401, json!({"error":"unauthorized"}))
                         } else if path == "/v4/search" {
+                            let mut results = vec![document(
+                                "topic-doc",
+                                "Repair Unicode transcript boundaries",
+                            )];
+                            if mix.load(Ordering::Relaxed) {
+                                // 他セッションの記録に加え、sessionId の無い記録と今のセッションの記録を混在させる。
+                                let mut legacy =
+                                    document("legacy-doc", "Repair Unicode transcript boundaries");
+                                legacy["metadata"]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("sessionId");
+                                let mut current =
+                                    document("current-doc", "Repair Unicode transcript boundaries");
+                                current["metadata"]["sessionId"] = json!("fixture-session");
+                                // 再開前の同じ会話（旧 ID）の記録と、無関係な別セッションの記録も混在させる。
+                                let mut resumed =
+                                    document("resumed-doc", "Repair Unicode transcript boundaries");
+                                resumed["metadata"]["sessionId"] = json!("resumed-old");
+                                let mut stranger =
+                                    document("stranger-doc", "Repair Unicode transcript boundaries");
+                                stranger["metadata"]["sessionId"] = json!("stranger-session");
+                                resumed["metadata"]["memoryIndex"]["sourceUpdatedAt"] =
+                                    json!("2026-09-01T10:05:00Z");
+                                // フォーク後に親（旧 ID）が保存した記録（上限より新しい）と、時刻の無い旧 ID の記録。
+                                let mut late =
+                                    document("late-doc", "Repair Unicode transcript boundaries");
+                                late["metadata"]["sessionId"] = json!("resumed-old");
+                                late["metadata"]["memoryIndex"]["sourceUpdatedAt"] =
+                                    json!("2026-09-01T10:05:01Z");
+                                let mut untimed =
+                                    document("untimed-doc", "Repair Unicode transcript boundaries");
+                                untimed["metadata"]["sessionId"] = json!("resumed-old");
+                                // 今の ID の記録は、時刻が上限より新しくても通る。
+                                current["metadata"]["memoryIndex"]["sourceUpdatedAt"] =
+                                    json!("2030-01-01T00:00:00Z");
+                                results.extend([legacy, current, resumed, stranger, late, untimed]);
+                            }
                             (
                                 200,
-                                json!({"searchScope":"all-containers","searchedContainers":["fixture-space"],"spaceDiscoveryComplete":true,"results":[document("topic-doc", "Repair Unicode transcript boundaries")]}),
+                                json!({"searchScope":"all-containers","searchedContainers":["fixture-space"],"spaceDiscoveryComplete":true,"results":results}),
                             )
                         } else if path == "/v3/documents/list" && input["recentTasks"] == true {
                             if fail.load(Ordering::Relaxed) {
@@ -148,6 +189,7 @@ impl Fixture {
             requests,
             revision,
             recent_failure,
+            mixed,
             stop,
             worker: Some(worker),
         }
@@ -210,7 +252,12 @@ fn hook_in(language: &str, root: &Path, url: &str, event: &str, input: &[u8]) ->
 fn root() -> PathBuf {
     let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
+    // 既定は今のセッションだけの注入になるため、従来の挙動を調べる既存テストは明示して all にする。
+    fs::write(root.join("remnifold.json"), br#"{"recallScope":"all"}"#).unwrap();
     root
+}
+fn root_all() -> PathBuf {
+    root()
 }
 fn append(path: &Path, row: Value) {
     let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -247,7 +294,7 @@ fn legacy_codex_home_configuration_migrates_to_remnifold_home() {
     let remnifold = root.join("remnifold-home");
     fs::create_dir_all(&codex).unwrap();
     let legacy = serde_json::to_vec(
-        &json!({"baseUrl":fixture.url,"apiKey":"fixture-secret","recallMode":"direct"}),
+        &json!({"baseUrl":fixture.url,"apiKey":"fixture-secret","recallMode":"direct","recallScope":"all"}),
     )
     .unwrap();
     fs::write(codex.join("remnifold.json"), &legacy).unwrap();
@@ -360,6 +407,245 @@ fn recall_index_follows_environment_language() {
             );
         }
     }
+}
+
+#[test]
+fn session_scope_injects_only_current_session_records_and_skips_recent_tasks() {
+    let fixture = Fixture::new();
+    fixture.mixed.store(true, Ordering::Relaxed);
+    let payload =
+        json!({"session_id":" fixture-session ","prompt":"Repair Unicode transcript boundaries"});
+    // 既定（設定なし）・明示の session・未知の値は、いずれも session として扱う。
+    for config in [
+        None,
+        Some(r#"{"recallScope":"session"}"#),
+        Some(r#"{"recallScope":"unknown"}"#),
+    ] {
+        let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        if let Some(config) = config {
+            fs::write(root.join("remnifold.json"), config).unwrap();
+        }
+        fixture.requests.lock().unwrap().clear();
+        let output = hook(
+            &root,
+            &fixture.url,
+            "UserPromptSubmit",
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        let context = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{config:?}: {output}"));
+        assert!(context.contains("id=current-doc"), "{context}");
+        for other in ["topic-doc", "legacy-doc", "recent-doc"] {
+            assert!(!context.contains(other), "{config:?}: {other} in {context}");
+        }
+        assert!(context.contains("今のセッションの記録"), "{context}");
+        let requests = fixture.requests.lock().unwrap();
+        assert!(requests.iter().any(|(path, _)| path == "/v4/search"));
+        // サーバーにも trim 済みの sessionId を渡し、候補窓を決める前に絞らせる。
+        for (_, body) in requests.iter().filter(|(path, _)| path == "/v4/search") {
+            assert_eq!(body["sessionId"], "fixture-session", "{config:?}: {body}");
+        }
+        assert!(
+            !requests
+                .iter()
+                .any(|(path, _)| path == "/v3/documents/list")
+        );
+    }
+    // session_id の無いペイロードは、何も注入せず検索もしない（fail closed）。
+    let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    fixture.requests.lock().unwrap().clear();
+    let output = hook(
+        &root,
+        &fixture.url,
+        "UserPromptSubmit",
+        &serde_json::to_vec(&json!({"prompt":"Repair Unicode transcript boundaries"})).unwrap(),
+    );
+    assert_eq!(output, json!({}));
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    // all では従来どおり、他セッションの記録と直近の作業も注入する。
+    let root = root_all();
+    fixture.requests.lock().unwrap().clear();
+    let output = hook(
+        &root,
+        &fixture.url,
+        "UserPromptSubmit",
+        &serde_json::to_vec(&payload).unwrap(),
+    );
+    let context = output.to_string();
+    for id in ["topic-doc", "legacy-doc", "current-doc", "recent-doc"] {
+        assert!(context.contains(id), "{id} in {context}");
+    }
+    let requests = fixture.requests.lock().unwrap();
+    assert!(requests.iter().any(|(path, _)| path == "/v3/documents/list"));
+    // all では従来どおり、検索にセッション絞り込みを載せない。
+    for (_, body) in requests.iter().filter(|(path, _)| path == "/v4/search") {
+        assert!(body.get("sessionId").is_none(), "{body}");
+    }
+}
+
+// セッション絞り込みは、クライアント種別が transcript から分かるときは (種別, sessionId) の組でサーバーに渡す。
+#[test]
+fn session_scope_sends_client_source_detected_from_the_transcript() {
+    let fixture = Fixture::new();
+    let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let rows = [
+        (
+            "codex",
+            json!({"type":"session_meta","payload":{"id":"fixture-session"}}),
+        ),
+        (
+            "claude-code",
+            json!({"type":"user","sessionId":"fixture-session","message":{"role":"user","content":"x"}}),
+        ),
+    ];
+    for (expected, row) in rows {
+        let transcript = root.join(format!("{expected}.jsonl"));
+        fs::write(&transcript, format!("{row}\n")).unwrap();
+        let payload = json!({"session_id":"fixture-session","prompt":"Repair Unicode transcript boundaries","transcript_path":transcript});
+        fixture.requests.lock().unwrap().clear();
+        hook(
+            &root,
+            &fixture.url,
+            "UserPromptSubmit",
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        let requests = fixture.requests.lock().unwrap();
+        let searches: Vec<_> = requests
+            .iter()
+            .filter(|(path, _)| path == "/v4/search")
+            .collect();
+        assert!(!searches.is_empty(), "{expected}");
+        for (_, body) in searches {
+            assert_eq!(body["sessionId"], "fixture-session", "{expected}: {body}");
+            assert_eq!(body["sessionSource"], expected, "{expected}: {body}");
+        }
+    }
+    // 種別が分からない（transcript が無い・判定できない）ときは sessionId だけで絞る。
+    let unknown = root.join("unknown.jsonl");
+    fs::write(&unknown, "{\"type\":\"other\"}\n").unwrap();
+    for payload in [
+        json!({"session_id":"fixture-session","prompt":"Repair Unicode transcript boundaries"}),
+        json!({"session_id":"fixture-session","prompt":"Repair Unicode transcript boundaries","transcript_path":unknown}),
+    ] {
+        fixture.requests.lock().unwrap().clear();
+        hook(
+            &root,
+            &fixture.url,
+            "UserPromptSubmit",
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        let requests = fixture.requests.lock().unwrap();
+        for (_, body) in requests.iter().filter(|(path, _)| path == "/v4/search") {
+            assert_eq!(body["sessionId"], "fixture-session");
+            assert!(body.get("sessionSource").is_none(), "{body}");
+        }
+    }
+}
+
+// Claude Code は再開でコピーされた旧 sessionId も同じ会話として扱い、sessionIds で送って旧 ID の記録も注入する。
+// 読み取りは ID の数・行・バイトで抑える。Codex は今の ID のままにする。
+#[test]
+fn claude_resume_copies_widen_session_scope_with_bounded_ids() {
+    let fixture = Fixture::new();
+    fixture.mixed.store(true, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("remnifold.json"), br#"{"maxMemories":8}"#).unwrap();
+    let row = |kind: &str, id: &str, extra: Value| {
+        let mut row = json!({"type":kind,"sessionId":id,"timestamp":"2026-09-01T10:00:00Z","message":{"role":kind,"content":"x"}});
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            row[key] = value.clone();
+        }
+        row
+    };
+    let run = |transcript: &Path| {
+        let payload = json!({"session_id":"fixture-session","prompt":"Repair Unicode transcript boundaries","transcript_path":transcript});
+        fixture.requests.lock().unwrap().clear();
+        let output = hook(
+            &root,
+            &fixture.url,
+            "UserPromptSubmit",
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        let requests = fixture.requests.lock().unwrap();
+        let body = requests
+            .iter()
+            .find(|(path, _)| path == "/v4/search")
+            .map(|(_, body)| body.clone())
+            .expect("search request");
+        (output.to_string(), body)
+    };
+    // 旧 ID の過去行（再開でコピーされたもの）に続き、今の ID の行が来る。sidechain・meta・会話以外・不正な ID は使わない。
+    let transcript = root.join("resumed.jsonl");
+    let rows = [
+        row("user", "resumed-old", json!({})),
+        row("assistant", "resumed-old", json!({"timestamp":"2026-09-01T10:05:00Z"})),
+        row("user", "no-time-old", json!({"timestamp":"not a time"})),
+        row("user", "side-only", json!({"isSidechain":true})),
+        row("user", "meta-only", json!({"isMeta":true})),
+        row("summary", "summary-only", json!({})),
+        row("user", "   ", json!({})),
+        row("user", &"x".repeat(161), json!({})),
+        row("user", "fixture-session", json!({})),
+    ];
+    let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    fs::write(&transcript, text).unwrap();
+    let (context, body) = run(&transcript);
+    assert_eq!(body["sessionIds"], json!(["fixture-session", "resumed-old"]));
+    // 旧 ID の時刻の上限は、コピーされた行の timestamp の最大値。今の ID には付かない。
+    assert_eq!(body["sessionUntil"], json!({"resumed-old":"2026-09-01T10:05:00Z"}));
+    assert!(body.get("sessionId").is_none(), "{body}");
+    assert_eq!(body["sessionSource"], "claude-code");
+    // 上限ちょうどの旧 ID の記録は入り、上限より後（フォーク後の親の記録）・時刻なしの旧 ID の記録は入らない。
+    assert!(context.contains("id=resumed-doc"), "{context}");
+    assert!(!context.contains("id=late-doc"), "{context}");
+    assert!(!context.contains("id=untimed-doc"), "{context}");
+    assert!(context.contains("id=current-doc"), "{context}");
+    assert!(!context.contains("stranger-doc"), "{context}");
+    // 旧 ID が無い（今の ID だけの）transcript は従来どおり sessionId の 1 件。
+    let single = root.join("single.jsonl");
+    fs::write(&single, format!("{}\n", row("user", "fixture-session", json!({})))).unwrap();
+    let (_, body) = run(&single);
+    assert_eq!(body["sessionId"], "fixture-session");
+    assert!(body.get("sessionIds").is_none(), "{body}");
+    // ID は今の ID を含めて最大 8 件で、transcript の後ろ（今の再開に近い）に現れた旧 ID を優先する。
+    let many = root.join("many.jsonl");
+    let text: String = (0..12)
+        .map(|i| format!("{}\n", row("user", &format!("old-{i:02}"), json!({}))))
+        .chain([format!("{}\n", row("user", "fixture-session", json!({})))])
+        .collect();
+    fs::write(&many, text).unwrap();
+    let (_, body) = run(&many);
+    let ids: Vec<&str> = body["sessionIds"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(body["sessionUntil"].as_object().unwrap().len(), 7);
+    assert_eq!(ids.len(), 8, "{ids:?}");
+    assert_eq!(ids[0], "fixture-session");
+    assert_eq!(ids[1..], ["old-11", "old-10", "old-09", "old-08", "old-07", "old-06", "old-05"]);
+    // 読み取りの上限: 行数を超えた先の旧 ID は読まない（20000 行）。
+    let long = root.join("long.jsonl");
+    let filler = format!("{}\n", json!({"type":"progress"}));
+    let mut text = filler.repeat(20_000);
+    text.push_str(&format!("{}\n", row("user", "beyond-limit", json!({}))));
+    fs::write(&long, text).unwrap();
+    let (_, body) = run(&long);
+    assert_eq!(body["sessionId"], "fixture-session");
+    assert!(body.get("sessionIds").is_none(), "{body}");
+    // Codex の rollout は今の ID のまま（再開時の ID の変化が未確認のため）。
+    let codex = root.join("codex.jsonl");
+    let text = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta","payload":{"id":"fixture-session"}}),
+        row("user", "resumed-old", json!({}))
+    );
+    fs::write(&codex, text).unwrap();
+    let (_, body) = run(&codex);
+    assert_eq!(body["sessionId"], "fixture-session");
+    assert_eq!(body["sessionSource"], "codex");
+    assert!(body.get("sessionIds").is_none(), "{body}");
 }
 
 #[test]

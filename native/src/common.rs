@@ -194,6 +194,7 @@ pub fn read_settings(config: &Config) -> Value {
         "recallMode": raw.get("recallMode").filter(|v| !v.is_null() && *v != "" && *v != false).cloned().unwrap_or(json!("direct")),
         "maxMemories": memories,
         "maxRecentTasks": raw["maxRecentTasks"].as_f64().filter(|n| n.is_finite() && n.fract()==0.0).map(|n| n.clamp(0.0,3.0) as i64).unwrap_or(2),
+        "recallScope": if raw["recallScope"] == "all" { "all" } else { "session" },
         "minimumSimilarity": number(&raw["similarityThreshold"], 0.70).clamp(0.65,0.95),
         "projectContainerTag": raw["projectContainerTag"], "userContainerTag": raw["userContainerTag"],
         "readContainerTags": raw.get("readContainerTags").filter(|v| v.is_array()).cloned().unwrap_or(json!([])),

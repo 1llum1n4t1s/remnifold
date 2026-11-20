@@ -425,6 +425,9 @@ pub fn document_index(doc: &Value, fallback_container: &str, terms: &[String]) -
     if m["sessionId"].is_string() {
         index["sessionId"] = m["sessionId"].clone()
     }
+    if m["sm_source"].is_string() {
+        index["sessionSource"] = m["sm_source"].clone()
+    }
     for key in ["turn", "part", "parts"] {
         if m[key].is_i64() || m[key].is_u64() {
             index[key] = m[key].clone()
@@ -1082,11 +1085,53 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
         .or_else(|| numeric_limit(&settings["maxMemories"]))
         .unwrap_or(3);
     let minimum = settings["minimumSimilarity"].as_f64().unwrap_or(0.7);
+    // 今のセッションだけを許す指定では、サーバーにも sessionId を渡して候補窓を決める前に絞らせる。
+    // 未対応の旧サーバーは未知の引数を無視するため、下のクライアント側の絞り込みも残す。
+    let only_session = text(&options["onlySessionId"]).trim();
+    // 種別（記録の sm_source: codex / claude-code）が分かるときは (種別, sessionId) の組で絞る。
+    // 種別を持たない旧記録は、対応サーバーが検索の時点で落とす（fail closed）。旧サーバーは種別を返さないため、
+    // クライアント側では種別が返った候補だけを突き合わせ、返らない候補は sessionId の一致だけで通す。
+    // 種別が分からないクライアントは sessionId だけで絞る。
+    let only_source = text(&options["onlySessionSource"]).trim();
+    // 再開で ID が変わった同じ会話の ID 群（今の ID を含む）。2 件以上のときだけ sessionIds として送り、1 件なら従来の sessionId のまま。
+    // 旧 ID には時刻の上限（until）が付く。フォーク・再開で引き継いだ旧 ID の記録のうち、元ターンの時刻が上限以下のものだけを通す。
+    // 上限が解釈できない旧 ID は使わない（fail closed）。今の ID に上限は付かない。
+    let mut only_ids: Vec<(String, Option<(i64, String)>)> = vec![];
+    if !only_session.is_empty() {
+        only_ids.push((only_session.to_string(), None));
+        for entry in options["onlySessionIds"].as_array().into_iter().flatten() {
+            let id = text(&entry["id"]).trim();
+            let until = text(&entry["until"]).trim();
+            let bound = if until.is_empty() { None } else { date_millis(until).map(|m| (m, until.to_string())) };
+            let usable = until.is_empty() || bound.is_some();
+            if !id.is_empty() && id.len() <= 160 && usable && !only_ids.iter().any(|s| s.0 == id) && only_ids.len() < 8 {
+                only_ids.push((id.to_string(), bound))
+            }
+        }
+    }
+    // サーバーへ渡す絞り込み。複数 ID は sessionIds（上限は sessionUntil）で、1 件なら従来の sessionId で送る。
+    let mut session_fields = json!({});
+    if only_ids.len() > 1 {
+        session_fields["sessionIds"] = json!(only_ids.iter().map(|s| s.0.as_str()).collect::<Vec<_>>());
+        let until: serde_json::Map<String, Value> = only_ids.iter().filter_map(|(id, bound)| bound.as_ref().map(|b| (id.clone(), json!(b.1)))).collect();
+        if !until.is_empty() {
+            session_fields["sessionUntil"] = Value::Object(until)
+        }
+    } else if !only_session.is_empty() {
+        session_fields["sessionId"] = json!(only_session)
+    }
+    if !only_session.is_empty() && !only_source.is_empty() {
+        session_fields["sessionSource"] = json!(only_source)
+    }
+    let session_fields = &session_fields;
     let mut global = None;
     if container.is_empty() {
         let mut body = json!({"allContainers":true,"q":query,"limit":40});
         if automatic {
-            body["indexOnly"] = json!(true)
+            body["indexOnly"] = json!(true);
+            for (key, value) in session_fields.as_object().into_iter().flatten() {
+                body[key] = value.clone()
+            }
         }
         match request(config, "/v4/search", Some(&body), options) {
             Ok(response) => {
@@ -1153,7 +1198,12 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
                         scope.spawn(move || {
                             let mut body = json!({"containerTag":tag,"q":query,"limit":20});
                             if automatic {
-                                body["indexOnly"] = json!(true)
+                                body["indexOnly"] = json!(true);
+                                if !only_session.is_empty() {
+                                    for (key, value) in session_fields.as_object().into_iter().flatten() {
+                                        body[key] = value.clone()
+                                    }
+                                }
                             }
                             request(config, "/v4/search", Some(&body), options)
                         })
@@ -1176,6 +1226,22 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
         if !tags.is_empty() && failed.len() == tags.len() {
             bail!("Remnifold search unavailable for all requested spaces")
         }
+    }
+    // 今のセッションだけを許す指定では、改訂選択・件数上限・ハイドレーションより前に絞る。
+    // sessionId の無い記録は一致しないため落ちる（fail closed）。
+    if automatic && !only_session.is_empty() {
+        candidates.retain(|c| {
+            only_ids.iter().any(|(id, bound)| {
+                id == text(&c.index["sessionId"])
+                    && bound.as_ref().is_none_or(|(until, _)| {
+                        // 元ターンの時刻（capture が保存する sourceTimestamp。索引の sourceUpdatedAt）。無い・解釈できない記録は落とす。
+                        date_millis(text(&c.index["sourceUpdatedAt"])).is_some_and(|t| t <= *until)
+                    })
+            })
+                && (only_source.is_empty()
+                    || text(&c.index["sessionSource"]).is_empty()
+                    || text(&c.index["sessionSource"]) == only_source)
+        })
     }
     for c in &mut candidates {
         score(c, &prepared_terms, total_weight, automatic)

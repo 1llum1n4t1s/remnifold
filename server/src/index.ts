@@ -672,7 +672,7 @@ function memoryResult(
     : typeof memoryIndex.title === "string" ? memoryIndex.title : undefined;
   const filepath = typeof metadata.filepath === "string" ? metadata.filepath : undefined;
   const resultMetadata = compactMetadata && indexOnly ? Object.fromEntries(
-    ["memoryIndex", "title", "sm_project_id", "project", "filepath", "captureVersion", "sessionId", "turn", "part", "parts",
+    ["memoryIndex", "title", "sm_project_id", "project", "filepath", "captureVersion", "sessionId", "sm_source", "turn", "part", "parts",
       "sourceTimestamp", "sourceUpdatedAt", "completedAt", "sm_consolidation", "sourceMemoryIds", "sourceCount",
       "sourceMemoryIdsTruncated", "consolidationCreatedAt"]
       .filter((key) => metadata[key] !== undefined).map((key) => [key, metadata[key]]),
@@ -2012,8 +2012,9 @@ async function recentMemories(
   scope?: string,
   indexOnly = false,
   manualContext = false,
+  session?: SessionFilter,
 ): Promise<RankedMemoryRow[]> {
-  const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
+  const { clause, parameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env), session);
   parameters.push(limit);
   const result = await env.DB.prepare(
     `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at, topic_revision
@@ -2026,7 +2027,31 @@ async function recentMemories(
   return result.results;
 }
 
-function searchConditions(containerTag: string | undefined, scope: string | undefined, indexOnly: boolean, alias = "", manualContext = false, semanticEnabled = true) {
+// 検索の絞り込み。id は metadata.sessionId、source は metadata.sm_source（codex / claude-code）の完全一致。
+// until は ID ごとの時刻の上限（sessionUntil）。その ID の記録は、元ターンの時刻（射影の source_date）が上限以下のものだけが一致する。
+type SessionFilter = { ids: string[]; source?: string; until?: Record<string, string> };
+// sessionIds（再開で ID が変わった同じ会話の ID 群）を含め、一度に指定できる ID の上限。
+const MAX_SESSION_IDS = 8;
+// 射影の列（prefix は "" か "p."）で書いた絞り込み。上限なしの ID は IN、上限ありの ID は「ID 一致 かつ source_date <= julianday(上限)」の OR。
+// 上限の時刻が解釈できない（julianday が NULL）場合は比較が偽になり、その ID の記録は一致しない（fail closed）。
+function sessionClause(session: SessionFilter, prefix: string): { clause: string; parameters: string[] } {
+  const free = session.ids.filter((id) => session.until?.[id] === undefined);
+  const parts: string[] = [];
+  const parameters: string[] = [];
+  if (free.length) {
+    parts.push(`${prefix}task_session IN (${free.map(() => "?").join(", ")})`);
+    parameters.push(...free);
+  }
+  for (const id of session.ids) {
+    const until = session.until?.[id];
+    if (until === undefined) continue;
+    parts.push(`(${prefix}task_session = ? AND ${prefix}source_date <= julianday(?))`);
+    parameters.push(id, until);
+  }
+  return { clause: `(${parts.join(" OR ")})`, parameters };
+}
+
+function searchConditions(containerTag: string | undefined, scope: string | undefined, indexOnly: boolean, alias = "", manualContext = false, semanticEnabled = true, session?: SessionFilter) {
   const prefix = alias ? `${alias}.` : "";
   const conditions = [`${prefix}is_forgotten = 0`, organizationVisible(alias || "memories", semanticEnabled)];
   const parameters: (string | number)[] = [];
@@ -2037,6 +2062,17 @@ function searchConditions(containerTag: string | undefined, scope: string | unde
   if (scope) {
     conditions.push(`json_extract(${prefix}metadata_json, '$.sm_scope') = ?`);
     parameters.push(scope);
+  }
+  if (session !== undefined) {
+    // 記録のメタデータ sessionId の完全一致。値は射影テーブルの task_session（migration 0014）と同じ式で、型の違う値は一致しない。
+    const match = sessionClause(session, "");
+    conditions.push(`${prefix}id IN (SELECT memory_id FROM memory_search_projection WHERE ${match.clause})`);
+    parameters.push(...match.parameters);
+    if (session.source !== undefined) {
+      // クライアント種別（metadata.sm_source）の完全一致。sm_source の無い旧記録は種別不明として一致しない。
+      conditions.push(`json_extract(${prefix}metadata_json, '$.sm_source') = ?`);
+      parameters.push(session.source);
+    }
   }
   if (indexOnly) conditions.push(`json_extract(${prefix}metadata_json, '$.memoryIndex.recallable') IS NOT 0`);
   if (indexOnly && !manualContext) conditions.push(`NOT (json_extract(${prefix}metadata_json, '$.sm_organization_manual_only') IS 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=${prefix}id))`);
@@ -2050,17 +2086,30 @@ function searchConditions(containerTag: string | undefined, scope: string | unde
 // 非表示判定（organizationVisibleId）は他テーブルに依存するため含めない。呼び出し元が、判定回数が最も少なくなる段で加える。
 // containerColumn は、memories を外側で読む文（本文の部分一致）で memories 側の列を指定し、
 // idx_memories_container_updated による絞り込みを使うためのもの（射影の container_tag は memories と常に同じ値）。
-function projectionSearchConditions(containerTag: string | undefined, scope: string | undefined, indexOnly: boolean, manualContext = false, containerColumn = "p.container_tag") {
+function projectionSearchConditions(containerTag: string | undefined, scope: string | undefined, indexOnly: boolean, manualContext = false, containerColumn = "p.container_tag", session?: SessionFilter) {
   const conditions: string[] = [];
   const parameters: (string | number)[] = [];
   if (containerTag !== undefined) {
-    conditions.push(`${containerColumn} = ?`);
+    // セッション絞り込みでは、コンテナの索引ではなく task_session の索引（migration 0015）で絞らせる。
+    // 統計の無い D1 ではコンテナの索引が選ばれやすいため、射影側の列には単項プラスを付けて索引の候補から外す（値は変わらない）。
+    conditions.push(`${session !== undefined && containerColumn === "p.container_tag" ? "+" : ""}${containerColumn} = ?`);
     parameters.push(containerTag);
   }
   if (scope) {
     // sm_scope は型宣言のない列に生の値で保存しているため、旧式の json_extract(...) = ? と同じ比較になる。
     conditions.push("p.sm_scope = ?");
     parameters.push(scope);
+  }
+  if (session !== undefined) {
+    // 候補窓を決める前の絞り込み。sessionId の無い記録（NULL）や別の型の値は一致しない。
+    const match = sessionClause(session, "p.");
+    conditions.push(match.clause);
+    parameters.push(...match.parameters);
+    if (session.source !== undefined) {
+      // 種別は memories の metadata を rowid で引いて確かめる（セッションで絞られた候補だけが対象）。
+      conditions.push("EXISTS (SELECT 1 FROM memories AS session_source WHERE session_source.rowid = p.memory_rowid AND json_extract(session_source.metadata_json, '$.sm_source') = ?)");
+      parameters.push(session.source);
+    }
   }
   if (indexOnly) conditions.push("p.recallable = 1");
   if (indexOnly && !manualContext) conditions.push("NOT (p.manual_only_marker = 1 AND EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=p.memory_id))");
@@ -2123,8 +2172,8 @@ function indexQueryPatterns(terms: string[]): string {
   return JSON.stringify(patterns);
 }
 
-async function indexedMemories(getPattern: () => string, containerTag: string | undefined, scope: string | undefined, env: Env, indexOnly: boolean, manualContext = false): Promise<RankedMemoryRow[]> {
-  const { clause, parameters } = projectionSearchConditions(containerTag, scope, indexOnly, manualContext);
+async function indexedMemories(getPattern: () => string, containerTag: string | undefined, scope: string | undefined, env: Env, indexOnly: boolean, manualContext = false, session?: SessionFilter): Promise<RankedMemoryRow[]> {
+  const { clause, parameters } = projectionSearchConditions(containerTag, scope, indexOnly, manualContext, "p.container_tag", session);
   const patterns = indexPatternList(getPattern());
   // 分類・索引だけの一致はVectorize topKや本文FTSの順位に依存させない。
   // 照合対象は射影テーブルの保存済みの値を読むだけで、memories の metadata（embedding を含む大きな行）や分類は読まない。
@@ -2161,13 +2210,14 @@ async function lexicalMemories(
   env: Env,
   indexOnly = false,
   manualContext = false,
+  session?: SessionFilter,
 ): Promise<RankedMemoryRow[]> {
   const candidateLimit = Math.min(MAX_LIMIT, Math.max(limit * 3, 10));
   let normalizedFtsRows: RankedMemoryRow[] = [];
   if (ftsQuery) {
     const { clause, parameters } = indexOnly
-      ? projectionSearchConditions(containerTag, scope, true, manualContext)
-      : searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env));
+      ? projectionSearchConditions(containerTag, scope, true, manualContext, "p.container_tag", session)
+      : searchConditions(containerTag, scope, indexOnly, "m", manualContext, enrichmentEnabled(env), session);
     try {
       // 索引優先の判定は射影テーブルの保存済みの版・照合対象で行い、一致行の memories は読まない。
       // fts（平坦化を止める境界つき）で絞り込み・非表示判定・bm25 を求め、selected で優先度・順位の上位だけに切ってから、
@@ -2176,13 +2226,20 @@ async function lexicalMemories(
       // （server/tests/search-projection.test.mjs が bm25 の同点を作って旧文と比べている）。
       // 束縛値の順序（FTS 語、条件、索引語、上限）を従来と同じに保つため、? が文面のこの順に現れる CTE の形にしている。
       // CROSS JOIN は FTS を外側に固定し、射影の全走査から FTS を引く計画を選ばせないためのもの。
+      // セッション絞り込みのときだけ向きを逆にし、射影を外側に固定する。task_session の索引（migration 0015）で少数の行に絞り、
+      // その行の rowid で FTS を引く（FTS 全体の一致を走査しない）。索引が無い（未適用の）サーバーでは射影の走査になり、遅いだけで結果は同じ。
       // 全文検索だけの経路は従来の文をそのまま使う。
       const patterns = indexOnly ? indexPatternList(getPattern()) : [];
+      // セッション絞り込みでは射影を外側に置く（索引で行を絞り、その rowid で FTS を引く）。指定がなければ従来の文面のまま。
+      const ftsFrom = session
+        ? `FROM memory_search_projection AS p
+             CROSS JOIN memories_fts ON memories_fts.rowid = p.memory_rowid`
+        : `FROM memories_fts
+             CROSS JOIN memory_search_projection AS p ON p.memory_rowid = memories_fts.rowid`;
       const result = await env.DB.prepare(indexOnly
         ? `WITH fts AS (
              SELECT p.memory_rowid AS row_order, bm25(memories_fts) AS rank, p.index_v1, p.index_text
-             FROM memories_fts
-             CROSS JOIN memory_search_projection AS p ON p.memory_rowid = memories_fts.rowid
+             ${ftsFrom}
              WHERE memories_fts MATCH ? AND ${clause} AND ${organizationVisibleId("p.memory_id", enrichmentEnabled(env))}
              LIMIT -1 OFFSET 0
            ), selected AS (
@@ -2216,9 +2273,15 @@ async function lexicalMemories(
 
   if (query.length > 0 && query.length <= 1_000) {
     const { clause, parameters } = indexOnly
-      ? projectionSearchConditions(containerTag, scope, true, manualContext, "m.container_tag")
-      : searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
+      ? projectionSearchConditions(containerTag, scope, true, manualContext, "m.container_tag", session)
+      : searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env), session);
     const patterns = indexOnly ? indexPatternList(getPattern()) : [];
+    // セッション絞り込みでは射影を外側に置く（task_session の索引で行を絞り、その rowid で memories を読む）。指定がなければ従来の文面のまま。
+    const instrFrom = session
+      ? `FROM memory_search_projection AS p
+             CROSS JOIN memories AS m ON m.rowid = p.memory_rowid`
+      : `FROM memories AS m
+             CROSS JOIN memory_search_projection AS p ON p.memory_rowid = m.rowid`;
     // 本文の部分一致は memories の本文を読むしかないため memories を外側に置き、本文が一致した行だけ射影を rowid で引く
     // （条件の文面上の順序は束縛値の順序を従来と同じに保つためのもので、評価の順序は SQLite が列の依存から決める）。
     // コンテナ指定は memories 側の列で書き、従来どおり idx_memories_container_updated で読む行を絞る。
@@ -2230,8 +2293,7 @@ async function lexicalMemories(
            FROM (
              SELECT m.id, m.container_tag, ${searchContentColumn(true, "m")}, m.metadata_json, m.created_at, m.updated_at, m.topic_revision,
                     m.rowid AS row_order, p.index_v1, p.index_text
-             FROM memories AS m
-             CROSS JOIN memory_search_projection AS p ON p.memory_rowid = m.rowid
+             ${instrFrom}
              WHERE m.is_forgotten = 0 AND ${clause} AND instr(lower(content), lower(?)) > 0
                AND ${organizationVisibleId("p.memory_id", enrichmentEnabled(env))}
              LIMIT -1 OFFSET 0
@@ -2284,6 +2346,7 @@ async function semanticMemories(
   env: Env,
   indexOnly = false,
   manualContext = false,
+  session?: SessionFilter,
 ): Promise<RankedMemoryRow[]> {
   const MAX_D1_VECTOR_SCAN = 200;
   if (!enrichmentEnabled(env)) return [];
@@ -2292,12 +2355,14 @@ async function semanticMemories(
     const hiddenVectorsPending = scope ? Promise.resolve(false) : hiddenVectorsMayRemain(env);
     const vector = await embedText(query, env);
     const candidateLimit = Math.min(MAX_LIMIT, Math.max(limit * 3, 10));
-    const { clause, parameters: fallbackParameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
+    const { clause, parameters: fallbackParameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env), session);
+    // sessionId 指定も同じ扱いにする。Vectorize の topK は他セッションの記録で埋まり得るため、
+    // 指定セッションの記録は D1 の embedding_json から直接候補に戻す（updated_at の新しい順に MAX_D1_VECTOR_SCAN 件まで）。
     // Vectorizeはsm_scopeで絞れないため、scope検索ではD1のindexed行も候補に戻す。
     // 非表示行のベクトルが削除済み・照合済みなら topK を占有しないので、未索引状態の行だけを D1 から探す。
     // CHECK 制約上 IN 句は `<> 'indexed'` と同値で、索引を直接使える。
     const hiddenPending = await hiddenVectorsPending;
-    const vectorStatusClause = scope || hiddenPending ? "" : " AND vector_status IN ('pending','queued','failed','disabled')";
+    const vectorStatusClause = scope || session !== undefined || hiddenPending ? "" : " AND vector_status IN ('pending','queued','failed','disabled')";
     fallbackParameters.push(MAX_D1_VECTOR_SCAN);
     let vectorQueryFailed = false;
     const [vectorResult, unindexedFallbackRows] = await Promise.all([
@@ -2363,7 +2428,7 @@ async function semanticMemories(
     const vectorRows = new Map<string, RankedMemoryRow>();
     if (missingIds.length > 0) {
       const placeholders = missingIds.map(() => "?").join(", ");
-      const { clause: hitClause, parameters: hitParameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env));
+      const { clause: hitClause, parameters: hitParameters } = searchConditions(containerTag, scope, indexOnly, "", manualContext, enrichmentEnabled(env), session);
       try {
         const result = await env.DB.prepare(
           `SELECT id, container_tag, ${searchContentColumn(indexOnly)}, metadata_json, created_at, updated_at,
@@ -2565,24 +2630,57 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
   const containerTag = allContainers ? undefined : stringValue(body.containerTag, "containerTag", MAX_CONTAINER_TAG_LENGTH);
   const limit = positiveInteger(body.limit, DEFAULT_LIMIT, MAX_LIMIT);
   const scope = scopeFilter(body);
+  // 任意。記録のメタデータ sessionId が完全一致するものだけに、候補窓を決める前から絞る（検索入口・全文・意味検索の全経路）。
+  const validSessionId = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0 && value.length <= 160;
+  if (body.sessionId !== undefined && !validSessionId(body.sessionId)) {
+    throw new HttpError(400, "sessionId must be a nonempty string of at most 160 characters");
+  }
+  // sessionIds は再開で ID が変わった同じ会話の ID 群。sessionId との併用は意味が二重になるため 400 にする（クライアントはどちらか一方だけを送る）。
+  // 重複は除去する（順序は結果に影響しない）。
+  if (body.sessionIds !== undefined) {
+    if (body.sessionId !== undefined) throw new HttpError(400, "sessionIds cannot be combined with sessionId");
+    if (!Array.isArray(body.sessionIds) || body.sessionIds.length < 1 || body.sessionIds.length > MAX_SESSION_IDS ||
+        !body.sessionIds.every(validSessionId)) {
+      throw new HttpError(400, `sessionIds must be an array of 1 to ${MAX_SESSION_IDS} nonempty strings of at most 160 characters`);
+    }
+  }
+  if (body.sessionSource !== undefined && (body.sessionId === undefined && body.sessionIds === undefined || typeof body.sessionSource !== "string" ||
+      !body.sessionSource.trim() || body.sessionSource.length > 64)) {
+    throw new HttpError(400, "sessionSource requires sessionId or sessionIds and a nonempty string of at most 64 characters");
+  }
+  // sessionUntil は sessionIds の ID ごとの時刻の上限（{ID: 時刻}）。フォーク・再開で引き継いだ旧 ID の、それより後の記録（親の並行作業）を除く。
+  // 上限を知らない旧サーバーは無視するため、クライアントも同じ条件で絞る。
+  let sessionUntil: Record<string, string> | undefined;
+  if (body.sessionUntil !== undefined) {
+    const entries = isObject(body.sessionUntil) ? Object.entries(body.sessionUntil) : [];
+    if (!Array.isArray(body.sessionIds) || !isObject(body.sessionUntil) || entries.length > MAX_SESSION_IDS ||
+        !entries.every(([id, until]) => (body.sessionIds as unknown[]).includes(id) && typeof until === "string" && until.trim().length > 0 && until.length <= 64)) {
+      throw new HttpError(400, "sessionUntil requires sessionIds and an object of ID keys from it with nonempty time strings of at most 64 characters");
+    }
+    sessionUntil = Object.fromEntries(entries as [string, string][]);
+  }
+  const sessionIds = Array.isArray(body.sessionIds) ? [...new Set(body.sessionIds as string[])]
+    : typeof body.sessionId === "string" ? [body.sessionId] : undefined;
+  const session: SessionFilter | undefined = sessionIds
+    ? { ids: sessionIds, ...(typeof body.sessionSource === "string" ? { source: body.sessionSource } : {}), ...(sessionUntil ? { until: sessionUntil } : {}) } : undefined;
 
   let rows: RankedMemoryRow[];
   let rankedTopics: Map<string, string[]> | undefined;
   if (!query) {
-    rows = await recentMemories(env, containerTag, limit, scope, indexOnly, manualContext);
+    rows = await recentMemories(env, containerTag, limit, scope, indexOnly, manualContext, session);
   } else {
     const ftsQuery = buildFtsQuery(query);
     const [lexical, semantic, indexed] = await Promise.all([
-      lexicalMemories(query, getPattern, ftsQuery, containerTag, limit, scope, env, indexOnly, manualContext),
-      semanticMemories(query, containerTag, limit, scope, env, indexOnly, manualContext),
-      indexOnly || allContainers ? indexedMemories(getPattern, containerTag, scope, env, indexOnly, manualContext) : Promise.resolve([]),
+      lexicalMemories(query, getPattern, ftsQuery, containerTag, limit, scope, env, indexOnly, manualContext, session),
+      semanticMemories(query, containerTag, limit, scope, env, indexOnly, manualContext, session),
+      indexOnly || allContainers ? indexedMemories(getPattern, containerTag, scope, env, indexOnly, manualContext, session) : Promise.resolve([]),
     ]);
     // RRFの重複加点で索引一致を切り捨てず、分類・原文の関連度を判定してから最終上限に絞る。
     rows = mergeRankedMemories([...lexical, ...indexed], semantic, indexOnly || allContainers ? MAX_LIMIT * 3 : limit);
   }
 
   if (indexOnly) {
-    const { clause, parameters } = searchConditions(containerTag, scope, true, "m", manualContext, enrichmentEnabled(env));
+    const { clause, parameters } = searchConditions(containerTag, scope, true, "m", manualContext, enrichmentEnabled(env), session);
     // A relevant older checkpoint must not disappear merely because the shared
     // container has more than one page of newer project checkpoints.
     parameters.push(MAX_INDEX_LEXICAL_SCAN);
