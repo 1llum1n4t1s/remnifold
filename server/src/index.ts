@@ -2612,24 +2612,7 @@ function sortByQueryCoverage(
   return ranked.map(({ row }) => row);
 }
 
-async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & { results: JsonObject[]; timing: number }> {
-  const MAX_INDEX_LEXICAL_SCAN = 1_000;
-  const startedAt = performance.now();
-  assertOptionalBoolean(body, "indexOnly");
-  const indexOnly = body.indexOnly === true;
-  assertOptionalBoolean(body, "manualContext");
-  const manualContext = indexOnly && body.manualContext === true;
-  const query = typeof body.q === "string" ? truncateUtf16(body.q.trim(), 1_000) : "";
-  let terms: string[] | undefined;
-  let pattern: string | undefined;
-  const getTerms = () => terms ??= searchQueryTerms(query);
-  const getPattern = () => pattern ??= indexQueryPatterns(getTerms());
-  assertOptionalBoolean(body, "allContainers");
-  const allContainers = body.allContainers === true;
-  if (allContainers && body.containerTag !== undefined) throw new HttpError(400, "allContainers cannot be combined with containerTag");
-  const containerTag = allContainers ? undefined : stringValue(body.containerTag, "containerTag", MAX_CONTAINER_TAG_LENGTH);
-  const limit = positiveInteger(body.limit, DEFAULT_LIMIT, MAX_LIMIT);
-  const scope = scopeFilter(body);
+function parseSessionFilter(body: JsonObject): SessionFilter | undefined {
   // 任意。記録のメタデータ sessionId が完全一致するものだけに、候補窓を決める前から絞る（検索入口・全文・意味検索の全経路）。
   const validSessionId = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0 && value.length <= 160;
   if (body.sessionId !== undefined && !validSessionId(body.sessionId)) {
@@ -2663,6 +2646,28 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
     : typeof body.sessionId === "string" ? [body.sessionId] : undefined;
   const session: SessionFilter | undefined = sessionIds
     ? { ids: sessionIds, ...(typeof body.sessionSource === "string" ? { source: body.sessionSource } : {}), ...(sessionUntil ? { until: sessionUntil } : {}) } : undefined;
+  return session;
+}
+
+async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & { results: JsonObject[]; timing: number }> {
+  const MAX_INDEX_LEXICAL_SCAN = 1_000;
+  const startedAt = performance.now();
+  assertOptionalBoolean(body, "indexOnly");
+  const indexOnly = body.indexOnly === true;
+  assertOptionalBoolean(body, "manualContext");
+  const manualContext = indexOnly && body.manualContext === true;
+  const query = typeof body.q === "string" ? truncateUtf16(body.q.trim(), 1_000) : "";
+  let terms: string[] | undefined;
+  let pattern: string | undefined;
+  const getTerms = () => terms ??= searchQueryTerms(query);
+  const getPattern = () => pattern ??= indexQueryPatterns(getTerms());
+  assertOptionalBoolean(body, "allContainers");
+  const allContainers = body.allContainers === true;
+  if (allContainers && body.containerTag !== undefined) throw new HttpError(400, "allContainers cannot be combined with containerTag");
+  const containerTag = allContainers ? undefined : stringValue(body.containerTag, "containerTag", MAX_CONTAINER_TAG_LENGTH);
+  const limit = positiveInteger(body.limit, DEFAULT_LIMIT, MAX_LIMIT);
+  const scope = scopeFilter(body);
+  const session = parseSessionFilter(body);
 
   let rows: RankedMemoryRow[];
   let rankedTopics: Map<string, string[]> | undefined;

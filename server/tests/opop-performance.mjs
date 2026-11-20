@@ -1,4 +1,3 @@
-const utf8Bytes=value=>new TextEncoder().encode(value).length;
 // 実行: cargo xtask server-test
 // 失敗条件: 表示列/状態/出典の欠落、内部embeddingのNULL化、同点順序/checkpoint優先の変化、
 // 段階間の古いキー再利用、同ID別rowの混同、scope/revision/limit/membershipの変化、
@@ -10,39 +9,12 @@ import after from "./support/observed.mjs";
 import searchGoldens from "./support/search-goldens.json" with {type:"json"};
 import {documentExpected,listExpected} from "./support/expected.mjs";
 import { applyMigrations } from "./support/migrations.mjs";
+import { measuredD1 } from "./support/measured-d1.mjs";
 import { buildMemoryIndex } from "../src/shared/memory-index.ts";
 
 const timestamp = "2026-03-04T12:00:00.000Z";
 const embedding = Array.from({ length: 1024 }, (_, i) => Math.sin(i + 1) / 32);
 const embeddingJson = JSON.stringify(embedding);
-// D1の返却直前に、実SELECTのJSONサイズとembedding取得数を測る。WireサイズやD1課金の推定ではない。
-function adapter(db) {
-  const reads = [];
-  let beforeRead;
-  function prepare(sql) {
-    const bind = (values = []) => {
-      const select = () => {
-        beforeRead?.(sql, values);
-        const rows = db.prepare(sql).all(...values);
-        reads.push({ sql, rows: rows.length, rowBytes: rows.reduce((sum, row) => sum + utf8Bytes(JSON.stringify(row)), 0),
-          embeddings: rows.filter((row) => typeof row.embedding_json === "string").length });
-        return rows;
-      };
-      return { sql, values, bind: (...next) => bind(next),
-        first: async () => select()[0], all: async () => ({ results: select() }),
-        run: async () => ({ meta: { changes: Number(db.prepare(sql).run(...values).changes) } }),
-        execute: () => /^\s*(SELECT|WITH|PRAGMA)\b/iu.test(sql)
-          ? { results: select(), meta: { changes: 0 } }
-          : { results: [], meta: { changes: Number(db.prepare(sql).run(...values).changes) } },
-      };
-    };
-    return bind();
-  }
-  return { prepare, reads, setBeforeRead(callback) { beforeRead = callback; }, batch: async (operations) => {
-    return db.transaction(() => operations.map(operation=>operation.execute()));
-  } };
-}
-
 test("display, ranking, checkpoint and Unicode contracts", async () => {
 const db = new DatabaseSync(":memory:");
 const fixtureRecords=new Map();
@@ -51,7 +23,7 @@ let artifact;
 try {
   db.exec("PRAGMA foreign_keys = ON");
   applyMigrations(db);
-  const DB = adapter(db);
+  const DB = measuredD1(db);
   const pending = [];
   const ctx = { waitUntil(promise) { pending.push(Promise.resolve(promise)); } };
   const env = { DB, MEMORY_API_KEY: "opop-local-fixture", AI_ENRICHMENT_MODE: "off",

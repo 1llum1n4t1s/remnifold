@@ -1,7 +1,7 @@
 import test,{assert} from './support/test.mjs';
 import worker from '../src/index.ts';
 import {fixture} from './worker-fixture.mjs';
-const utf8Bytes=value=>new TextEncoder().encode(value).length;
+import {utf8Bytes} from './support/measured-d1.mjs';
 test('authenticated Worker API smoke, source capacity and remote MCP', {timeout:90000}, async()=>{
  const f=fixture();f.env.AI=undefined;f.env.MEMORY_VECTORS=undefined;
  const token=f.env.MEMORY_API_KEY;const baseUrl='https://smoke.example';

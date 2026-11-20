@@ -22,6 +22,8 @@ const visible = (alias: string, semanticEnabled = true) => visibleId(`${alias}.i
 export const organizationVisible = visible;
 export const organizationVisibleId = visibleId;
 const eligible = `m.is_forgotten=0 AND NOT EXISTS(SELECT 1 FROM memory_organization_versions v WHERE v.memory_id=m.id)`;
+// バッチ先頭の UPDATE（lease と revision を検査して request_json を書く）が成立したことを、同じバッチの後続文へ伝える条件。受領（response_json）の書込み後は成立しなくなる。
+const live = `EXISTS(SELECT 1 FROM memory_organization_batches WHERE id=? AND request_json=? AND response_json IS NULL)`;
 const databaseNow = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const captureParts = (alias:string)=>`CASE WHEN json_type(${alias}.metadata_json,'$.sessionId')='text'
   AND json_extract(${alias}.metadata_json,'$.sessionId')<>'' AND json_type(${alias}.metadata_json,'$.turn') IN ('integer','real')
@@ -632,7 +634,6 @@ async function commit(body: ObjectValue, env: Environment): Promise<ObjectValue>
     if(snapshot.group.phase==='reading' && status==='partial' && !memo) fail('Group continuation requires a private memo');
     if(list(body.summaries,8).length || list(body.coverage,20).length) fail('Group continuation cannot publish summaries or coverage');
     const group=snapshot.group;
-    const live=`EXISTS(SELECT 1 FROM memory_organization_batches WHERE id=? AND request_json=? AND response_json IS NULL)`;
     const statements=[env.DB.prepare(`UPDATE memory_organization_batches SET request_json=? WHERE id=? AND request_json IS NULL
       AND expires_at>${databaseNow} AND EXISTS(SELECT 1 FROM memory_organization_groups WHERE id=? AND generation=? AND batch_id=? AND lease_until>${databaseNow})
       AND NOT EXISTS(SELECT 1 FROM json_each(?) e LEFT JOIN memories m ON m.id=json_extract(e.value,'$.id')
@@ -649,9 +650,7 @@ async function commit(body: ObjectValue, env: Environment): Promise<ObjectValue>
     const response={protocol:1,batchId,status:'committed',summaries:[],coverage:[],group:{id:group.id,generation:group.generation,status}};
     add(`UPDATE memory_organization_batches SET response_json=?,snapshot_json='{"sources":[],"summaries":[]}' WHERE ${live}`,JSON.stringify(response));
     await env.DB.batch(statements);
-    const result=await env.DB.prepare('SELECT request_json,response_json FROM memory_organization_batches WHERE id=?').bind(batchId).first<{request_json:string;response_json:string|null}>();
-    if(result?.request_json!==request || !result.response_json) throw new Failure(409,'Capture group changed or lease expired');
-    return JSON.parse(result.response_json);
+    return committedResponse(env,batchId,request,'Capture group changed or lease expired');
   }
   const incoming = list(body.summaries, 8).map(object);
   const coverage = list(body.coverage, 20).map(object);
@@ -772,7 +771,6 @@ async function commit(body: ObjectValue, env: Environment): Promise<ObjectValue>
         WHERE d.summary_id=s.id AND (m.id IS NULL OR m.is_forgotten<>0 OR COALESCE(m.topic_revision,m.updated_at)<>d.source_revision)))`);
     values.push(s.id, s.previous.revision, s.previous.memoryId);
   }
-  const live = `EXISTS(SELECT 1 FROM memory_organization_batches WHERE id=? AND request_json=? AND response_json IS NULL)`;
   const statements: D1PreparedStatement[] = [env.DB.prepare(`UPDATE memory_organization_batches SET request_json=? WHERE id=? AND request_json IS NULL AND expires_at>${databaseNow} AND ${guards.join(' AND ')}`).bind(request, batchId, ...values)];
   const add = (sql: string, ...bindings: (string | number | null)[]) => statements.push(env.DB.prepare(sql).bind(...bindings, batchId, request));
   for (const s of outputs) {
@@ -825,8 +823,13 @@ async function commit(body: ObjectValue, env: Environment): Promise<ObjectValue>
   add(`DELETE FROM memory_organization_batch_summaries WHERE batch_id=? AND ${live}`, batchId);
   add(`UPDATE memory_organization_batches SET response_json=?,snapshot_json='{"sources":[],"summaries":[]}' WHERE ${live}`, JSON.stringify(response));
   await env.DB.batch(statements);
+  return committedResponse(env, batchId, request, 'Sources or summaries changed before publication');
+}
+
+// env.DB.batch の直後に、この要求の受領が書かれたかを読み戻す。書かれていなければ guard が外れている。
+async function committedResponse(env: Environment, batchId: string, request: string, message: string) {
   const result = await env.DB.prepare('SELECT request_json,response_json FROM memory_organization_batches WHERE id=?').bind(batchId).first<{request_json: string | null; response_json: string | null}>();
-  if (result?.request_json !== request || !result.response_json) throw new Failure(409, 'Sources or summaries changed before publication');
+  if (result?.request_json !== request || !result.response_json) throw new Failure(409, message);
   return JSON.parse(result.response_json);
 }
 

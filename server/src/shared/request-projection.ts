@@ -52,13 +52,3 @@ export function projectRequestText(value: unknown, options?: ProjectionOptions) 
   const text = String(value || "");
   return projectTextSlice(text, 0, text.length, requestProjectionEdits(text, options));
 }
-
-export function projectDocumentContent(value: unknown) {
-  const content = String(value || "");
-  const marker = /^### User request\s*\n/m.exec(content);
-  if (!marker) return content;
-  const start = marker.index + marker[0].length;
-  const response = /^### Final assistant response\s*$/m.exec(content.slice(start));
-  const end = response ? start + response.index : content.length;
-  return content.slice(0, start) + projectRequestText(content.slice(start, end), { keepInvocation: true }) + content.slice(end);
-}

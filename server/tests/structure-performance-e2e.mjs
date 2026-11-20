@@ -1,4 +1,3 @@
-const utf8Bytes=value=>new TextEncoder().encode(value).length;
 // 失敗条件: 公開JSON/キー順・AI/Vectorize入力・DB更新順・revisionガード・診断順が変わる、
 // 再調整の探索/digestや検索のexcerpt/pattern/小文字化が減らない、index投影が本文を評価する。
 // 実行: cargo xtask server-test
@@ -10,18 +9,10 @@ import structureGoldens from "./support/structure-goldens.json" with {type:"json
 import {normalizeFixtureResult} from "./support/golden.mjs";
 import {documentExpected,listExpected} from "./support/expected.mjs";
 import { migrations, applyMigrations } from "./support/migrations.mjs";
+import { bounded, utf8Bytes } from "./support/measured-d1.mjs";
 
 const timestamp = "2026-10-21T01:00:00.000Z";
 const embedding = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
-
-async function bounded(promise, description) {
-  let timer;
-  try {
-    return await Promise.race([promise, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${description} exceeded 10 seconds`)), 10_000);
-    })]);
-  } finally { clearTimeout(timer); }
-}
 
 function fixture(module) {
   module.resetFixture();
@@ -38,7 +29,7 @@ function fixture(module) {
     const bind = (values = []) => {
       const execute = () => {
         events.push({ operation: "sql", sql, values });
-        if (/^\s*(SELECT|WITH|PRAGMA)\b/iu.test(sql)){const results=db.prepare(sql).all(...values);sqlReads.push({sql,rows:results.length,rowBytes:results.reduce((sum,row)=>sum+new TextEncoder().encode(JSON.stringify(row)).length,0)});return {results,meta:{changes:0}}}
+        if (/^\s*(SELECT|WITH|PRAGMA)\b/iu.test(sql)){const results=db.prepare(sql).all(...values);sqlReads.push({sql,rows:results.length,rowBytes:results.reduce((sum,row)=>sum+utf8Bytes(JSON.stringify(row)),0)});return {results,meta:{changes:0}}}
         return { results: [], meta: { changes: Number(db.prepare(sql).run(...values).changes) } };
       };
       return { bind: (...next) => bind(next), first: async () => execute().results[0], all: async () => execute(), run: async () => execute(), execute };

@@ -1,4 +1,3 @@
-const utf8Bytes=value=>new TextEncoder().encode(value).length;
 // 失敗条件: SQL/JSの文字数差・NULで本文/ellipsis/AI入力が変わる、scope/同時刻順序/40件境界が変わる、
 // metadata/embeddingが欠落する、PATCHの生成物/競合ガードが弱まる、取得量が減らない。
 // 再強化のembedding/facts/topics入力が変わる、非同期中の版更新/forget/除外で古い結果を保存する、保存全文を切り詰める。
@@ -11,50 +10,18 @@ import projectionGoldens from "./support/projection-goldens.json" with {type:"js
 import {normalizeFixtureResult} from "./support/golden.mjs";
 import {documentExpected} from "./support/expected.mjs";
 import { migrations, applyMigrations } from "./support/migrations.mjs";
+import { bounded, measuredD1, utf8Bytes } from "./support/measured-d1.mjs";
 
 const timestamp = "2026-10-21T01:00:00.000Z";
 const embedding = JSON.stringify(Array.from({ length: 1024 }, (_, index) => Math.sin(index + 1)));
 const privateFilters = { AND: [{ key: "sm_scope", filterType: "metadata", value: "private" }] };
-
-async function bounded(promise, description) {
-  let timer;
-  try {
-    return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${description} exceeded 10 seconds`)), 10_000); })]);
-  } finally { clearTimeout(timer); }
-}
-
-function adapter(db) {
-  const reads = [];
-  let beforeBatch;
-  function prepare(sql) {
-    const bind = (values = []) => {
-      const select = () => {
-        const rows = db.prepare(sql).all(...values);
-        reads.push({ sql, rows: rows.length, rowBytes: rows.reduce((sum, row) => sum + utf8Bytes(JSON.stringify(row)), 0),
-          records:rows, embeddings: rows.filter((row) => typeof row.embedding_json === "string").length });
-        return rows;
-      };
-      return { bind: (...next) => bind(next), first: async () => select()[0], all: async () => ({ results: select() }),
-        run: async () => ({ meta: { changes: Number(db.prepare(sql).run(...values).changes) } }),
-        execute: () => /^\s*(SELECT|WITH|PRAGMA)\b/iu.test(sql)
-          ? { results: select(), meta: { changes: 0 } }
-          : { results: [], meta: { changes: Number(db.prepare(sql).run(...values).changes) } },
-      };
-    };
-    return bind();
-  }
-  return { reads, prepare, beforeBatch(callback) { beforeBatch = callback; }, batch: async (operations) => {
-    const callback = beforeBatch; beforeBatch = undefined; callback?.();
-    return db.transaction(() => operations.map(operation=>operation.execute()));
-  } };
-}
 
 function fixture(module) {
   module.resetFixtureIds();
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
   applyMigrations(db);
-  const DB = adapter(db);
+  const DB = measuredD1(db, { keepRecords: true });
   const seeds=new Map();
   const calls = [];
   const aiCalls = [];

@@ -18,11 +18,6 @@ type MemoryDocument = {
   title?: string; containerTag?: unknown; containerTags?: unknown[]; topics?: unknown; topic?: unknown; provenance?: Provenance | null;
   createdAt?: unknown; updatedAt?: unknown; searchExcerpt?: unknown;
 };
-type IndexDisplayItem = {
-  id?: unknown; title?: unknown; description?: unknown; containerTag?: unknown; topics?: string[]; sections?: string[];
-  sourceUpdatedAt?: unknown; updatedAt?: unknown; createdAt?: unknown; recallable?: unknown;
-  part?: number; parts?: number; consolidation?: unknown; searchExcerpt?: unknown; provenance?: Provenance;
-};
 
 const INDEX_VERSION = 1;
 const compact = (value: unknown) => typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
@@ -69,11 +64,6 @@ export function shortText(value: unknown, limit = 160) {
   const text = compact(value).replace(/<[^>]*>/g, "");
   return text.length <= limit ? text : `${truncateUtf16(text, limit - 1).trimEnd()}…`;
 }
-
-const promptText = (value: unknown, limit = 160) => shortText(shortText(value, limit)
-  .replace(/&/g, "&amp;")
-  .replace(/</g, "&lt;")
-  .replace(/>/g, "&gt;"), limit);
 
 function plainLine(line: string) {
   return line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)/, "")
@@ -210,43 +200,4 @@ export function documentIndex(document: MemoryDocument, fallbackContainer?: stri
     consolidationCreatedAt: validDate(metadata.consolidationCreatedAt),
     evidence: "historical record; inspect the document before relying on it",
   };
-}
-
-export function publicIndex(item: IndexDisplayItem) {
-  return {
-    id: item.id,
-    title: item.title,
-    description: item.description,
-    containerTag: item.containerTag,
-    topics: item.topics,
-    sections: item.sections,
-    ...(item.sourceUpdatedAt ? { sourceUpdatedAt: item.sourceUpdatedAt } : {}),
-    ...(item.updatedAt ? { updatedAt: item.updatedAt } : {}),
-    ...(item.createdAt ? { createdAt: item.createdAt } : {}),
-    recallable: item.recallable,
-    ...(Number.isInteger(item.part) && Number.isInteger(item.parts) && item.parts! > 1
-      ? { part: item.part, parts: item.parts }
-      : {}),
-  };
-}
-
-export function formatIndexItem(item: IndexDisplayItem) {
-  const timestamp = item.sourceUpdatedAt || item.updatedAt || item.createdAt || "日時不明";
-  const when = item.description && item.description !== item.title ? ` — 参照する場面: ${promptText(item.description, 180)}` : "";
-  const sections = item.sections?.length ? `（収録: ${item.sections.slice(0, 2).map((value) => promptText(value, 60)).join("、")}）` : "";
-  const parts = item.parts! > 1 ? ` | part=${item.part}/${item.parts}` : "";
-  const kind = item.consolidation ? " | kind=consolidated-checkpoint" : "";
-  const excerpt = item.searchExcerpt ? `\n  原文の該当箇所: ${promptText(item.searchExcerpt, 240)}` : "";
-  const topics = item.topics?.length ? ` | topics=${item.topics.slice(0, 3).map((value) => promptText(value, 60)).join(", ")}` : "";
-  const provenance = item.provenance?.project || item.provenance?.projectId || item.provenance?.containerTag
-    ? ` | provenance=${promptText(item.provenance.project || item.provenance.projectId || item.provenance.containerTag, 160)}${item.provenance.project && item.provenance.projectId ? ` (${promptText(item.provenance.projectId, 160)})` : ""}`
-    : "";
-  return `- ◪ ${promptText(item.title, 100)}${when}${sections}\n  id=${promptText(item.id, 80)}${topics} | container=${promptText(item.containerTag || "unknown", 160)}${provenance} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${promptText(timestamp, 40)}${parts}${kind}${excerpt}`;
-}
-
-export function formatRecentTask(item: IndexDisplayItem) {
-  const project = item.provenance?.project || item.provenance?.projectId || item.containerTag;
-  const timestamp = item.sourceUpdatedAt || item.createdAt || item.updatedAt || "日時不明";
-  const description = item.description && item.description !== item.title ? ` — ${promptText(item.description, 100)}` : "";
-  return `- ◷ ${promptText(item.title, 80)}${description}\n  id=${promptText(item.id, 64)} | project=${promptText(project, 64)} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${promptText(timestamp, 40)}`;
 }
