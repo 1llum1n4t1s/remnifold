@@ -334,39 +334,24 @@ fn finish_batch(
         "cases":last-first+1,"failed":failed,"stateCleanup":cleanup,"processId":fixture.child.id(),"childStopped":true}),
     )
 }
-pub fn run(repo: &Path, tools: &Toolchain, work: &Path) -> Result<()> {
-    let mut fixture = start_fixture(repo, tools, work)?;
-    let report_dir = fixture.output_dir.clone();
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(90))
-        .build()?;
-    let cases: Vec<Value> = client
-        .get(format!("{}/__cases", fixture.base_url))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    if cases.is_empty() {
-        bail!("server contract case list is empty")
-    }
-    let run = uuid::Uuid::new_v4().to_string();
-    let mut results = Vec::new();
+struct BatchOutcome {
+    results: Vec<Value>,
+    failed: usize,
+    state: Value,
+}
+// 1 バッチ分（連続する case）を、そのバッチ専用の workerd で順に実行する。同じ workerd へ並行してリクエストしない
+// （isolate 内の計測・console 差し替えが共有されるため）。
+fn run_batch(
+    mut fixture: WorkerFixture,
+    client: &reqwest::blocking::Client,
+    run: &str,
+    first: usize,
+    batch: &[Value],
+) -> Result<BatchOutcome> {
+    let started = Instant::now();
+    let mut results = Vec::with_capacity(batch.len());
     let mut failed = 0;
-    let mut batch_failed = 0;
-    let mut batch_start = 0;
-    let mut batch_states = Vec::new();
-    for (position, case) in cases.into_iter().enumerate() {
-        if position > 0 && position % MAX_CASES_PER_WORKER == 0 {
-            batch_states.push(finish_batch(
-                &mut fixture,
-                batch_start,
-                position - 1,
-                batch_failed,
-            )?);
-            fixture = start_fixture(repo, tools, work)?;
-            batch_start = position;
-            batch_failed = 0;
-        }
+    for case in batch {
         let i = case["index"].as_u64().context("missing test index")?;
         let result: Value = client
             .get(format!("{}/__run?case={i}&run={run}", fixture.base_url))
@@ -376,17 +361,105 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path) -> Result<()> {
             .json()?;
         if result["status"] != "passed" {
             failed += 1;
-            batch_failed += 1;
             eprintln!("FAILED {}: {}", result["name"], result["error"])
         }
         results.push(result);
     }
-    batch_states.push(finish_batch(
-        &mut fixture,
-        batch_start,
-        results.len() - 1,
-        batch_failed,
-    )?);
+    let mut state = finish_batch(&mut fixture, first, first + batch.len() - 1, failed)?;
+    state["durationMs"] = serde_json::json!(started.elapsed().as_millis() as u64);
+    Ok(BatchOutcome {
+        results,
+        failed,
+        state,
+    })
+}
+pub fn run(repo: &Path, tools: &Toolchain, work: &Path) -> Result<()> {
+    let first_fixture = start_fixture(repo, tools, work)?;
+    let report_dir = first_fixture.output_dir.clone();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(90))
+        .build()?;
+    let cases: Vec<Value> = client
+        .get(format!("{}/__cases", first_fixture.base_url))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    if cases.is_empty() {
+        bail!("server contract case list is empty")
+    }
+    let run = uuid::Uuid::new_v4().to_string();
+    let batches: Vec<&[Value]> = cases.chunks(MAX_CASES_PER_WORKER).collect();
+    let parallel_workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(batches.len());
+    // バッチ単位で並列に走らせる。workerd の起動（ポートの確保から /__health の応答まで）は 1 本ずつにして、
+    // 確保して手放したポートを別の fixture と取り合わない。
+    let start_lock = std::sync::Mutex::new(());
+    let first_fixture = std::sync::Mutex::new(Some(first_fixture));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let abort = std::sync::atomic::AtomicBool::new(false);
+    let mut outcomes: Vec<(usize, BatchOutcome)> = Vec::new();
+    let mut error = None;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..parallel_workers)
+            .map(|_| {
+                scope.spawn(|| -> Result<Vec<(usize, BatchOutcome)>> {
+                    let mut done = Vec::new();
+                    while !abort.load(std::sync::atomic::Ordering::SeqCst) {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Some(batch) = batches.get(index) else {
+                            break;
+                        };
+                        let outcome = (|| {
+                            let reused = if index == 0 {
+                                first_fixture.lock().unwrap().take()
+                            } else {
+                                None
+                            };
+                            let fixture = match reused {
+                                Some(fixture) => fixture,
+                                None => {
+                                    let _guard = start_lock.lock().unwrap();
+                                    start_fixture(repo, tools, work)?
+                                }
+                            };
+                            run_batch(fixture, &client, &run, index * MAX_CASES_PER_WORKER, batch)
+                        })();
+                        match outcome {
+                            Ok(outcome) => done.push((index, outcome)),
+                            Err(e) => {
+                                abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Ok(done)
+                })
+            })
+            .collect();
+        for worker in workers {
+            match worker.join().expect("server test worker panicked") {
+                Ok(done) => outcomes.extend(done),
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
+    });
+    if let Some(error) = error {
+        return Err(error);
+    }
+    // case の並びは従来どおり（バッチ順・バッチ内の順）で報告する。
+    outcomes.sort_by_key(|outcome| outcome.0);
+    let mut results = Vec::new();
+    let mut failed = 0;
+    let mut batch_states = Vec::new();
+    for (_, outcome) in outcomes {
+        results.extend(outcome.results);
+        failed += outcome.failed;
+        batch_states.push(outcome.state);
+    }
     let cleanup = if batch_states
         .iter()
         .all(|batch| batch["stateCleanup"] == batch_states[0]["stateCleanup"])
@@ -403,7 +476,8 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path) -> Result<()> {
         report_dir.join("server-validation.json"),
         serde_json::to_vec_pretty(
             &serde_json::json!({"runtime":"workerd","results":results,"failed":failed,"stateCleanup":cleanup,
-                "outputDir":report_dir,"maxCasesPerWorker":MAX_CASES_PER_WORKER,"batchOutputDirs":batch_dirs,"batchStates":batch_states}),
+                "outputDir":report_dir,"maxCasesPerWorker":MAX_CASES_PER_WORKER,"batchOutputDirs":batch_dirs,"batchStates":batch_states,
+                "parallelWorkers":parallel_workers}),
         )?,
     )?;
     println!(

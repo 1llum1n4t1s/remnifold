@@ -5,10 +5,13 @@
 #
 # 目的:
 #   Setup（Velopack）は main のコミットに付けた軽量タグ v<x.y.z> の push で配信する（GitHub Release は作らない）。
-#   公開バケットへ書く前に、そのコミットが main で全ターゲットのビルド・検証（ci.yml）に通っていることを要求する。
+#   公開バケットへ書く前に、そのコミットが main で速い検査（ci.yml の server-contracts・windows-native-contracts・
+#   windows-client-contracts）に通っていることを要求する。全ターゲットのパッケージ作成・updater-test は main の push では
+#   走らず、版タグの push で起動する ci.yml の run が配信と並行して行う事後確認で、その成否はここでは待たない
+#   （待つのは head_branch が既定ブランチの run だけで、タグの run は数えない）。
 #   そうしないと CI が失敗したコミットの Setup が公開バケットに載ってしまう（AGENTS.md の公開境界）。
 #   厳格な install 経路（releases/<version>/index.json と publish-r2）は 1.0.32 で凍結したため、publish-r2 の成功は
-#   求めない（main の ci.yml では publish-r2 は skipped で、run は success になる）。
+#   求めない（main の ci.yml では native-package と publish-r2 は skipped で、run は success になる）。
 #   このスクリプトは Secrets も Environment も持たない gate ジョブで動き、読み取り専用の権限
 #   （actions: read, contents: read）だけを使う。
 #

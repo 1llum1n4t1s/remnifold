@@ -319,13 +319,36 @@ fn run_command(command: &mut Command, stage: &str) -> Result<()> {
     }
     Ok(())
 }
+// `cargo xtask`（cargo run）が xtask へ渡す、パッケージ固有の環境変数。入れ子の cargo がそのまま引き継ぐと、
+// ring などの build.rs（rerun-if-env-changed）の指紋が外側と入れ子で交互に変わり、ring から remnifold まで
+// 毎回再ビルドされる。CARGO_HOME・CARGO_TARGET_DIR・設定系の CARGO_* は残す。
+fn nested_cargo() -> Command {
+    let mut command = Command::new(env!("CARGO"));
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("CARGO_PKG_")
+            || [
+                "CARGO_MANIFEST_DIR",
+                "CARGO_MANIFEST_PATH",
+                "CARGO_MANIFEST_LINKS",
+                "CARGO_CRATE_NAME",
+                "CARGO_BIN_NAME",
+                "CARGO_PRIMARY_PACKAGE",
+            ]
+            .contains(&upper.as_str())
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+}
 fn build_native(
     repo: &Path,
     tools: &tools::Toolchain,
     target: Option<&str>,
     release: bool,
 ) -> Result<()> {
-    let mut command = Command::new(env!("CARGO"));
+    let mut command = nested_cargo();
     command
         .args(["build", "--locked", "--package", "remnifold"])
         .env("REMNIFOLD_ESBUILD", &tools.esbuild)
@@ -353,7 +376,7 @@ fn native_tests(repo: &Path, tools: &tools::Toolchain, work: &Path) -> Result<()
     let isolated = work.join(format!("n-{}", uuid::Uuid::new_v4().simple()));
     let temporary = isolated.join("t");
     fs::create_dir_all(&temporary)?;
-    let mut command = Command::new(env!("CARGO"));
+    let mut command = nested_cargo();
     for (key, _) in std::env::vars_os() {
         let upper = key.to_string_lossy().to_ascii_uppercase();
         if ([

@@ -124,18 +124,14 @@ mod tests {
             .lines()
             .filter(|line| line.contains("refs/heads/main"))
         {
-            // main を名指しするのは、キャッシュの保存条件と、実行量を絞る条件（concurrency・全行列・Windows 検証 job の if）だけ。
+            // main を名指しするのは、キャッシュの保存条件と、実行量を絞る条件（concurrency）だけ。
             // どれも資格情報・Environment・ステージ・公開には関わらない。
             let line = line.trim();
             assert!(
                 line == "save-if: ${{ github.ref == 'refs/heads/main' }}"
                     || line.starts_with("group: ci-${{ github.workflow }}-")
                     || line
-                        .starts_with("cancel-in-progress: ${{ github.ref != 'refs/heads/main' &&")
-                    || line.starts_with("include: ${{ fromJSON(")
-                    || line.starts_with(
-                        "if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' ||"
-                    ),
+                        .starts_with("cancel-in-progress: ${{ github.ref != 'refs/heads/main' &&"),
                 "main may only select cache saving or the CI workload: {line}"
             );
         }
@@ -194,14 +190,19 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), ids.len(), "job IDs must be unique");
-        for id in [
-            "native-package",
-            "windows-server-contracts",
-            "windows-native-contracts",
-            "publish-r2",
-        ] {
+        // 速い検査の job（main の push を含む全 event で走る）と、job ID に対応する runs-on。
+        const FAST_JOBS: [(&str, &str); 3] = [
+            ("server-contracts", "ubuntu-24.04"),
+            ("windows-native-contracts", "windows-latest"),
+            ("windows-client-contracts", "windows-latest"),
+        ];
+        for id in ["native-package", "publish-r2"]
+            .into_iter()
+            .chain(FAST_JOBS.iter().map(|job| job.0))
+        {
             assert!(ids.contains(&id), "missing job {id}");
         }
+        assert_eq!(ids.len(), 5, "unexpected extra job");
 
         let publisher = job(&blocks, "publish-r2");
         let needs: Vec<&str> = publisher
@@ -230,10 +231,16 @@ mod tests {
         }
 
         // 新しい検証 job は資格情報・Environment を持たず、名前が公開 witness の job 名と重ならない。
-        for id in ["windows-server-contracts", "windows-native-contracts"] {
+        for (id, runner) in FAST_JOBS {
             let block = job(&blocks, id);
             assert!(block.contains(&format!("\n    name: {id}\n")));
-            assert!(block.contains("\n    runs-on: windows-latest\n"));
+            assert!(block.contains(&format!("\n    runs-on: {runner}\n")));
+            // main の push の CI を速い検査だけにするため、これらの job は条件なしで全 event で走る。
+            // job の if を書くと main や feature ブランチで検査が黙って外れるので禁止する。
+            assert!(
+                !block.contains("\n    if:"),
+                "{id} must run for every event without a job condition"
+            );
             assert!(block.contains("\n    timeout-minutes: 90\n"));
             assert!(block.contains("\n    permissions:\n      contents: read\n    defaults:"));
             for forbidden in [
@@ -260,12 +267,18 @@ mod tests {
             ));
             assert!(block.contains("remnifold-ci-paths.exe\" reports \"$CI_ROOT/validation\""));
         }
-        assert!(job(&blocks, "windows-server-contracts").contains("run: cargo xtask type-check\n"));
-        assert!(job(&blocks, "windows-server-contracts").contains("run: cargo xtask server-test "));
-        assert!(
-            job(&blocks, "windows-native-contracts").contains("run: cargo xtask native-test\n")
-        );
-        assert!(job(&blocks, "windows-native-contracts").contains("run: cargo xtask client-test "));
+        let server = job(&blocks, "server-contracts");
+        assert!(server.contains("run: cargo xtask type-check\n"));
+        assert!(server.contains("run: cargo xtask server-test "));
+        assert!(server.contains("run: git diff --check\n"));
+        // Linux 側は Windows 専用の cygpath・.exe を使わない。
+        assert!(!server.contains("cygpath") && !server.contains("node.exe"));
+        let native = job(&blocks, "windows-native-contracts");
+        assert!(native.contains("run: cargo xtask native-test\n"));
+        assert!(!native.contains("cargo xtask client-test"));
+        let client = job(&blocks, "windows-client-contracts");
+        assert!(client.contains("run: cargo xtask client-test "));
+        assert!(!client.contains("cargo xtask native-test"));
         // 各検証コマンドはちょうど1回だけ走る（分割で落としたり重複させたりしない）。
         for command in [
             "cargo xtask type-check",
@@ -622,15 +635,15 @@ mod tests {
             }
         }
         assert_eq!(
-            pinned, 3,
-            "rust-cache runs in the Windows package and both contract jobs"
+            pinned, 4,
+            "rust-cache runs in the Windows package and the three contract jobs"
         );
         // 固定 target（キャッシュ対象）は release 以外の run だけ。release は run/attempt 別の build を使う。
         assert_eq!(
             workflow
                 .matches("if [[ \"$GITHUB_REF\" != refs/heads/release/* ]]; then build=")
                 .count(),
-            3
+            4
         );
         assert!(
             workflow.contains("REMNIFOLD_PACKAGE_BINARY=%s/%s/release/remnifold%s\\n' \"$build\"")
@@ -654,38 +667,42 @@ mod tests {
         assert!(!workflow.contains("setup-node") && !workflow.contains("upload-artifact"));
         // 4 ターゲットは GitHub 提供ランナーがネイティブにビルドする。target と runs-on の対応を厳密に照合する
         // （Linux x64 は glibc の下限を保つため ubuntu-latest ではなく ubuntu-24.04 に固定）。
+        // matrix は固定の4件（式・fromJSON・縮小行列を使わない）。feature ブランチの Linux 1構成への縮小は廃止した。
         for (os, target) in [
             ("windows-latest", "x86_64-pc-windows-msvc"),
             ("macos-latest", "aarch64-apple-darwin"),
             ("ubuntu-24.04", "x86_64-unknown-linux-gnu"),
             ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
         ] {
-            // 全行列は fromJSON の1行の JSON にある。feature ブランチの push 用の縮小行列は Linux x64 だけを持つ。
-            let entry = format!("{{\"os\":\"{os}\",\"target\":\"{target}\"}}");
-            let expected = if target == "x86_64-unknown-linux-gnu" {
-                2
-            } else {
-                1
-            };
+            let entry = format!("          - os: {os}\n            target: {target}\n");
             assert_eq!(
                 workflow.matches(&entry).count(),
-                expected,
+                1,
                 "{target} must run on {os}"
             );
         }
-        assert_eq!(workflow.matches("{\"os\":").count(), 5);
-        assert!(workflow.contains("&& '[{\"os\":\"windows-latest\""));
-        assert!(
-            workflow.contains(
-                "|| '[{\"os\":\"ubuntu-24.04\",\"target\":\"x86_64-unknown-linux-gnu\"}]')"
-            )
-        );
+        assert_eq!(workflow.matches("          - os: ").count(), 4);
+        assert!(workflow.contains("      matrix:\n        # "));
+        assert!(!workflow.contains("fromJSON") && !workflow.contains("{\"os\":"));
         assert!(!workflow.contains("target: x86_64-apple-darwin"));
         // 手元ビルドの local-input 方式は廃止した。
         assert!(!workflow.contains("local-input"));
         let blocks = job_blocks(workflow);
         let matrix = job(&blocks, "native-package");
-        // 4 つの step は全ターゲットで無条件に動く（main / PR でも実際にビルドと検証を行う）。
+        // 全ターゲットのパッケージ作成は、main・feature ブランチの push では走らせない。PR・手動実行・release/* の push・
+        // 版タグの push のときだけ。job の if の式は一字一句固定する（緩めると main の CI が重くなり、
+        // 絞りすぎると配信後の事後確認や strict 公開が止まる）。
+        assert!(matrix.contains(
+            "\n    if: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v') }}\n"
+        ));
+        assert_eq!(
+            workflow
+                .matches("\n    if: ${{ github.event_name != 'push'")
+                .count(),
+            1,
+            "only native-package carries a job-level push filter"
+        );
+        // 4 つの step は全ターゲットで無条件に動く（PR・手動実行・release/*・版タグでは実際にビルドと検証を行う）。
         for name in [
             "Prepare pinned native build tools",
             "Build native consumer archive",
@@ -725,6 +742,42 @@ mod tests {
             include_str!("../../.github/dependabot.yml")
                 .contains("  - package-ecosystem: github-actions\n    directory: /\n")
         );
+    }
+
+    // main の push の CI は速い検査だけで、配信の関門（wait-main-ci.sh）はその run の成功を待つ。版タグの push では
+    // 全構成を事後確認として走らせる。トリガーと concurrency が崩れると、関門が待つ run が消える・全構成が走らなくなる。
+    #[test]
+    fn ci_triggers_run_version_tags_and_never_cancel_the_gate_run() {
+        let workflow = include_str!("../../.github/workflows/ci.yml");
+        let header = workflow.split_once("\njobs:\n").unwrap().0;
+        assert!(!workflow.contains("tags-ignore"));
+        assert!(header.contains("\n    tags:\n      - 'v[0-9]+.[0-9]+.[0-9]+'\n  pull_request:\n"));
+        assert_eq!(
+            header.matches("      - '").count(),
+            2,
+            "branches-ignore and one tag filter"
+        );
+        assert!(header.contains("    branches-ignore:\n      - 'dependabot/**'\n"));
+        assert!(header.contains("\n  workflow_dispatch:\n"));
+        assert!(!header.contains("schedule:"));
+        // 同じ SHA の別 event（手動実行・タグ・PR）が、待機中の main の run と同じ group に入って取り消さない。
+        let group = header
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("group: "))
+            .expect("concurrency group");
+        assert!(group.contains("${{ github.event_name }}"));
+        assert!(group.contains("github.sha"));
+        let cancel = header
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("cancel-in-progress: "))
+            .expect("cancel-in-progress");
+        for kept in [
+            "github.ref != 'refs/heads/main'",
+            "!startsWith(github.ref, 'refs/heads/release/')",
+            "!startsWith(github.ref, 'refs/tags/')",
+        ] {
+            assert!(cancel.contains(kept), "{kept} must never be cancelled");
+        }
     }
 
     // Literal command inspection complements the PATH guard. It intentionally does

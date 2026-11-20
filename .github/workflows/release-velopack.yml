@@ -4,7 +4,7 @@
 # このワークフローで配信する。
 #
 # job（配信の 4 チャネルは互いに独立。どれも gate だけを needs に持ち、ある OS の失敗は他の OS の配信に影響しない）:
-#   gate               ubuntu-latest       Secrets なし。起点のタグを確かめ、main の ci.yml の成功を待つ
+#   gate               ubuntu-latest       Secrets なし。起点のタグを確かめ、main の ci.yml（速い検査）の成功を待つ
 #   windows-installer  windows-latest      チャネル win         Certum（Sigilune）で署名。署名済みの bootstrap も置く
 #   macos-installer    macos-latest        チャネル osx         Developer ID で署名・公証（一時キーチェーン + App Store Connect API キー）
 #   linux-installer    ubuntu-24.04        チャネル linux-x64   署名なし（HTTPS とフィードのハッシュで信頼する）
@@ -24,8 +24,9 @@
 # - gate（Environment・Secrets なし、actions: read と contents: read だけ）が、公開バケットへ書く前に無条件で確かめる
 #   （本体は scripts/velopack/wait-main-ci.sh。スタブの gh で検証できる）:
 #   ref がタグで厳密な v<x.y.z>、タグ名が v<.codex-plugin/plugin.json の版>、軽量タグで GITHUB_SHA を指す、
-#   GITHUB_SHA が既定ブランチの祖先、同じコミットを既定ブランチへ push したときの ci.yml が成功（publish-r2 は求めない。
-#   main では skipped）。待った後にもタグが動いていないことを確かめる。
+#   GITHUB_SHA が既定ブランチの祖先、同じコミットを既定ブランチへ push したときの ci.yml が成功（main の run は速い検査
+#   だけで、native-package と publish-r2 は skipped。タグの push で起動する ci.yml の全構成の run は配信と並行する
+#   事後確認で、成否は待たない）。待った後にもタグが動いていないことを確かめる。
 #   各配信 job も、Secrets を使う step より前に cargo xtask ci-release-tag（refs/tags/v<plugin.json の版>）を通す。
 #   workflow_run は使わない（GITHUB_REF が既定ブランチになり、タグに限る r2-release に弾かれるため）。
 # - 部分配信と再実行: 各配信 job は、公開 URL の velopack/releases.<channel>.json（Secrets なしで取得。404 は未配信）に
@@ -36,7 +37,8 @@
 #   内容が変わり、既存の nupkg と一致せず失敗する（版付きの成果物は上書きしない）。その場合は patch を上げて出し直す。
 # - concurrency は配信 job ごと・チャネルごとに掛ける（ワークフロー直下には置かない。gate の待機中に枠を占有せず、
 #   同じ group に 4 job を入れて待機中の job が取り消されることもない）。
-# - 署名は ci.yml へ入れない（ci.yml は全ターゲットのビルド・検証を担い、旧版の strict 公開の witness も ci.yml にある）。
+# - 署名は ci.yml へ入れない（ci.yml は PR・手動実行・release/*・版タグで全ターゲットのビルド・検証を担い、旧版の
+#   strict 公開の witness も ci.yml にある）。
 # - 本人が事前に用意するもの（リポジトリの設定。値はここに書かない）:
 #     Environment `r2-release`（deployment policy はタグ v*.*.*）に
 #       Secrets:   R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY（R2）
@@ -60,7 +62,7 @@ jobs:
     name: gate
     if: github.repository == '1llum1n4t1s/remnifold' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    # main の ci.yml（native-package は 90 分）が終わるまで待てる長さ。待機の上限
+    # main の ci.yml（速い検査。各 job の上限は 90 分）が終わるまで待てる長さ。待機の上限
     # （GATE_TIMEOUT_SECONDS の既定 140 分）より長くする。
     timeout-minutes: 150
     permissions:
