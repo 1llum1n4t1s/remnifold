@@ -155,7 +155,7 @@ fn root() -> PathBuf {
     let root = std::env::temp_dir().join(format!("hook-concurrency-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     // 既定は今のセッションだけの注入になるため、従来の挙動（他セッションと直近の作業）を明示する。
-    fs::write(root.join("remnifold.json"), br#"{"recallScope":"all"}"#).unwrap();
+    fs::write(root.join("remnifold.json"), br#"{"recallMode":"direct","recallScope":"all"}"#).unwrap();
     root
 }
 /// 隔離した REMNIFOLD_HOME（全プロセスで共有 = 同じロック置き場）でフックを 1 つ実行する。

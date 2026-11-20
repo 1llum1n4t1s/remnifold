@@ -169,7 +169,7 @@ pub fn setup(args: &[String]) -> Result<()> {
     raw["baseUrl"] = json!(base_url);
     raw["apiKey"] = json!(key);
     if raw.get("recallMode").is_none() {
-        raw["recallMode"] = json!("direct");
+        raw["recallMode"] = json!("off");
     }
     if raw.get("maxMemories").is_none() {
         raw["maxMemories"] = json!(3);

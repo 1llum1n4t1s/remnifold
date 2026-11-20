@@ -253,7 +253,7 @@ fn root() -> PathBuf {
     let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     // 既定は今のセッションだけの注入になるため、従来の挙動を調べる既存テストは明示して all にする。
-    fs::write(root.join("remnifold.json"), br#"{"recallScope":"all"}"#).unwrap();
+    fs::write(root.join("remnifold.json"), br#"{"recallMode":"direct","recallScope":"all"}"#).unwrap();
     root
 }
 fn root_all() -> PathBuf {
@@ -415,11 +415,11 @@ fn session_scope_injects_only_current_session_records_and_skips_recent_tasks() {
     fixture.mixed.store(true, Ordering::Relaxed);
     let payload =
         json!({"session_id":" fixture-session ","prompt":"Repair Unicode transcript boundaries"});
-    // 既定（設定なし）・明示の session・未知の値は、いずれも session として扱う。
+    // recallMode 以外は既定のまま・明示の session・未知の値は、いずれも session として扱う。
     for config in [
-        None,
-        Some(r#"{"recallScope":"session"}"#),
-        Some(r#"{"recallScope":"unknown"}"#),
+        Some(r#"{"recallMode":"direct"}"#),
+        Some(r#"{"recallMode":"direct","recallScope":"session"}"#),
+        Some(r#"{"recallMode":"direct","recallScope":"unknown"}"#),
     ] {
         let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -492,6 +492,7 @@ fn session_scope_sends_client_source_detected_from_the_transcript() {
     let fixture = Fixture::new();
     let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("remnifold.json"), br#"{"recallMode":"direct"}"#).unwrap();
     let rows = [
         (
             "codex",
@@ -554,7 +555,7 @@ fn claude_resume_copies_widen_session_scope_with_bounded_ids() {
     fixture.mixed.store(true, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("hooks-e2e-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("remnifold.json"), br#"{"maxMemories":8}"#).unwrap();
+    fs::write(root.join("remnifold.json"), br#"{"recallMode":"direct","maxMemories":8}"#).unwrap();
     let row = |kind: &str, id: &str, extra: Value| {
         let mut row = json!({"type":kind,"sessionId":id,"timestamp":"2026-09-01T10:00:00Z","message":{"role":kind,"content":"x"}});
         for (key, value) in extra.as_object().into_iter().flatten() {

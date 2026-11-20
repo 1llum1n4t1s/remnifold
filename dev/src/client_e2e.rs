@@ -735,7 +735,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
     fs::write(
         home.join("remnifold.json"),
         serde_json::to_vec(
-            &json!({"baseUrl":fixture.base_url,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all"}),
+            &json!({"baseUrl":fixture.base_url,"apiKey":API_KEY,"recallMode":"direct","maxRecentTasks":0,"recallScope":"all"}),
         )?,
     )?;
     let endpoint = &fixture.base_url;
@@ -1050,7 +1050,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
         fs::write(
             home.join("remnifold.json"),
             serde_json::to_vec(
-                &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":scope,"maxMemories":8}),
+                &json!({"baseUrl":endpoint,"apiKey":API_KEY,"recallMode":"direct","maxRecentTasks":0,"recallScope":scope,"maxMemories":8}),
             )?,
         )?;
         let output = hook(
@@ -1081,7 +1081,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
     fs::write(
         home.join("remnifold.json"),
         serde_json::to_vec(
-            &json!({"baseUrl":fixture.base_url,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all"}),
+            &json!({"baseUrl":fixture.base_url,"apiKey":API_KEY,"recallMode":"direct","maxRecentTasks":0,"recallScope":"all"}),
         )?,
     )?;
     checks.push("native session recall through real workerd: resume-copied old session ids are bounded by the copied rows' timestamps");
@@ -1291,7 +1291,7 @@ fn organization_contracts(
     fs::write(
         recall_home.join("remnifold.json"),
         serde_json::to_vec(
-            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all","maxMemories":5,"minimumSimilarity":0.7}),
+            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"recallMode":"direct","maxRecentTasks":0,"recallScope":"all","maxMemories":5,"minimumSimilarity":0.7}),
         )?,
     )?;
     let recalled = hook(
@@ -1503,7 +1503,7 @@ fn organization_numeric_conflict_journey(
     fs::write(
         recall_home.join("remnifold.json"),
         serde_json::to_vec(
-            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all","maxMemories":5,"minimumSimilarity":0.7}),
+            &json!({"baseUrl":endpoint,"apiKey":API_KEY,"recallMode":"direct","maxRecentTasks":0,"recallScope":"all","maxMemories":5,"minimumSimilarity":0.7}),
         )?,
     )?;
     let result = hook(
@@ -1661,7 +1661,7 @@ fn diagnostic_contracts(
         fs::write(
             home.join("remnifold.json"),
             serde_json::to_vec(
-                &json!({"baseUrl":endpoint,"apiKey":API_KEY,"maxRecentTasks":0,"recallScope":"all"}),
+                &json!({"baseUrl":endpoint,"apiKey":API_KEY,"recallMode":"direct","maxRecentTasks":0,"recallScope":"all"}),
             )?,
         )?;
         let transcript = home.join("fixture-sensitive-marker.jsonl");
@@ -1914,7 +1914,7 @@ impl Recall<'_> {
         fs::write(
             self.home.join("remnifold.json"),
             serde_json::to_vec(
-                &json!({"baseUrl":self.endpoint,"apiKey":API_KEY,"maxMemories":count,"maxRecentTasks":recent,"recallScope":"all","minimumSimilarity":0.7}),
+                &json!({"baseUrl":self.endpoint,"apiKey":API_KEY,"recallMode":"direct","maxMemories":count,"maxRecentTasks":recent,"recallScope":"all","minimumSimilarity":0.7}),
             )?,
         )?;
         Ok(())
