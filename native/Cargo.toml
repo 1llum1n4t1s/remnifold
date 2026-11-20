@@ -23,7 +23,7 @@ icu_segmenter = { version = "2", features = ["compiled_data"] }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "multipart"] }
 rpassword = "7"
-rusqlite = { version = "0.42", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
@@ -36,7 +36,7 @@ unicode-normalization = "0.1"
 # public-utils は依存を増やさず `velopack::bundle` を公開するだけの機能。macOS の署名検証で、UpdateMac が導入先へ
 # 展開するのと同じ関数（extract_lib_contents_to_path）で nupkg を展開し、実際に入れ替わる中身そのものを検証するために使う。
 velopack = { version = "=1.2.161", default-features = false, features = ["public-utils"] }
-zip = { version = "9.4.1", default-features = false, features = ["deflate"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_System_Registry", "Win32_Security_WinTrust", "Win32_Security_Cryptography"] }
