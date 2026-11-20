@@ -69,7 +69,7 @@ fn run() -> Result<()> {
     }
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         println!(
-            "cargo xtask <prepare|type-check|native-test|server-test|client-test|updater-test|bootstrap-test|package|verify|check>\n\nOptions: --tool-root <absolute-cache> --work-root <absolute-output>\nPackage: --target <Rust target> --binary <executable> --output <archive>\nSource: --source-mode commit|checkout (package/verify default: commit)\nVerify/update tests: --archive <archive> [--legacy-archive <old-JS-package>] [--previous-archive <old-native-package>]"
+            "cargo xtask <prepare|type-check|native-test|server-test|client-test|updater-test|bootstrap-test|package|verify|check>\n\nOptions: --tool-root <absolute-cache> --work-root <absolute-output>\nPackage: --target <Rust target> --binary <executable> --output <archive>\nSource: --source-mode commit|checkout (package/verify default: commit)\nVerify/update tests: --archive <archive> [--previous-archive <old-native-package>]"
         );
         return Ok(());
     }
@@ -100,7 +100,6 @@ fn run() -> Result<()> {
             "--archive",
             "--source-commit",
             "--source-mode",
-            "--legacy-archive",
             "--previous-archive",
         ]
         .contains(&option.as_str())
@@ -186,7 +185,6 @@ fn run() -> Result<()> {
         }
         "updater-test" => {
             let archive = required_path(&options, "--archive")?;
-            let legacy = options.get("--legacy-archive").map(PathBuf::from);
             let previous = options.get("--previous-archive").map(PathBuf::from);
             updater_e2e::run(
                 &repo,
@@ -194,7 +192,6 @@ fn run() -> Result<()> {
                 &work,
                 &binary,
                 &archive,
-                legacy.as_deref(),
                 previous.as_deref(),
             )?;
         }
@@ -239,7 +236,6 @@ fn run() -> Result<()> {
                 .join(format!("remnifold-{target}.tar.gz"));
             let commit = source_commit(&repo, &options)?;
             let archive = package::build(&repo, target, &native, &output, &commit)?;
-            let legacy = options.get("--legacy-archive").map(PathBuf::from);
             let previous = options.get("--previous-archive").map(PathBuf::from);
             updater_e2e::run(
                 &repo,
@@ -247,7 +243,6 @@ fn run() -> Result<()> {
                 &work.join("updater"),
                 &native,
                 &archive,
-                legacy.as_deref(),
                 previous.as_deref(),
             )?;
             run_command(

@@ -37,7 +37,12 @@
 use super::{SetupContext, log_line, logon};
 use crate::connect;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 /// 登録の状態を覚えるファイル（状態フォルダー直下）。
 pub const STATE_FILE: &str = "setup-registration.json";
@@ -157,8 +162,42 @@ pub fn plan(
     })
 }
 
+/// 更新後のフック（Velopack は15秒で打ち切る）で、CLI の登録に使ってよい時間の予算。15秒より十分小さくし、
+/// ログオン時の適用・フックの張り直しと、最後に始めた CLI の待ちが収まるようにする。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const UPDATED_HOOK_BUDGET: Duration = Duration::from_secs(12);
+
+/// `tools` を順に登録する。`budget` があるときは、次の CLI の登録を始める時点で `elapsed` と最悪の所要時間
+/// `worst` の合計が予算を超えるなら、その CLI と以降を始めずに返す（remove と add の途中では打ち切らない
+/// ため、始めた登録は最後まで行う）。返す 2 つ目は始めなかった CLI。
+fn register_within(
+    tools: &[&'static str],
+    budget: Option<Duration>,
+    worst: Duration,
+    elapsed: impl Fn() -> Duration,
+    mut register: impl FnMut(&'static str) -> connect::SetupOutcome,
+) -> (Vec<connect::SetupOutcome>, Vec<&'static str>) {
+    let mut outcomes = Vec::new();
+    let mut skipped = Vec::new();
+    for &tool in tools {
+        if budget.is_some_and(|budget| elapsed() + worst > budget) {
+            skipped.push(tool);
+        } else {
+            outcomes.push(register(tool));
+        }
+    }
+    (outcomes, skipped)
+}
+
 /// 必要なら登録する。`label` は診断ログの見出し。失敗は例外にせず、診断ログにだけ残す。
 pub fn ensure(context: &SetupContext, label: &str) {
+    ensure_within(context, label, None);
+}
+
+/// [`ensure`] に、CLI の登録へ使う時間の予算を付けたもの（更新後のフック用。[`UPDATED_HOOK_BUDGET`]）。
+/// 予算で始められなかった CLI は未完了のまま状態に残し、次のログオン時の適用などでやり直す。
+pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duration>) {
+    let started = Instant::now();
     let state_dir = crate::paths::Roots::current().state;
     let executable = context.executable.to_string_lossy().into_owned();
     if plan(
@@ -212,13 +251,25 @@ pub fn ensure(context: &SetupContext, label: &str) {
             connect::refresh_claude_hooks_for_setup(&context.executable)
         ));
     }
-    for outcome in connect::register_tools_for_setup(&context.executable, &plan.tools) {
+    let (outcomes, skipped) = register_within(
+        &plan.tools,
+        budget,
+        connect::tool_registration_worst_case(),
+        || started.elapsed(),
+        |tool| connect::register_tool_for_setup(&context.executable, tool),
+    );
+    for outcome in outcomes {
         if outcome.done {
             state.done.insert(outcome.tool.to_string());
         } else {
             state.done.remove(outcome.tool);
         }
         log_line(&format!("{label}: {}", outcome.line));
+    }
+    for tool in skipped {
+        log_line(&format!(
+            "{label}: {tool}: not started (hook time budget); retried at the next logon"
+        ));
     }
     if let Err(error) = save(&state_dir, &state) {
         log_line(&format!("{label}: registration state not saved: {error}"));
@@ -234,6 +285,61 @@ mod tests {
             done: tools.iter().map(|t| t.to_string()).collect(),
             ..state.clone()
         }
+    }
+
+    fn outcome(tool: &'static str) -> connect::SetupOutcome {
+        connect::SetupOutcome {
+            tool,
+            done: true,
+            line: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_hook_budget_stops_before_a_registration_that_might_not_finish() {
+        use std::cell::Cell;
+        let worst = Duration::from_secs(9);
+        let clock = Cell::new(Duration::ZERO);
+        // Each registration takes its worst case: the second one must not start within 12 seconds.
+        let (done, skipped) = register_within(
+            &["claude", "codex"],
+            Some(UPDATED_HOOK_BUDGET),
+            worst,
+            || clock.get(),
+            |tool| {
+                clock.set(clock.get() + worst);
+                outcome(tool)
+            },
+        );
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].tool, "claude");
+        assert_eq!(skipped, vec!["codex"]);
+        // A fast first registration leaves room for the second.
+        let clock = Cell::new(Duration::ZERO);
+        let (done, skipped) = register_within(
+            &["claude", "codex"],
+            Some(UPDATED_HOOK_BUDGET),
+            worst,
+            || clock.get(),
+            |tool| {
+                clock.set(clock.get() + Duration::from_secs(1));
+                outcome(tool)
+            },
+        );
+        assert_eq!((done.len(), skipped.len()), (2, 0));
+        // Without a budget (install hook, logon retry) everything runs.
+        let clock = Cell::new(Duration::ZERO);
+        let (done, skipped) = register_within(
+            &["claude", "codex"],
+            None,
+            worst,
+            || clock.get(),
+            |tool| {
+                clock.set(clock.get() + worst);
+                outcome(tool)
+            },
+        );
+        assert_eq!((done.len(), skipped.len()), (2, 0));
     }
 
     #[test]

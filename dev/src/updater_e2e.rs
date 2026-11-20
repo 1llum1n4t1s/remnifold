@@ -1556,7 +1556,6 @@ pub fn run(
     work: &Path,
     binary: &Path,
     archive: &Path,
-    legacy_archive: Option<&Path>,
     previous_archive: Option<&Path>,
 ) -> Result<()> {
     run_suite(
@@ -1565,13 +1564,12 @@ pub fn run(
         work,
         binary,
         archive,
-        legacy_archive,
         previous_archive,
         false,
     )
 }
 pub fn bootstrap_tests(repo: &Path, work: &Path, binary: &Path, archive: &Path) -> Result<()> {
-    run_suite(repo, None, work, binary, archive, None, None, true)
+    run_suite(repo, None, work, binary, archive, None, true)
 }
 
 #[cfg(test)]
@@ -1697,7 +1695,6 @@ fn run_suite(
     work: &Path,
     binary: &Path,
     archive: &Path,
-    legacy_archive: Option<&Path>,
     previous_archive: Option<&Path>,
     bootstrap_only: bool,
 ) -> Result<()> {
@@ -1974,8 +1971,6 @@ fn run_suite(
         "linked work ancestor was followed: {result}"
     );
     scenarios.push("linked-work-root-rejected-before-mutation");
-    // 旧 JavaScript 版は Codex プラグインとしての配布物で、単独アプリの導入では移行対象にしない。
-    let _ = legacy_archive;
     let mut worker = if previous_archive.is_some() {
         Some(start_fixture(
             repo,

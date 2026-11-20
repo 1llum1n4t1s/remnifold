@@ -15,7 +15,7 @@
 //!
 //! 解除（`--remove`）は、登録の逆を自分の項目だけに行う。settings.json の他のフック・設定、他の MCP 登録は
 //! 保つ。Setup（Velopack）版のインストール・更新・アンインストールの各フックからは、
-//! [`register_tools_for_setup`] / [`unregister_for_setup`] を通して同じ処理を呼ぶ（失敗しても例外にせず、
+//! [`register_tool_for_setup`] / [`unregister_for_setup`] を通して同じ処理を呼ぶ（失敗しても例外にせず、
 //! 結果を文字列で返す。フックの失敗でインストールや更新を止めないため）。
 use crate::common::{atomic_write, home_dir};
 use anyhow::{Result, bail, ensure};
@@ -29,8 +29,9 @@ use std::{
 };
 
 /// Setup（Velopack）のフックから呼ぶ CLI 1回あたりの上限（既定）。Velopack はインストール・アンインストール後の
-/// フックを30秒、更新後のフックを15秒で打ち切る。最悪でも全体が15秒に収まるよう、1回を3秒に制限する
-/// （remove と add の間で打ち切られると登録が消えたままになるため、無制限に待たせない）。
+/// フックを30秒、更新後のフックを15秒で打ち切る。1回を3秒に制限し（remove と add の間で打ち切られると登録が
+/// 消えたままになるため、無制限に待たせない）、更新後のフックはさらに合計の時間予算（`app_update::registration`）で
+/// 次の CLI の登録を始める前に打ち切る。これで全体が15秒に収まる。
 pub const HOOK_CLI_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// フック以外（ログオン時の `update-apply`・引数なしの起動・`mcp` の背景スレッド）で登録をやり直すときの上限。
@@ -499,10 +500,10 @@ fn codex_remove(
 }
 
 /// Setup 版が登録する CLI の名前（`claude` と `codex`）。Setup 版の登録は全 OS 共通で
-/// `app_update::registration` が状態ファイルとあわせて [`register_tools_for_setup`] を呼ぶ。
+/// `app_update::registration` が状態ファイルとあわせて [`register_tool_for_setup`] を呼ぶ。
 pub const SETUP_TOOLS: [&str; 2] = ["claude", "codex"];
 
-/// [`register_tools_for_setup`] の1つの CLI の結果。
+/// [`register_tool_for_setup`] の1つの CLI の結果。
 pub struct SetupOutcome {
     /// CLI の名前（`claude` / `codex`）。
     pub tool: &'static str,
@@ -512,44 +513,43 @@ pub struct SetupOutcome {
     pub line: String,
 }
 
-/// 指定の CLI だけを登録する（macOS の初回起動・更新後の登録で、未完了の CLI だけをやり直すために使う）。
-/// 未知の名前は無視する。どの失敗も例外にしない。
-pub fn register_tools_for_setup(executable: &Path, tools: &[&str]) -> Vec<SetupOutcome> {
-    let mut outcomes = Vec::new();
-    for (tool, claude) in [("claude", true), ("codex", false)] {
-        if !tools.contains(&tool) {
-            continue;
-        }
-        let Some(cli) = find_cli(tool) else {
-            outcomes.push(SetupOutcome {
-                tool,
-                done: false,
-                line: format!("{tool}: CLI not found; skipped"),
-            });
-            continue;
+/// 1つの CLI の登録に最悪でかかる時間。`mcp get`・`remove`・`add` の3回が、それぞれ上限まで待つ場合。
+/// フックの時間予算（[`crate::app_update::registration`]）が、次の CLI を始めてよいかの判断に使う。
+pub fn tool_registration_worst_case() -> Duration {
+    cli_timeout() * 3
+}
+
+/// 指定の CLI を1つだけ登録する（Setup 版の登録で、未完了の CLI をやり直すために使う）。
+/// 未知の名前は CLI が無いものとして扱う。どの失敗も例外にしない。
+pub fn register_tool_for_setup(executable: &Path, tool: &'static str) -> SetupOutcome {
+    let claude = tool == "claude";
+    let Some(cli) = SETUP_TOOLS.contains(&tool).then(|| find_cli(tool)).flatten() else {
+        return SetupOutcome {
+            tool,
+            done: false,
+            line: format!("{tool}: CLI not found; skipped"),
         };
-        let outcome = if claude {
-            claude_code(executable, Some(cli), true, true)
-        } else {
-            codex(executable, Some(cli), true, true)
-        };
-        outcomes.push(match outcome {
-            Ok(value) => SetupOutcome {
-                tool,
-                done: true,
-                line: format!(
-                    "{tool}: {}",
-                    value["mcp"]["status"].as_str().unwrap_or("done")
-                ),
-            },
-            Err(error) => SetupOutcome {
-                tool,
-                done: false,
-                line: format!("{tool}: failed: {error}"),
-            },
-        });
+    };
+    let outcome = if claude {
+        claude_code(executable, Some(cli), true, true)
+    } else {
+        codex(executable, Some(cli), true, true)
+    };
+    match outcome {
+        Ok(value) => SetupOutcome {
+            tool,
+            done: true,
+            line: format!(
+                "{tool}: {}",
+                value["mcp"]["status"].as_str().unwrap_or("done")
+            ),
+        },
+        Err(error) => SetupOutcome {
+            tool,
+            done: false,
+            line: format!("{tool}: failed: {error}"),
+        },
     }
-    outcomes
 }
 
 /// 更新の後に、Claude Code の settings.json にある Remnifold のフックだけを最新の定義へ張り直す。
