@@ -26,12 +26,20 @@
 //!
 //! # 軽くする工夫（状態ファイル）
 //! 状態フォルダーの `setup-registration.json` に、登録した実行ファイルのパス・版・登録済みの CLI を覚え、
-//! 次の場合だけ処理する。普段の `mcp` 起動では、ファイル1つの読み込みと PATH の走査だけで終わる。
+//! 次の場合だけ処理する。普段の `mcp` 起動では、この状態ファイルと接続設定（`recallMode`）の読み込みと
+//! PATH の走査だけで終わる。
 //! - パスが変わった（初回・導入先の移動）: ログイン時の適用と、見つかった全ての CLI を登録する。
 //! - 版だけが変わった（更新の後）: ログイン時の適用の定義と、Claude Code のフックだけを張り直す。
 //!   MCP の登録はパスが同じなら有効なままなので CLI は呼ばない（使用中のセッションの設定を外して
 //!   付け直すことを避けるため）。
 //! - 同じパス・版で、前回見つからなかった・失敗した CLI が今は見つかる: その CLI だけを登録する。
+//! - 自動想起（`remnifold.json` の `recallMode`）の on/off が、前回フックを登録したときと違う: Claude Code の
+//!   フックだけを張り直す（off では想起用の SessionStart・UserPromptSubmit を外す）。利用者が設定を書き換えた後の
+//!   最初の `mcp` 起動などで反映し、Claude Code はフックを起動時に読むため、その次のセッションから効く。
+//!   この項目の無い古い状態ファイル（この変更より前の版）では1回だけ張り直す。これが既存の利用者の移行で、
+//!   off の利用者の settings.json に残っている想起用のフックを外す（更新の後の張り直しでも同じく外れる）。
+//!   張り直しは、この実行ファイルを指す Remnifold のフックがある場合だけ書き込むので、Claude の登録が
+//!   `done` に無くても行う（利用者が `connect` で手動登録した場合も移行する）。
 //!
 //! 複数のセッションが同時に起動しても二重に登録しないよう、`setup-registration.lock` を try-lock する。
 use super::{SetupContext, log_line, logon};
@@ -60,6 +68,9 @@ pub struct State {
     pub done: BTreeSet<String>,
     /// ログイン時の適用を登録したか（別の導入の plist が残っていて触れなかった場合は false）。
     pub logon: bool,
+    /// Claude Code のフックを、自動想起が有効（true）・無効（false）のどちらの定義で登録したか。
+    /// 未登録・古い状態ファイルでは None。
+    pub recall: Option<bool>,
 }
 
 /// 何をするか。
@@ -71,7 +82,7 @@ pub struct Plan {
     pub logon: bool,
     /// CLI で登録する CLI。
     pub tools: Vec<&'static str>,
-    /// Claude Code のフックだけを張り直す（更新の後）。
+    /// Claude Code のフックだけを張り直す（更新の後・自動想起の切り替えの後）。
     pub refresh_hooks: bool,
 }
 
@@ -94,6 +105,7 @@ pub fn parse(bytes: &[u8]) -> State {
             })
             .unwrap_or_default(),
         logon: value["logon"].as_bool().unwrap_or(false),
+        recall: value["recall"].as_bool(),
     }
 }
 
@@ -111,6 +123,7 @@ fn save(state_dir: &Path, state: &State) -> anyhow::Result<()> {
         "version": state.version,
         "done": state.done.iter().collect::<Vec<_>>(),
         "logon": state.logon,
+        "recall": state.recall,
     });
     crate::common::atomic_write(
         &state_dir.join(STATE_FILE),
@@ -129,11 +142,12 @@ pub fn forget(state_dir: &Path) -> std::io::Result<bool> {
 }
 
 /// 前回の状態と今の導入から、するべきことを決める。何もしなくてよければ None。
-/// `available` は CLI が見つかるかの判定（テストで差し替える）。
+/// `recall` は今の自動想起の on/off、`available` は CLI が見つかるかの判定（テストで差し替える）。
 pub fn plan(
     state: &State,
     executable: &str,
     version: &str,
+    recall: bool,
     available: impl Fn(&str) -> bool,
 ) -> Option<Plan> {
     if state.executable.as_deref() != Some(executable) {
@@ -150,7 +164,9 @@ pub fn plan(
         .filter(|tool| !state.done.contains(*tool) && available(tool))
         .collect();
     let logon = updated || !state.logon;
-    let refresh_hooks = updated && state.done.contains("claude");
+    // 想起の切り替え（と古い状態ファイルからの移行）は、Claude の登録が `done` に無くても張り直す。
+    // 張り直しはこの実行ファイルを指す Remnifold のフックがある場合だけ書き込むので、未登録なら何も変わらない。
+    let refresh_hooks = (updated && state.done.contains("claude")) || state.recall != Some(recall);
     if !logon && tools.is_empty() && !refresh_hooks {
         return None;
     }
@@ -200,10 +216,13 @@ pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duratio
     let started = Instant::now();
     let state_dir = crate::paths::Roots::current().state;
     let executable = context.executable.to_string_lossy().into_owned();
+    // 1回だけ読み、判定と書き込みで同じ値を使う（途中で設定が書き換わっても食い違わない）。
+    let recall = connect::recall_enabled();
     if plan(
         &load(&state_dir),
         &executable,
         &context.version,
+        recall,
         connect::cli_available,
     )
     .is_none()
@@ -220,6 +239,7 @@ pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duratio
         &previous,
         &executable,
         &context.version,
+        recall,
         connect::cli_available,
     ) else {
         return;
@@ -246,23 +266,27 @@ pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duratio
         }
     }
     if plan.refresh_hooks {
-        log_line(&format!(
-            "{label}: {}",
-            connect::refresh_claude_hooks_for_setup(&context.executable)
-        ));
+        let (refreshed, line) =
+            connect::refresh_claude_hooks_for_setup(&context.executable, recall);
+        // 失敗したら覚えている定義を消し、次の機会に張り直す。
+        state.recall = refreshed.then_some(recall);
+        log_line(&format!("{label}: {line}"));
     }
     let (outcomes, skipped) = register_within(
         &plan.tools,
         budget,
         connect::tool_registration_worst_case(),
         || started.elapsed(),
-        |tool| connect::register_tool_for_setup(&context.executable, tool),
+        |tool| connect::register_tool_for_setup(&context.executable, tool, recall),
     );
     for outcome in outcomes {
         if outcome.done {
             state.done.insert(outcome.tool.to_string());
         } else {
             state.done.remove(outcome.tool);
+        }
+        if outcome.tool == "claude" {
+            state.recall = outcome.done.then_some(recall);
         }
         log_line(&format!("{label}: {}", outcome.line));
     }
@@ -351,7 +375,7 @@ mod tests {
             refresh_hooks: false,
         };
         assert_eq!(
-            plan(&State::default(), "/A.app/x", "1.0.0", |_| false),
+            plan(&State::default(), "/A.app/x", "1.0.0", false, |_| false),
             Some(everything)
         );
         let registered = State {
@@ -359,9 +383,10 @@ mod tests {
             version: Some("1.0.0".into()),
             done: ["claude".to_string(), "codex".to_string()].into(),
             logon: true,
+            recall: Some(false),
         };
         assert!(
-            plan(&registered, "/A.app/x", "1.0.0", |_| true)
+            plan(&registered, "/A.app/x", "1.0.0", false, |_| true)
                 .unwrap()
                 .fresh
         );
@@ -374,14 +399,15 @@ mod tests {
             version: Some("1.0.0".into()),
             done: ["claude".to_string(), "codex".to_string()].into(),
             logon: true,
+            recall: Some(false),
         };
-        assert_eq!(plan(&state, "/A.app/x", "1.0.0", |_| true), None);
+        assert_eq!(plan(&state, "/A.app/x", "1.0.0", false, |_| true), None);
         // 見つからなかった CLI は、見つかるまでは何もしない（毎回の起動でプロセスを起動しない）。
         let partial = done(&state, &["claude"]);
-        assert_eq!(plan(&partial, "/A.app/x", "1.0.0", |_| false), None);
+        assert_eq!(plan(&partial, "/A.app/x", "1.0.0", false, |_| false), None);
         // 見つかったら、その CLI だけを登録する。
         assert_eq!(
-            plan(&partial, "/A.app/x", "1.0.0", |tool| tool == "codex"),
+            plan(&partial, "/A.app/x", "1.0.0", false, |tool| tool == "codex"),
             Some(Plan {
                 fresh: false,
                 logon: false,
@@ -398,9 +424,10 @@ mod tests {
             version: Some("1.0.0".into()),
             done: ["claude".to_string(), "codex".to_string()].into(),
             logon: true,
+            recall: Some(false),
         };
         assert_eq!(
-            plan(&state, "/A.app/x", "1.0.1", |_| true),
+            plan(&state, "/A.app/x", "1.0.1", false, |_| true),
             Some(Plan {
                 fresh: false,
                 logon: true,
@@ -410,10 +437,60 @@ mod tests {
         );
         // Claude を登録していなければ、フックは張り直さない。
         assert!(
-            !plan(&done(&state, &["codex"]), "/A.app/x", "1.0.1", |_| false)
-                .unwrap()
-                .refresh_hooks
+            !plan(
+                &done(&state, &["codex"]),
+                "/A.app/x",
+                "1.0.1",
+                false,
+                |_| false
+            )
+            .unwrap()
+            .refresh_hooks
         );
+    }
+
+    #[test]
+    fn a_changed_recall_mode_refreshes_only_the_claude_hooks() {
+        let state = State {
+            executable: Some("/A.app/x".into()),
+            version: Some("1.0.0".into()),
+            done: ["claude".to_string(), "codex".to_string()].into(),
+            logon: true,
+            recall: Some(false),
+        };
+        let refresh = Some(Plan {
+            fresh: false,
+            logon: false,
+            tools: vec![],
+            refresh_hooks: true,
+        });
+        // off → on と on → off の両方向で、CLI を呼ばずにフックだけを張り直す。
+        assert_eq!(plan(&state, "/A.app/x", "1.0.0", true, |_| true), refresh);
+        let on = State {
+            recall: Some(true),
+            ..state.clone()
+        };
+        assert_eq!(plan(&on, "/A.app/x", "1.0.0", false, |_| true), refresh);
+        assert_eq!(plan(&on, "/A.app/x", "1.0.0", true, |_| true), None);
+        // 項目の無い古い状態ファイルでは1回だけ張り直す。
+        let legacy = State {
+            recall: None,
+            ..state.clone()
+        };
+        assert_eq!(plan(&legacy, "/A.app/x", "1.0.0", false, |_| true), refresh);
+        // Claude の登録が `done` に無くても（手動の connect など）切り替えと移行は張り直す。
+        let manual = done(&state, &["codex"]);
+        assert_eq!(plan(&manual, "/A.app/x", "1.0.0", true, |_| false), refresh);
+        let manual_legacy = State {
+            recall: None,
+            ..manual.clone()
+        };
+        assert_eq!(
+            plan(&manual_legacy, "/A.app/x", "1.0.0", false, |_| false),
+            refresh
+        );
+        // 一致していれば何もしない。
+        assert_eq!(plan(&manual, "/A.app/x", "1.0.0", false, |_| false), None);
     }
 
     #[test]
@@ -426,6 +503,7 @@ mod tests {
             version: Some("9.0.0".into()),
             done: ["codex".to_string()].into(),
             logon: true,
+            recall: Some(false),
         };
         save(&dir, &state).unwrap();
         assert_eq!(load(&dir), state);

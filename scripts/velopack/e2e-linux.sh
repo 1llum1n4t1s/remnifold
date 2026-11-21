@@ -172,17 +172,49 @@ grep -qxF "Exec=/usr/bin/env \"REMNIFOLD_HOME=$REMNIFOLD_HOME\" \"$app\" update-
 grep -qxF 'X-GNOME-Autostart-enabled=true' "$autostart" || fail 'autostart is not enabled'
 grep -qxF "mcp add --scope user remnifold -- $app mcp" "$STUB_LOG_DIR/claude.log" || fail 'claude mcp add was not called with the AppImage'
 grep -qxF "mcp add remnifold -- $app mcp" "$STUB_LOG_DIR/codex.log" || fail 'codex mcp add was not called with the AppImage'
-python3 - "$CLAUDE_CONFIG_DIR/settings.json" "$app" <<'PY' || fail 'Claude Code hooks do not point at the AppImage'
+# 接続設定が無い（自動想起は off）ので、想起用の SessionStart・UserPromptSubmit は登録しない。
+hooks_are() {
+  python3 - "$CLAUDE_CONFIG_DIR/settings.json" "$app" "$@" <<'PY'
 import json, sys
-settings, app = json.load(open(sys.argv[1])), sys.argv[2]
-commands = [h["command"] for event in ("SessionStart", "UserPromptSubmit", "Stop", "PreToolUse") for e in settings["hooks"][event] for h in e["hooks"]]
+settings, app, expected = json.load(open(sys.argv[1])), sys.argv[2], sorted(sys.argv[3:])
+events = sorted(settings["hooks"])
+assert events == expected, events
+commands = [h["command"] for event in events for e in settings["hooks"][event] for h in e["hooks"]]
 assert commands and all(f'"{app}" hook ' in c for c in commands), commands
 PY
+}
+hooks_are PreToolUse Stop || fail 'Claude Code hooks do not point at the AppImage or include recall hooks while recall is off'
+[[ "$(json "$registration" 'v["recall"]')" = False ]] || fail 'the registered recall mode is not off'
 claude_calls="$(wc -l < "$STUB_LOG_DIR/claude.log")"; codex_calls="$(wc -l < "$STUB_LOG_DIR/codex.log")"
 # 2回目の起動は状態ファイルを読むだけで、CLI を呼ばない。
 timeout 60 "$app" </dev/null >/dev/null 2>>"$work/mcp-a.err" || fail 'the second launch failed'
 [[ "$(wc -l < "$STUB_LOG_DIR/claude.log")" = "$claude_calls" && "$(wc -l < "$STUB_LOG_DIR/codex.log")" = "$codex_calls" ]] || fail 'the second launch called a CLI again'
 echo 'registered once; the second launch was a no-op'
+# 自動想起を on にすると次の起動でフックだけを張り直し（CLI は呼ばない）、off に戻すと外す。
+# 接続先は使わない（引数なしの起動は stdin を閉じた mcp として終わり、API を呼ばない）。以降も off のまま残す。
+connection="$REMNIFOLD_HOME/remnifold.json"
+printf '{"baseUrl":"https://remnifold.invalid","apiKey":"e2e-placeholder","recallMode":"direct"}\n' > "$connection"
+timeout 60 "$app" </dev/null >/dev/null 2>>"$work/mcp-a.err" || fail 'the launch after enabling recall failed'
+hooks_are PreToolUse SessionStart Stop UserPromptSubmit || fail 'enabling recall did not register the recall hooks'
+printf '{"baseUrl":"https://remnifold.invalid","apiKey":"e2e-placeholder","recallMode":"off"}\n' > "$connection"
+timeout 60 "$app" </dev/null >/dev/null 2>>"$work/mcp-a.err" || fail 'the launch after disabling recall failed'
+hooks_are PreToolUse Stop || fail 'disabling recall did not remove the recall hooks'
+# 移行: 以前の版の状態（4つのフックを登録済みで、状態ファイルに recall が無い）から、off なら想起用のフックを外す。
+printf '{"baseUrl":"https://remnifold.invalid","apiKey":"e2e-placeholder","recallMode":"direct"}\n' > "$connection"
+timeout 60 "$app" </dev/null >/dev/null 2>>"$work/mcp-a.err" || fail 'the launch before the migration check failed'
+hooks_are PreToolUse SessionStart Stop UserPromptSubmit || fail 'the recall hooks were not registered before the migration check'
+python3 - "$registration" <<'PY' || fail 'the registration state could not be made legacy'
+import json, sys
+state = json.load(open(sys.argv[1]))
+state.pop("recall")
+json.dump(state, open(sys.argv[1], "w"))
+PY
+printf '{"baseUrl":"https://remnifold.invalid","apiKey":"e2e-placeholder","recallMode":"off"}\n' > "$connection"
+timeout 60 "$app" </dev/null >/dev/null 2>>"$work/mcp-a.err" || fail 'the launch for the migration failed'
+hooks_are PreToolUse Stop || fail 'the migration did not remove the recall hooks'
+[[ "$(json "$registration" 'v["recall"]')" = False ]] || fail 'the migration did not record the recall mode'
+[[ "$(wc -l < "$STUB_LOG_DIR/claude.log")" = "$claude_calls" && "$(wc -l < "$STUB_LOG_DIR/codex.log")" = "$codex_calls" ]] || fail 'switching recall called a CLI'
+echo 'recall hooks follow recallMode and migrate without CLI calls'
 
 # ───────────── B. 複数の mcp を同時に起動しても取得は1回 ─────────────
 step 'B. concurrent mcp sessions download once'

@@ -8,7 +8,10 @@
 //!   実行すべきコマンドを表示して利用者に任せる（設定ファイルを直接書き換えない）。
 //! - フック（SessionStart・UserPromptSubmit・Stop・PreToolUse）は settings.json へ統合する。
 //!   既存の Remnifold 用の項目（旧ランチャー経由を含む）だけを置き換え、他の設定は保つ。
+//!   自動想起（`recallMode`）が off のときは、想起だけに使う SessionStart・UserPromptSubmit を登録せず、
+//!   既にある Remnifold の項目も外す（保存の Stop と読み取り許可の PreToolUse は残す）。
 //!   壊れた settings.json は書き換えずに止め、初回の書換え前に元の内容を退避する。
+//!
 //! Codex:
 //! - MCP サーバーを公式 CLI（`codex mcp add`）で登録する。フックはプラグイン以外から登録する公式手段が
 //!   無いため登録しない（索引の自動想起と保存は Claude Code のフックで行う）。
@@ -92,24 +95,67 @@ fn run_cli<S: AsRef<OsStr>>(cli: &Path, args: &[S], bounded: bool) -> Result<Opt
 }
 
 /// 登録するフック。マッチャー・タイムアウト・非同期・表示文言はパッケージの hooks.json と揃える。
-const HOOKS: [(&str, Option<&str>, u64, bool, &str); 4] = [
+/// 最後の値は、自動想起（注入）だけに使うフックか（`recallMode` が off なら登録しない）。
+/// イベント名・マッチャー・タイムアウト（秒）・非同期・表示文言・想起専用か。
+type HookDef = (
+    &'static str,
+    Option<&'static str>,
+    u64,
+    bool,
+    &'static str,
+    bool,
+);
+
+const HOOKS: [HookDef; 4] = [
     (
         "PreToolUse",
         Some("^mcp__remnifold__"),
         5,
         false,
         "Checking memory access...",
+        false,
     ),
-    ("SessionStart", None, 30, false, "Loading memory index..."),
+    (
+        "SessionStart",
+        None,
+        30,
+        false,
+        "Loading memory index...",
+        true,
+    ),
     (
         "UserPromptSubmit",
         None,
         12,
         false,
         "Searching memory index...",
+        true,
     ),
-    ("Stop", None, 120, true, "Saving memory index..."),
+    ("Stop", None, 120, true, "Saving memory index...", false),
 ];
+
+/// 自動想起（注入）が有効か。フックの実行時（`hooks::run_hook`）と同じ判定にする: 接続設定を読めない
+/// ときも同じ代わりの設定から [`crate::common::read_settings`] で `recallMode` を読み、無ければ off。
+pub fn recall_enabled() -> bool {
+    use crate::common::{Config, codex_home, load_config, read_settings};
+    let config = load_config(None).unwrap_or_else(|_| Config {
+        base_url: String::new(),
+        api_key: String::new(),
+        raw: json!({}),
+        codex_home: codex_home(),
+        roots: crate::paths::Roots::current(),
+    });
+    read_settings(&config)["recallMode"] != "off"
+}
+
+/// `recall` のときに登録するフックのイベント名。
+fn registered_events(recall: bool) -> Vec<&'static str> {
+    HOOKS
+        .iter()
+        .filter(|hook| recall || !hook.5)
+        .map(|hook| hook.0)
+        .collect()
+}
 
 pub fn run(args: &[String]) -> Result<()> {
     let Some(tool) = args.first().map(String::as_str) else {
@@ -178,7 +224,7 @@ pub fn run(args: &[String]) -> Result<()> {
         executable.display()
     );
     let result = match tool {
-        "claude-code" => claude_code(&executable, cli, apply, false)?,
+        "claude-code" => claude_code(&executable, cli, apply, false, recall_enabled())?,
         "codex" => codex(&executable, cli, apply, false)?,
         _ => bail!("Unknown tool. Use claude-code or codex."),
     };
@@ -209,7 +255,8 @@ fn is_remnifold_entry(entry: &Value, event: &str) -> bool {
 }
 
 /// settings.json の値へ Remnifold のフックを統合する（何度実行しても同じ結果になる）。
-fn merge_hooks(settings: &mut Value, executable: &Path) -> Result<()> {
+/// `recall` が false なら想起用のフックは登録せず、既にある Remnifold の項目を外す（空になったイベントは消す）。
+fn merge_hooks(settings: &mut Value, executable: &Path, recall: bool) -> Result<()> {
     ensure!(
         settings.is_object(),
         "Claude Code settings must be a JSON object; it was not changed."
@@ -221,7 +268,7 @@ fn merge_hooks(settings: &mut Value, executable: &Path) -> Result<()> {
         settings["hooks"].is_object(),
         "Claude Code settings has a non-object \"hooks\" value; it was not changed."
     );
-    for (event, matcher, timeout, asynchronous, status) in HOOKS {
+    for (event, matcher, timeout, asynchronous, status, recall_only) in HOOKS {
         let mut entries = match settings["hooks"].get(event) {
             None => Vec::new(),
             Some(Value::Array(items)) => items.clone(),
@@ -230,6 +277,17 @@ fn merge_hooks(settings: &mut Value, executable: &Path) -> Result<()> {
             ),
         };
         entries.retain(|entry| !is_remnifold_entry(entry, event));
+        if recall_only && !recall {
+            if entries.is_empty() {
+                settings["hooks"]
+                    .as_object_mut()
+                    .expect("checked above")
+                    .remove(event);
+            } else {
+                settings["hooks"][event] = Value::Array(entries);
+            }
+            continue;
+        }
         let mut hook = json!({
             "type":"command",
             "command": hook_command(executable, event)?,
@@ -262,6 +320,7 @@ fn claude_code(
     cli: Option<PathBuf>,
     apply: bool,
     bounded: bool,
+    recall: bool,
 ) -> Result<Value> {
     let settings_path = claude_settings_path();
     let mut settings = match fs::read(&settings_path) {
@@ -272,14 +331,15 @@ fn claude_code(
         Err(_) => bail!("Claude Code settings could not be read."),
     };
     let before = settings.clone();
-    merge_hooks(&mut settings, executable)?;
+    merge_hooks(&mut settings, executable, recall)?;
     let mcp_args = mcp_add_args(executable, true);
     let mut result = json!({
         "tool":"claude-code",
         "applied":apply,
         "executable":executable,
         "settings":settings_path,
-        "hooks": HOOKS.iter().map(|(event, ..)| event).collect::<Vec<_>>(),
+        "hooks": registered_events(recall),
+        "recallHooks": recall,
         "hooksChanged": settings != before,
         "mcpCommand": format!("claude {}", display_args(&mcp_args))
     });
@@ -520,10 +580,18 @@ pub fn tool_registration_worst_case() -> Duration {
 }
 
 /// 指定の CLI を1つだけ登録する（Setup 版の登録で、未完了の CLI をやり直すために使う）。
-/// 未知の名前は CLI が無いものとして扱う。どの失敗も例外にしない。
-pub fn register_tool_for_setup(executable: &Path, tool: &'static str) -> SetupOutcome {
+/// 未知の名前は CLI が無いものとして扱う。どの失敗も例外にしない。`recall` は [`recall_enabled`] の値。
+pub fn register_tool_for_setup(
+    executable: &Path,
+    tool: &'static str,
+    recall: bool,
+) -> SetupOutcome {
     let claude = tool == "claude";
-    let Some(cli) = SETUP_TOOLS.contains(&tool).then(|| find_cli(tool)).flatten() else {
+    let Some(cli) = SETUP_TOOLS
+        .contains(&tool)
+        .then(|| find_cli(tool))
+        .flatten()
+    else {
         return SetupOutcome {
             tool,
             done: false,
@@ -531,7 +599,7 @@ pub fn register_tool_for_setup(executable: &Path, tool: &'static str) -> SetupOu
         };
     };
     let outcome = if claude {
-        claude_code(executable, Some(cli), true, true)
+        claude_code(executable, Some(cli), true, true, recall)
     } else {
         codex(executable, Some(cli), true, true)
     };
@@ -552,11 +620,12 @@ pub fn register_tool_for_setup(executable: &Path, tool: &'static str) -> SetupOu
     }
 }
 
-/// 更新の後に、Claude Code の settings.json にある Remnifold のフックだけを最新の定義へ張り直す。
+/// 更新の後や自動想起の切り替えの後に、Claude Code の settings.json にある Remnifold のフックだけを
+/// 最新の定義（`recall` に応じたイベント）へ張り直す。
 /// CLI は呼ばない（MCP の登録は実行ファイルのパスが変わらない限り有効なままで、使用中のセッションの
 /// 設定を CLI で外して付け直すことを避けるため）。この実行ファイルを指す Remnifold のフックが1つも
-/// 無ければ（利用者が外した・未登録）、何も書かない。
-pub fn refresh_claude_hooks_for_setup(executable: &Path) -> String {
+/// 無ければ（利用者が外した・未登録）、何も書かない。返す bool は、張り直しが済んだ（変更不要を含む）か。
+pub fn refresh_claude_hooks_for_setup(executable: &Path, recall: bool) -> (bool, String) {
     let outcome = (|| -> Result<bool> {
         let settings_path = claude_settings_path();
         let bytes = match fs::read(&settings_path) {
@@ -578,7 +647,7 @@ pub fn refresh_claude_hooks_for_setup(executable: &Path) -> String {
             return Ok(false);
         }
         let before = settings.clone();
-        merge_hooks(&mut settings, executable)?;
+        merge_hooks(&mut settings, executable, recall)?;
         if settings == before {
             return Ok(false);
         }
@@ -594,9 +663,9 @@ pub fn refresh_claude_hooks_for_setup(executable: &Path) -> String {
         Ok(true)
     })();
     match outcome {
-        Ok(true) => "claude: hooks updated".to_string(),
-        Ok(false) => "claude: hooks unchanged".to_string(),
-        Err(error) => format!("claude: hooks failed: {error}"),
+        Ok(true) => (true, "claude: hooks updated".to_string()),
+        Ok(false) => (true, "claude: hooks unchanged".to_string()),
+        Err(error) => (false, format!("claude: hooks failed: {error}")),
     }
 }
 
@@ -812,9 +881,9 @@ mod tests {
                 "Notification":[{"hooks":[{"type":"command","command":"notify"}]}]
             }
         });
-        merge_hooks(&mut settings, &exe).unwrap();
+        merge_hooks(&mut settings, &exe, true).unwrap();
         let once = settings.clone();
-        merge_hooks(&mut settings, &exe).unwrap();
+        merge_hooks(&mut settings, &exe, true).unwrap();
         assert_eq!(settings, once);
         assert_eq!(settings["model"], "keep");
         assert_eq!(
@@ -838,11 +907,48 @@ mod tests {
     }
 
     #[test]
+    fn hooks_merge_follows_the_recall_mode_in_both_directions() {
+        let exe = std::env::temp_dir().join("Remnifold App/bin/remnifold.exe");
+        let mut settings = json!({
+            "hooks":{
+                "SessionStart":[{"hooks":[{"type":"command","command":"other-tool start"}]}]
+            }
+        });
+        merge_hooks(&mut settings, &exe, true).unwrap();
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2
+        );
+        assert!(settings["hooks"]["UserPromptSubmit"].is_array());
+        // off にすると想起用の項目だけが外れ、他社の項目・保存・読み取り許可は残る。
+        merge_hooks(&mut settings, &exe, false).unwrap();
+        let off = settings.clone();
+        merge_hooks(&mut settings, &exe, false).unwrap();
+        assert_eq!(settings, off);
+        assert_eq!(
+            settings["hooks"]["SessionStart"],
+            json!([{"hooks":[{"type":"command","command":"other-tool start"}]}])
+        );
+        assert!(settings["hooks"].get("UserPromptSubmit").is_none());
+        assert!(settings["hooks"]["Stop"].is_array());
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+        // 戻すと再び登録される。
+        merge_hooks(&mut settings, &exe, true).unwrap();
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2
+        );
+        assert!(settings["hooks"]["UserPromptSubmit"].is_array());
+        assert_eq!(registered_events(false), ["PreToolUse", "Stop"]);
+        assert_eq!(registered_events(true).len(), 4);
+    }
+
+    #[test]
     fn hooks_merge_refuses_malformed_settings_and_unsafe_paths() {
         let exe = std::env::temp_dir().join("bin/remnifold");
-        assert!(merge_hooks(&mut json!([]), &exe).is_err());
-        assert!(merge_hooks(&mut json!({"hooks":[]}), &exe).is_err());
-        assert!(merge_hooks(&mut json!({"hooks":{"Stop":{}}}), &exe).is_err());
+        assert!(merge_hooks(&mut json!([]), &exe, true).is_err());
+        assert!(merge_hooks(&mut json!({"hooks":[]}), &exe, true).is_err());
+        assert!(merge_hooks(&mut json!({"hooks":{"Stop":{}}}), &exe, false).is_err());
         assert!(hook_command(Path::new("/tmp/a\"b/remnifold"), "Stop").is_err());
         assert!(hook_command(Path::new("/tmp/$HOME/remnifold"), "Stop").is_err());
     }
@@ -858,7 +964,7 @@ mod tests {
                 "Notification":[{"hooks":[{"type":"command","command":"notify"}]}]
             }
         });
-        merge_hooks(&mut settings, &exe).unwrap();
+        merge_hooks(&mut settings, &exe, true).unwrap();
         // 別の実行ファイルを指す指定では何も消えない。
         let mut untouched = settings.clone();
         remove_hooks(&mut untouched, Some(&other)).unwrap();
@@ -880,7 +986,7 @@ mod tests {
         assert!(settings["hooks"].get("Stop").is_none());
         // Remnifold しか無い設定では hooks ごと消える。
         let mut only = json!({"hooks":{}});
-        merge_hooks(&mut only, &exe).unwrap();
+        merge_hooks(&mut only, &exe, true).unwrap();
         remove_hooks(&mut only, None).unwrap();
         assert_eq!(only, json!({}));
         // 形が想定外の設定は変更せず拒否する。
