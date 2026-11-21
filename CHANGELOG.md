@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.37 - 2026-11-21
+
+### 変更
+
+- 自動想起を切っている（`recallMode: "off"`、既定）ときは、Claude Code の `settings.json` に想起用の `SessionStart`・`UserPromptSubmit` フックを登録せず、既にある Remnifold の項目も外すようにしました。プロンプトごとに何もしないフックが起動し「Searching memory index...」が表示されることがなくなります。保存の `Stop` フックと読み取り許可の `PreToolUse` フックは残します。Setup 版は `setup-registration.json` に登録時の on/off を覚え、`remnifold.json` の `recallMode` を変えた後の最初の `mcp` 起動・引数なしの起動・ログオン時に、CLI を呼ばずにフックだけを張り直します（Claude Code ではその次のセッションから反映されます）。既存の利用者の移行として、この版への更新後の張り直し（または `recall` の項目が無い古い状態ファイルでの最初の起動）で、off なら想起用のフックを外します。Claude の登録が状態ファイルに無くても、この実行ファイルを指す Remnifold のフックがあれば移行します。strict の `install` 経路（1.0.32 で凍結）で登録したフックは4つのまま残り、off では即座に戻ります。現在の版の実行ファイルで `connect claude-code --apply` を実行すると同じ規則で登録し直せます。プラグインパッケージの `hooks/hooks.json` は固定のままで、off のフックは何もせずに戻ります。
+
 ## 1.0.36 - 2026-11-21
 
 ### 変更
