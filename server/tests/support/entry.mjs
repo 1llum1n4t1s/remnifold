@@ -22,11 +22,13 @@ import "../trigger-update-columns.test.mjs";
 import "../capture-conflict-single-body.test.mjs";
 import "../consolidation-due.test.mjs";
 import "../fact-candidates.test.mjs";
+import "../fact-order.test.mjs";
 import "../visibility-statements.test.mjs";
 import "../consolidation-targets.test.mjs";
 import "../add-memory-load.test.mjs";
 import "../embedding-first.test.mjs";
 import "../embedding-retry.test.mjs";
+import "../extraction-retry.test.mjs";
 class TestDatabase {
   constructor(ctx) {
     this.ctx = ctx;

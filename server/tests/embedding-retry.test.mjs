@@ -43,7 +43,9 @@ async function stuck(f, customId, content, { status = "processing", age = 30 } =
 const row = (f, id) => f.db.prepare(`SELECT embedding_status, vector_status, fact_status, topic_status, topic_revision, updated_at, enrichment_error,
   embedding_json IS NOT NULL AS has_embedding, is_forgotten FROM memories WHERE id = ?`).get(id);
 const retry = (f, id) => f.db.prepare("SELECT source_revision, attempts, next_attempt_at FROM memory_embedding_retries WHERE memory_id = ?").get(id);
-const cron = async (f, name = CRON) => { worker.scheduled({ cron: name, scheduledTime: Date.now() }, f.env, f.ctx); return f.drain(); };
+// 抽出の拾い直し（毎時15分・45分の枠だけ）に当たらない固定時刻（毎時0分）。このテストは埋め込みだけを対象にする。
+const OUT_OF_EXTRACTION_SLOT = Date.UTC(2026, 5, 1, 0, 0);
+const cron = async (f, name = CRON) => { worker.scheduled({ cron: name, scheduledTime: OUT_OF_EXTRACTION_SLOT }, f.env, f.ctx); return f.drain(); };
 const withFixture = (name, run, options) => test(name, async () => {
   const f = fixture(options);
   try { await run(f); } finally { await f.drain(); f.db.close(); }

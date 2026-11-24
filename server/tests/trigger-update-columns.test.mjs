@@ -27,7 +27,7 @@ const payload = (batch) => ({ batchId: batch.batchId,
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b[0-9a-f]{64}\b|\b[0-9a-f]{32}\b/g;
 const TIME = /\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z/g;
 function snapshot(f) {
-  const tables = f.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'memories_fts%' AND name <> 'memory_embedding_retries' ORDER BY name").all().map((row) => row.name);
+  const tables = f.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'memories_fts%' AND name NOT IN ('memory_embedding_retries', 'memory_extraction_retries', 'memory_extraction_retry_slot') ORDER BY name").all().map((row) => row.name);
   const dump = {};
   for (const name of tables) {
     let rows;

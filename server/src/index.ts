@@ -1641,10 +1641,30 @@ async function restoreUnsupportedFacts(env: Env, containerTag: string): Promise<
   await restoreUnsupportedFactsStatement(env, containerTag).run();
 }
 
-async function replaceFacts(memory: EnrichmentMemory, facts: ExtractedFact[], env: Env): Promise<void> {
-  const currentGuard =
-    "SELECT 1 FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0";
+type ReplaceFactsOptions = {
+  // facts.updated_at だけに使う（既定は now）。
+  factUpdatedAt?: string;
+};
+
+function sourceProjectExpression(alias: string): string {
+  return `CASE
+    WHEN json_type(${alias}.metadata_json, '$.sm_project_id') = 'text'
+      THEN json_extract(${alias}.metadata_json, '$.sm_project_id')
+    ELSE ${alias}.container_tag
+  END`;
+}
+
+// 事実の新旧は元記録の (updated_at, id) で決める。抽出が遅れた古い記録が新しい事実を上書きしない。
+// 同じ組の active が4件以上あるときは、順方向が上位3件に限られるため完全な順序独立にはならない（既知の制約）。
+async function replaceFacts(
+  memory: EnrichmentMemory,
+  facts: ExtractedFact[],
+  env: Env,
+  options: ReplaceFactsOptions = {},
+): Promise<void> {
+  const currentGuard = `SELECT 1 FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0`;
   const now = new Date().toISOString();
+  const factUpdatedAt = options.factUpdatedAt ?? now;
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `DELETE FROM facts
@@ -1681,7 +1701,7 @@ async function replaceFacts(memory: EnrichmentMemory, facts: ExtractedFact[], en
         fact.exclusive ? 1 : 0,
         fact.confidence,
         now,
-        now,
+        factUpdatedAt,
         memory.id,
         memory.topicRevision,
       ),
@@ -1701,11 +1721,8 @@ async function replaceFacts(memory: EnrichmentMemory, facts: ExtractedFact[], en
            JOIN memories AS previous_source ON previous_source.id = candidate.source_memory_id
            WHERE candidate.container_tag = ? AND candidate.subject_key = ? AND candidate.predicate_key = ?
              AND candidate.status = 'active' AND candidate.source_memory_id <> ?
-             AND CASE
-                   WHEN json_type(previous_source.metadata_json, '$.sm_project_id') = 'text'
-                     THEN json_extract(previous_source.metadata_json, '$.sm_project_id')
-                   ELSE previous_source.container_tag
-                 END = ?
+             AND ${sourceProjectExpression("previous_source")} = ?
+             AND (candidate.object_key = ? OR (previous_source.updated_at, previous_source.id) < (?, ?))
            ORDER BY candidate.updated_at DESC, candidate.rowid LIMIT 3
          ) AS previous
          WHERE (previous.object_key = ? OR ? = 1)
@@ -1723,6 +1740,9 @@ async function replaceFacts(memory: EnrichmentMemory, facts: ExtractedFact[], en
         predicateKey,
         memory.id,
         memory.projectId ?? memory.containerTag,
+        objectKey,
+        memory.updatedAt,
+        memory.id,
         objectKey,
         fact.exclusive ? 1 : 0,
         memory.id,
@@ -1748,6 +1768,48 @@ async function replaceFacts(memory: EnrichmentMemory, facts: ExtractedFact[], en
     }
   }
   statements.push(...supersedeStatements);
+  if (facts.length > 0) {
+    // 自分より新しい（元記録の (updated_at, id)）排他的な事実が既にあるなら、自分が置き換えられる。
+    statements.push(
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO fact_relations(
+           id, container_tag, from_fact_id, relation, to_fact_id,
+           source_memory_id, confidence, created_at
+         )
+         SELECT lower(hex(randomblob(16))), own.container_tag, newer.id, 'supersedes', own.id,
+                newer.source_memory_id, MIN(own.confidence, newer.confidence), ?
+         FROM facts AS own INDEXED BY idx_facts_source
+         CROSS JOIN facts AS newer INDEXED BY idx_facts_identity
+           ON newer.container_tag = own.container_tag AND newer.subject_key = own.subject_key
+          AND newer.predicate_key = own.predicate_key AND newer.status = 'active'
+         CROSS JOIN memories AS s ON s.id = newer.source_memory_id
+         WHERE own.source_memory_id = ? AND newer.source_memory_id <> own.source_memory_id
+           AND newer.is_exclusive = 1 AND newer.object_key <> own.object_key
+           AND s.is_forgotten = 0 AND (s.updated_at, s.id) > (?, ?)
+           AND ${sourceProjectExpression("s")} = ?
+           AND EXISTS (${currentGuard})`,
+      ).bind(
+        now,
+        memory.id,
+        memory.updatedAt,
+        memory.id,
+        memory.projectId ?? memory.containerTag,
+        memory.id,
+        memory.topicRevision,
+      ),
+      // restoreUnsupportedFactsStatement の正確な裏返し（往復を防ぐ）。updated_at は変えない。
+      env.DB.prepare(
+        `UPDATE facts INDEXED BY idx_facts_source SET status = 'superseded'
+         WHERE source_memory_id = ? AND status = 'active' AND EXISTS (
+           SELECT 1 FROM fact_relations AS relation
+           JOIN facts AS newer ON newer.id = relation.from_fact_id
+           JOIN memories AS source ON source.id = newer.source_memory_id
+           WHERE relation.to_fact_id = facts.id AND relation.relation = 'supersedes'
+             AND newer.status = 'active' AND source.is_forgotten = 0)
+         AND EXISTS (${currentGuard})`,
+      ).bind(memory.id, memory.id, memory.topicRevision),
+    );
+  }
   await env.DB.batch(statements);
 }
 
@@ -3503,8 +3565,252 @@ async function retryMissingEmbeddings(env: Env): Promise<void> {
   if (failures[0]) throw failures[0].reason;
 }
 
-// 15分 cron: 前段（照合）が失敗しても拾い直しを実行し、前段の例外を最後に再送出する。
-async function runVectorMaintenance(env: Env): Promise<void> {
+// 抽出（事実・トピック）の拾い直しの設定。Workers AI の消費を抑える値をここだけに置く。
+// 件数を減らすときは EXTRACTION_RETRY_INTERVAL_MINUTES を大きくする（30分に1件＝48件/日、60分なら24件/日）。
+const EXTRACTION_RETRY_INTERVAL_MINUTES = 30;
+const EXTRACTION_RETRY_CRON_PERIOD_MINUTES = 15;
+// その日（UTC）の新規がこの件数以上なら、通常の補強で無料枠を使うため拾わない。
+const EXTRACTION_RETRY_BUSY_DAY_THRESHOLD = 300;
+const EXTRACTION_RETRY_MAX_ATTEMPTS = 3;
+const EXTRACTION_RETRY_TIMEOUT_MS = 180_000;
+const EXTRACTION_RETRY_CONTENT_LENGTH = 8_000;
+const EXTRACTION_PENDING_STATUSES = "('pending','processing','failed')";
+// 期限付き一括モード（env.EXTRACTION_BACKLOG_UNTIL）。滞留を一時的に早く片付ける。期限の7日前から有効になる。
+const EXTRACTION_BACKLOG_BATCH_SIZE = 20;
+const EXTRACTION_BACKLOG_CONCURRENCY = 4;
+const EXTRACTION_BACKLOG_START_LIMIT_MS = 8 * 60_000;
+const EXTRACTION_BACKLOG_MAX_AHEAD_MS = 7 * 24 * 60 * 60_000;
+
+// scheduledTime の15分枠のうち、間隔に当たる枠（既定は毎時15分と45分）の枠番号を返す。当たらなければ null。
+// EXTRACTION_RETRY_CRON_PERIOD_MINUTES は wrangler.jsonc の cron（*/15）と合わせる前提。切り上げるので設定した間隔より頻繁にならない。
+function extractionRetrySlot(scheduledTime: number): number | null {
+  if (!Number.isFinite(scheduledTime)) return null;
+  const slots = Math.max(1, Math.ceil(EXTRACTION_RETRY_INTERVAL_MINUTES / EXTRACTION_RETRY_CRON_PERIOD_MINUTES));
+  const period = Math.floor(scheduledTime / (EXTRACTION_RETRY_CRON_PERIOD_MINUTES * 60_000));
+  // 枠番号は15分枠の開始時刻（分）。間隔の定数を変えても減らないので、確保が止まらない。
+  return period % slots === slots - 1 ? period * EXTRACTION_RETRY_CRON_PERIOD_MINUTES : null;
+}
+
+// 同じ枠（同じ scheduledTime の重複起動を含む）で AI を2回呼ばないよう、枠番号を1文で確保する。大きい時だけ更新し、changes=0 なら呼ばない。
+async function claimExtractionRetrySlot(slot: number, env: Env): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `INSERT INTO memory_extraction_retry_slot(id,slot) VALUES(1,?)
+     ON CONFLICT(id) DO UPDATE SET slot=excluded.slot WHERE excluded.slot>memory_extraction_retry_slot.slot`,
+  ).bind(slot).run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function extractionRetryBusyDay(env: Env, scheduledTime: number): Promise<boolean> {
+  const dayStart = `${new Date(scheduledTime).toISOString().slice(0, 10)}T00:00:00.000Z`;
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM (SELECT 1 FROM memories WHERE created_at>=? LIMIT ${EXTRACTION_RETRY_BUSY_DAY_THRESHOLD})`,
+  ).bind(dayStart).first<{ n: number }>();
+  return (row?.n ?? 0) >= EXTRACTION_RETRY_BUSY_DAY_THRESHOLD;
+}
+
+// 抽出が未完了のまま残った行の候補条件（部分索引 idx_memories_extraction_backlog と同じ条件を含める）。
+// 通常の補強と /v4/enrich の埋め込み（20分以内）、整理のまとめ、recallable:false、topic_revision なしは対象にしない。
+function extractionRetryCandidate(alias: string): string {
+  return `${alias}.is_forgotten=0 AND ${alias}.embedding_status='done'
+    AND (${alias}.fact_status IN ${EXTRACTION_PENDING_STATUSES} OR ${alias}.topic_status IN ${EXTRACTION_PENDING_STATUSES})
+    AND ${alias}.topic_revision IS NOT NULL
+    AND ${alias}.updated_at<strftime('%Y-%m-%dT%H:%M:%fZ','now','-20 minutes')
+    AND ${alias}.embedded_at<strftime('%Y-%m-%dT%H:%M:%fZ','now','-20 minutes')
+    AND json_extract(${alias}.metadata_json,'$.memoryIndex.recallable') IS NOT 0
+    AND NOT EXISTS(SELECT 1 FROM memory_organization_summaries s WHERE s.memory_id=${alias}.id)`;
+}
+
+type ExtractionRetryRow = {
+  id: string;
+  container_tag: string;
+  content: string;
+  updated_at: string;
+  topic_revision: string;
+  metadata_json: string;
+  fact_status: string;
+  topic_status: string;
+};
+
+// 拾い直しの権利を AI の前に確保する。試行回数と次回時刻（6時間、24時間）を1文で更新し、changes=0 なら呼ばない。
+async function claimExtractionRetry(row: Pick<ExtractionRetryRow, "id" | "updated_at" | "topic_revision">, env: Env): Promise<boolean> {
+  const attempts = `CASE WHEN memory_extraction_retries.source_revision=excluded.source_revision THEN memory_extraction_retries.attempts+1 ELSE 1 END`;
+  const result = await env.DB.prepare(
+    `INSERT INTO memory_extraction_retries(memory_id,source_revision,attempts,next_attempt_at)
+     SELECT m.id,m.topic_revision,1,strftime('%Y-%m-%dT%H:%M:%fZ','now','+360 minutes')
+     FROM memories m WHERE m.id=? AND m.topic_revision=? AND m.updated_at=? AND ${extractionRetryCandidate("m")}
+     ON CONFLICT(memory_id) DO UPDATE SET
+       source_revision=excluded.source_revision,
+       attempts=${attempts},
+       next_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ','now',CASE ${attempts} WHEN 1 THEN '+360 minutes' ELSE '+1440 minutes' END)
+     WHERE memory_extraction_retries.source_revision<>excluded.source_revision
+       OR (memory_extraction_retries.attempts<${EXTRACTION_RETRY_MAX_ATTEMPTS} AND memory_extraction_retries.next_attempt_at<=${SQL_NOW})`,
+  ).bind(row.id, row.topic_revision, row.updated_at).run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+// extractEnrichment を1回だけ呼ぶ。打ち切った後に遅れて返った結果は使わず、タイマーは必ず片付ける。
+async function extractWithTimeout(content: string, env: Env): Promise<PromiseSettledResult<ExtractedEnrichment>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    extractEnrichment(content, env).then(
+      (value): PromiseSettledResult<ExtractedEnrichment> => ({ status: "fulfilled", value }),
+      (reason): PromiseSettledResult<ExtractedEnrichment> => ({ status: "rejected", reason }),
+    ),
+    new Promise<PromiseSettledResult<ExtractedEnrichment>>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ status: "rejected", reason: new Error(`extraction retry timed out after ${EXTRACTION_RETRY_TIMEOUT_MS / 1000}s`) }),
+        EXTRACTION_RETRY_TIMEOUT_MS,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+const extractionPending = (status: string): boolean => status === "pending" || status === "processing" || status === "failed";
+
+// 未完了の側だけを書く。done・disabled の側は変えない。失敗した側は版条件付きで failed にし、エラー文を返す。
+async function persistExtractionRetry(
+  memory: EnrichmentMemory,
+  needs: { facts: boolean; topics: boolean },
+  result: PromiseSettledResult<ExtractedEnrichment>,
+  env: Env,
+): Promise<string[]> {
+  const errors: string[] = [];
+  const failFacts = (message: string) => {
+    errors.push(message);
+    return env.DB.prepare("UPDATE memories SET fact_status='failed' WHERE id=? AND updated_at=? AND topic_revision=? AND is_forgotten=0")
+      .bind(memory.id, memory.updatedAt, memory.topicRevision).run();
+  };
+  if (needs.facts) {
+    if (result.status === "rejected") await failFacts(`fact extraction: ${String(result.reason)}`);
+    else {
+      try {
+        await replaceFacts(memory, result.value.facts, env, { factUpdatedAt: memory.updatedAt });
+        await env.DB.prepare(
+          `UPDATE memories SET fact_status='done', fact_model=?, facts_extracted_at=?
+           WHERE id=? AND updated_at=? AND topic_revision=? AND is_forgotten=0`,
+        ).bind(FACT_MODEL, new Date().toISOString(), memory.id, memory.updatedAt, memory.topicRevision).run();
+      } catch (error) {
+        await failFacts(`fact graph: ${String(error)}`);
+      }
+    }
+  }
+  if (needs.topics) {
+    try {
+      if (result.status === "rejected") throw new Error(String(result.reason));
+      if (result.value.topics.length === 0) throw new Error("Workers AI returned no valid content topics");
+      await replaceTopics(memory, result.value.topics, FACT_MODEL, env);
+    } catch (error) {
+      errors.push(`topic classification: ${error instanceof Error ? error.message : String(error)}`);
+      await failTopics(memory, env);
+    }
+  }
+  return errors;
+}
+
+async function finishExtractionRetry(memory: EnrichmentMemory, errors: string[], env: Env): Promise<void> {
+  const state = await env.DB.prepare(
+    "SELECT fact_status, topic_status FROM memories WHERE id=? AND updated_at=? AND topic_revision=? AND is_forgotten=0",
+  ).bind(memory.id, memory.updatedAt, memory.topicRevision).first<{ fact_status: string; topic_status: string }>();
+  if (!state) return;
+  if (!extractionPending(state.fact_status) && !extractionPending(state.topic_status)) {
+    await env.DB.prepare("DELETE FROM memory_extraction_retries WHERE memory_id=? AND source_revision=?")
+      .bind(memory.id, memory.topicRevision).run();
+  }
+  // 抽出由来（"fact " / "topic classification: "）の記録だけを書き換える。埋め込みなど他の段階の記録は残す。
+  await env.DB.prepare(
+    `UPDATE memories SET enrichment_error=?
+     WHERE id=? AND updated_at=? AND topic_revision=? AND is_forgotten=0
+       AND (enrichment_error IS NULL OR enrichment_error LIKE 'fact %' OR enrichment_error LIKE 'topic classification: %')`,
+  ).bind(errors.length > 0 ? diagnosticError(errors.join("; "), env) : null, memory.id, memory.updatedAt, memory.topicRevision).run();
+}
+
+async function retryMissingExtraction(row: ExtractionRetryRow, env: Env): Promise<void> {
+  if (!(await claimExtractionRetry(row, env))) return;
+  const metadata = parseMetadata(row.metadata_json);
+  const explicitTopics = existingExplicitTopics(row.metadata_json);
+  const memory: EnrichmentMemory = {
+    id: row.id,
+    containerTag: row.container_tag,
+    content: truncateUtf16(row.content, EXTRACTION_RETRY_CONTENT_LENGTH),
+    updatedAt: row.updated_at,
+    topicRevision: row.topic_revision,
+    explicitTopics,
+    projectId: typeof metadata.sm_project_id === "string" ? metadata.sm_project_id : undefined,
+  };
+  const needs = { facts: extractionPending(row.fact_status), topics: extractionPending(row.topic_status) };
+  // 明示トピックはAIなしで保存する。残りが無ければAIを呼ばない。
+  if (needs.topics && explicitTopics) {
+    if (!enrichmentEnabled(env) || !(await memoryStillCurrent(memory, env))) return;
+    await replaceTopics(memory, explicitTopics, null, env);
+    needs.topics = false;
+  }
+  const errors: string[] = [];
+  if (needs.facts || needs.topics) {
+    const result = await extractWithTimeout(memory.content, env);
+    if (!enrichmentEnabled(env) || !(await memoryStillCurrent(memory, env))) return;
+    errors.push(...await persistExtractionRetry(memory, needs, result, env));
+    if (errors.length > 0) {
+      console.error(JSON.stringify({ event: "extraction_retry_failed", memoryId: memory.id, revision: memory.topicRevision, error: diagnosticError(errors.join("; "), env) }));
+    }
+  }
+  await finishExtractionRetry(memory, errors, env);
+}
+
+function extractionRetrySelect(limit: number): string {
+  return `SELECT m.id,m.container_tag,
+            CASE WHEN instr(m.content, char(0)) > 0 THEN m.content ELSE substr(m.content, 1, ${EXTRACTION_RETRY_CONTENT_LENGTH}) END AS content,
+            m.updated_at,m.topic_revision,m.metadata_json,m.fact_status,m.topic_status
+     FROM memories m
+     LEFT JOIN memory_extraction_retries r ON r.memory_id=m.id AND r.source_revision=m.topic_revision
+     WHERE ${extractionRetryCandidate("m")}
+       AND (r.memory_id IS NULL OR (r.attempts<${EXTRACTION_RETRY_MAX_ATTEMPTS} AND r.next_attempt_at<=${SQL_NOW}))
+     ORDER BY m.updated_at DESC LIMIT ${limit}`;
+}
+
+// 一括モードか。EXTRACTION_BACKLOG_UNTIL が ISO 8601 UTC（Z 付き）で、scheduledTime より後、かつ7日以内のときだけ true。
+function extractionBacklogActive(env: Env, scheduledTime: number): boolean {
+  const value = env.EXTRACTION_BACKLOG_UNTIL?.trim();
+  if (!value || !Number.isFinite(scheduledTime) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/u.test(value)) return false;
+  const until = Date.parse(value);
+  return until > scheduledTime && until <= scheduledTime + EXTRACTION_BACKLOG_MAX_AHEAD_MS;
+}
+
+// 一括モード: 15分枠ごとに最大 BATCH 件を同時 CONCURRENCY 件で処理する。忙しい日の判定は飛ばし、cron の処理開始（前段を含む）から8分を過ぎたら新しい行を始めない。
+// 候補・行の確保・3回・180秒・書き込みは通常の retryMissingExtraction をそのまま使う。1件の失敗で残りを止めず、最初の例外を最後に再送出する。
+async function retryMissingExtractionsBacklog(env: Env, scheduledTime: number, startedAt: number): Promise<void> {
+  const slot = Math.floor(scheduledTime / (EXTRACTION_RETRY_CRON_PERIOD_MINUTES * 60_000)) * EXTRACTION_RETRY_CRON_PERIOD_MINUTES;
+  const rows = (await env.DB.prepare(extractionRetrySelect(EXTRACTION_BACKLOG_BATCH_SIZE)).all<ExtractionRetryRow>()).results;
+  if (rows.length === 0 || !(await claimExtractionRetrySlot(slot, env))) return;
+  const failures: unknown[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < rows.length && Date.now() - startedAt < EXTRACTION_BACKLOG_START_LIMIT_MS) {
+      const row = rows[next++]!;
+      try {
+        await retryMissingExtraction(row, env);
+      } catch (error) {
+        failures.push(error);
+        console.error(JSON.stringify({ event: "extraction_retry_row_failed", memoryId: row.id, error: diagnosticError(error, env) }));
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: EXTRACTION_BACKLOG_CONCURRENCY }, worker));
+  if (failures.length > 0) throw failures[0];
+}
+
+// 1枠に最大1件。AI有効 → 時刻枠 → 忙しい日 → 候補1件 → 枠の確保 → 行の確保 → AI 1回の順に絞る。
+// 期限付きの一括モード（EXTRACTION_BACKLOG_UNTIL）の間だけ、上を飛ばして一括で処理する。
+async function retryMissingExtractions(env: Env, scheduledTime: number, startedAt: number): Promise<void> {
+  if (enrichmentEnabled(env) && extractionBacklogActive(env, scheduledTime)) return retryMissingExtractionsBacklog(env, scheduledTime, startedAt);
+  const slot = extractionRetrySlot(scheduledTime);
+  if (!enrichmentEnabled(env) || slot === null || await extractionRetryBusyDay(env, scheduledTime)) return;
+  const row = await env.DB.prepare(extractionRetrySelect(1)).first<ExtractionRetryRow>();
+  if (row && await claimExtractionRetrySlot(slot, env)) await retryMissingExtraction(row, env);
+}
+
+// 15分 cron: 前段が失敗しても次の段を実行し、最初の例外を最後に再送出する。
+async function runVectorMaintenance(env: Env, scheduledTime = Number.NaN): Promise<void> {
+  const startedAt = Date.now();
   let failure: { error: unknown } | undefined;
   try {
     await reconcileVectors(env);
@@ -3516,6 +3822,15 @@ async function runVectorMaintenance(env: Env): Promise<void> {
   } catch (error) {
     if (failure) {
       console.error(JSON.stringify({ event: "embedding_retry_failed_after_reconcile", error: diagnosticError(error, env) }));
+    } else {
+      failure = { error };
+    }
+  }
+  try {
+    await retryMissingExtractions(env, scheduledTime, startedAt);
+  } catch (error) {
+    if (failure) {
+      console.error(JSON.stringify({ event: "extraction_retry_failed_after_earlier", error: diagnosticError(error, env) }));
     } else {
       failure = { error };
     }
@@ -4441,7 +4756,7 @@ const worker = {
     const CONSOLIDATION_CRON = "0 18 * * *";
     const task = controller.cron === CONSOLIDATION_CRON
         ? runScheduledConsolidations(env, ctx)
-        : runVectorMaintenance(env);
+        : runVectorMaintenance(env, controller.scheduledTime);
     ctx.waitUntil(task.catch((error) => {
       console.error(JSON.stringify({ event: "scheduled_failed", cron: controller.cron, error: diagnosticError(error, env) }));
       throw error;

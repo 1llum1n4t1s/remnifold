@@ -3,6 +3,8 @@
 import test, { assert } from "./support/test.mjs";
 import worker from "../src/index.ts";
 import { checkpoint, embedding, fixture, migrations, output, scenarioWithLogs as scenario } from "./worker-fixture.mjs";
+// 15分cronの確認は、抽出の拾い直し（毎時15分・45分の枠）に当たらない固定時刻（毎時0分）で行う。
+const OUT_OF_EXTRACTION_SLOT = Date.UTC(2026, 5, 1, 0, 0);
 
 const scopeFilters = value => ({ AND: [{ key: "sm_scope", filterType: "metadata", value }] });
 function insertProfileFact(f, id, source, object, status = 'active') {
@@ -104,7 +106,7 @@ for (const subject of ['source-false','source-zero','checkpoint']) test(`0011 re
     f.env.AI_ENRICHMENT_MODE='off'; const deleted=[];
     f.env.MEMORY_VECTORS.getByIds=async ids=>ids.map(id=>({id}));
     f.env.MEMORY_VECTORS.deleteByIds=async ids=>{deleted.push(...ids);return {};};
-    worker.scheduled({cron:'*/15 * * * *',scheduledTime:Date.now()},f.env,f.ctx); await f.drain();
+    worker.scheduled({cron:'*/15 * * * *',scheduledTime:OUT_OF_EXTRACTION_SLOT},f.env,f.ctx); await f.drain();
     assert.ok(deleted.includes(first.memoryId));
     const automatic=await f.api('/v3/search',{containerTag:'memories',indexOnly:true});
     assert.ok(!automatic.body.results.some(m=>m.id===first.memoryId));
@@ -373,7 +375,7 @@ for (const recurring of [false, true]) scenario(`${recurring ? "recurring" : "in
 for (const cron of ["0 18 * * *", "*/15 * * * *"]) scenario(`cron ${cron} outer database failure logs and rejects`, async (f, logs) => {
   f.env.AI_ENRICHMENT_MODE = "on";
   f.DB.hooks.all = () => { throw new Error(`injected-cron-db-failure ${f.env.MEMORY_API_KEY}`); };
-  worker.scheduled({ cron, scheduledTime: Date.now() }, f.env, f.ctx);
+  worker.scheduled({ cron, scheduledTime: OUT_OF_EXTRACTION_SLOT }, f.env, f.ctx);
   const results = await f.drain(); assert.ok(results.some((r) => r.status === "rejected" && r.error.includes("injected-cron-db-failure")));
   const log = logs.find((entry) => entry.event === "scheduled_failed"); assert.equal(log?.cron, cron); assert.match(log.error, /injected-cron-db-failure/u);
   assert.ok(!JSON.stringify(logs).includes(f.env.MEMORY_API_KEY));
@@ -427,7 +429,7 @@ for (const failure of ["lookup", "delete", "upsert"]) scenario(`scheduled vector
     f.env.MEMORY_VECTORS.getByIds = async () => { if (failure === "lookup") throw providerFailure(f); return [{ id }]; };
     if (failure === "delete") f.env.MEMORY_VECTORS.deleteByIds = async () => { throw providerFailure(f); };
   }
-  worker.scheduled({ cron: "*/15 * * * *", scheduledTime: Date.now() }, f.env, f.ctx); await f.drain();
+  worker.scheduled({ cron: "*/15 * * * *", scheduledTime: OUT_OF_EXTRACTION_SLOT }, f.env, f.ctx); await f.drain();
   const row = f.db.prepare("SELECT vector_status, enrichment_error FROM memories WHERE id = ?").get(id);
   assert.equal(row.vector_status, failure === "upsert" ? "failed" : "pending");
   boundedDiagnostics(f, logs, failure === "upsert" ? "vector_reconcile_failed" : `forgotten_vector_${failure}_failed`);
