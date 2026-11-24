@@ -965,7 +965,47 @@ function isConsolidationDue(target: ConsolidationTarget, now: Date): boolean {
     (Number.isFinite(referenceTime) && referenceTime <= now.getTime() - CONSOLIDATION_AFTER_MS);
 }
 
+// projectKey 指定なしの集計。射影（忘却済みを持たない）から候補を絞り、memories は残った行だけを rowid で引く。
+// 絞り込みの条件は旧文（下の projectKey 指定時の文）と同じ。射影の recallable は json_extract(...) IS NOT 0 と同じ式で、
+// memory_rowid は memories.rowid。LIMIT -1 OFFSET 0 は候補をマテリアライズし、結合順を保つ。
+// 最終の SELECT・GROUP BY・ORDER BY は旧文と同じ。集計は MAX/MIN/COUNT とグループキー順なので走査順は結果に出ない。
+const CONSOLIDATION_TARGETS_ALL_SQL = `WITH candidate AS (
+       SELECT p.memory_rowid, COALESCE(p.topic_revision, p.updated_at) AS source_revision
+       FROM memory_search_projection AS p
+       WHERE p.recallable = 1
+         AND NOT EXISTS(SELECT 1 FROM memory_organization_versions WHERE memory_id=p.memory_id)
+         AND NOT EXISTS (
+           SELECT 1 FROM memory_consolidation_sources AS source
+           JOIN memory_consolidations AS consolidation
+             ON consolidation.id = source.consolidation_id AND consolidation.status = 'active'
+           WHERE source.memory_id = p.memory_id AND source.source_revision = COALESCE(p.topic_revision, p.updated_at)
+         )
+       LIMIT -1 OFFSET 0
+     ), u AS (
+       SELECT m.id, m.container_tag, m.created_at, candidate.source_revision,
+              ${CONSOLIDATION_PROJECT_KEY_SQL} AS project_key,
+              CASE WHEN json_type(m.metadata_json, '$.sm_project_id') = 'text'
+                    AND length(trim(json_extract(m.metadata_json, '$.sm_project_id'))) > 0
+                   THEN json_extract(m.metadata_json, '$.sm_project_id') END AS project_id
+       FROM candidate CROSS JOIN memories AS m ON m.rowid = candidate.memory_rowid
+       WHERE m.is_forgotten = 0
+         AND json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1
+     )
+     SELECT u.project_key AS projectKey, MAX(u.project_id) AS projectId,
+            MIN(u.container_tag) AS sourceContainerTag, COUNT(*) AS unconsolidatedCount,
+            MIN(u.created_at) AS oldestUnconsolidatedAt,
+            project.last_success_at AS lastSuccessAt,
+            project.initial_backfill_completed AS initialBackfillCompleted
+     FROM u
+     LEFT JOIN memory_consolidation_projects AS project ON project.project_key = u.project_key
+     GROUP BY u.project_key, project.last_success_at, project.initial_backfill_completed
+     ORDER BY oldestUnconsolidatedAt ASC`;
+
 async function consolidationTargets(env: Env, now: Date, projectKey?: string): Promise<ConsolidationTarget[]> {
+  if (projectKey === undefined) {
+    const all = await env.DB.prepare(CONSOLIDATION_TARGETS_ALL_SQL).all<ConsolidationTarget>();
+    return all.results.filter((target) => isConsolidationDue(target, now));
+  }
   const result = await env.DB.prepare(
     `WITH raw AS (
        SELECT m.id, m.container_tag, m.created_at,
@@ -1657,7 +1697,7 @@ async function replaceFacts(memory: EnrichmentMemory, facts: ExtractedFact[], en
                 previous.id, ?, MIN(?, previous.confidence), ?
          FROM (
            SELECT candidate.id, candidate.object_key, candidate.confidence
-           FROM facts AS candidate
+           FROM facts AS candidate INDEXED BY idx_facts_identity
            JOIN memories AS previous_source ON previous_source.id = candidate.source_memory_id
            WHERE candidate.container_tag = ? AND candidate.subject_key = ? AND candidate.predicate_key = ?
              AND candidate.status = 'active' AND candidate.source_memory_id <> ?
@@ -1666,7 +1706,7 @@ async function replaceFacts(memory: EnrichmentMemory, facts: ExtractedFact[], en
                      THEN json_extract(previous_source.metadata_json, '$.sm_project_id')
                    ELSE previous_source.container_tag
                  END = ?
-           ORDER BY candidate.updated_at DESC LIMIT 3
+           ORDER BY candidate.updated_at DESC, candidate.rowid LIMIT 3
          ) AS previous
          WHERE (previous.object_key = ? OR ? = 1)
            AND EXISTS (${currentGuard})
@@ -1873,9 +1913,9 @@ async function persistMemoryEmbedding(
           `UPDATE memories
            SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
            WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0
-             AND ${organizationVisible("memories",enrichmentEnabled(env))}${organizationAttemptFence(memory)}`,
+             AND ${organizationVisibleId("?",enrichmentEnabled(env))}${organizationAttemptFence(memory)}`,
         )
-          .bind(vectorMutationId(mutation), attemptedAt, memory.id, memory.updatedAt, memory.topicRevision,...organizationAttemptBindings(memory))
+          .bind(vectorMutationId(mutation), attemptedAt, memory.id, memory.updatedAt, memory.topicRevision, memory.id,...organizationAttemptBindings(memory))
           .run();
         if ((vectorUpdate.meta.changes ?? 0) === 0) {
           await deleteVectorAfterStaleUpsert(memory.id, env);
@@ -1917,13 +1957,26 @@ async function runMemoryEnrichment(memory: EnrichmentMemory, env: Env): Promise<
     .bind(memory.skipFacts ? 1 : 0, memory.explicitTopics ? 1 : 0, memory.id, memory.updatedAt, memory.topicRevision)
     .run();
 
-  const [embeddingResult, enrichmentResult] = await Promise.allSettled([
-    embedText(memory.content, env),
+  // 埋め込みは完了した時点で保存する。抽出が遅くて応答後の実行が打ち切られても、終わった埋め込みを失わない。
+  const embedAndPersist = async (): Promise<{ result: PromiseSettledResult<number[]>; errors: string[] | null }> => {
+    const result = await embedText(memory.content, env).then(
+      (value): PromiseSettledResult<number[]> => ({ status: "fulfilled", value }),
+      (reason): PromiseSettledResult<number[]> => ({ status: "rejected", reason }),
+    );
+    if (!(await memoryStillCurrent(memory, env))) return { result, errors: null };
+    return { result, errors: await persistMemoryEmbedding(memory, env, result) };
+  };
+  const [embeddedResult, enrichmentResult] = await Promise.allSettled([
+    embedAndPersist(),
     extractEnrichment(memory.content, env),
   ]);
-  if (!(await memoryStillCurrent(memory, env))) return;
+  // 保存連鎖の例外は、従来どおり事実を保存せず enrichMemory へ再送出する。
+  if (embeddedResult.status === "rejected") throw embeddedResult.reason;
+  const embedded = embeddedResult.value;
+  const embeddingResult = embedded.result;
+  if (embedded.errors === null || !(await memoryStillCurrent(memory, env))) return;
 
-  const errors = await persistMemoryEmbedding(memory, env, embeddingResult);
+  const errors = embedded.errors;
 
   if (memory.skipFacts) {
     // Consolidated checkpoints derive from source memories, so publishing their
@@ -3187,11 +3240,19 @@ async function getVectorsByIds(env: Env, ids: string[]): Promise<VectorizeVector
 async function reconcileForgottenVectors(env: Env): Promise<void> {
   const MAX_FORGOTTEN_VECTOR_SCAN = 100;
   const result = await env.DB.prepare(
-    `SELECT id FROM memories
-     WHERE is_forgotten = 1 OR NOT ${organizationVisible("memories",true)}
-     ORDER BY COALESCE(vector_attempted_at, updated_at) ASC
-     LIMIT ?`,
-  ).bind(MAX_FORGOTTEN_VECTOR_SCAN).all<{ id: string }>();
+    // 忘却済み（is_forgotten=1）と非表示の2枝を枝ごとに LIMIT して併合する。2枝が重ならず重複も出ないのは、
+    // memory_organization_hidden が 0009 のビュー定義で is_forgotten=0 の行だけを返すことが前提（変更時は同値を確かめ直す）。
+    // 同点の順は旧文の走査順（rowid）に揃える。
+    `SELECT id FROM (
+       SELECT * FROM (SELECT id, COALESCE(vector_attempted_at, updated_at) AS k, rowid AS r
+         FROM memories WHERE is_forgotten = 1
+         ORDER BY COALESCE(vector_attempted_at, updated_at), rowid LIMIT ?)
+       UNION ALL
+       SELECT * FROM (SELECT m.id, COALESCE(m.vector_attempted_at, m.updated_at) AS k, m.rowid AS r
+         FROM memory_organization_hidden AS h CROSS JOIN memories AS m ON m.id = h.memory_id
+         ORDER BY k, r LIMIT ?)
+     ) ORDER BY k, r LIMIT ?`,
+  ).bind(MAX_FORGOTTEN_VECTOR_SCAN, MAX_FORGOTTEN_VECTOR_SCAN, MAX_FORGOTTEN_VECTOR_SCAN).all<{ id: string }>();
   if (result.results.length === 0) return;
 
   const ids = result.results.map((row) => row.id);
@@ -3203,8 +3264,8 @@ async function reconcileForgottenVectors(env: Env): Promise<void> {
     await env.DB.batch(ids.map((id) => env.DB.prepare(
       `UPDATE memories
        SET vector_status = 'pending', vector_attempted_at = ?
-       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisible("memories",true)})`,
-    ).bind(attemptedAt, id)));
+       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisibleId("?",true)})`,
+    ).bind(attemptedAt, id, id)));
     console.error(JSON.stringify({ event: "forgotten_vector_lookup_failed", memoryIds: ids, error: diagnosticError(error, env) }));
     return;
   }
@@ -3231,11 +3292,12 @@ async function reconcileForgottenVectors(env: Env): Promise<void> {
     return env.DB.prepare(
       `UPDATE memories
        SET vector_status = ?, vector_mutation_id = ?, vector_attempted_at = ?
-       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisible("memories",true)})`,
+       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisibleId("?",true)})`,
     ).bind(
       visibleIds.has(id) ? visibleStatus : "disabled",
       visibleIds.has(id) && !deleteFailed ? vectorMutationId(mutation) : null,
       attemptedAt,
+      id,
       id,
     );
   }));
@@ -3326,6 +3388,141 @@ async function retryOrganizationEmbeddings(env: Env, selectedIds?: string[], for
   }));
 }
 
+const EMBEDDING_RETRY_LIMIT = 10;
+const EMBEDDING_RETRY_MAX_ATTEMPTS = 5;
+const EMBEDDING_RETRY_TIMEOUT_MS = 60_000;
+const SQL_NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+
+// 埋め込みが無いまま残った行の候補条件。通常の補強が動いている行（更新20分以内）、整理のまとめ、整理で隠れた行、
+// recallable:false、topic_revision なしは対象にしない。非表示判定は一括評価の形（束縛 id にしない）にする。
+function embeddingRetryCandidate(alias: string): string {
+  return `${alias}.is_forgotten=0 AND ${alias}.embedding_json IS NULL AND ${alias}.embedding_status IN ('pending','processing','failed')
+    AND ${alias}.topic_revision IS NOT NULL AND ${alias}.updated_at<strftime('%Y-%m-%dT%H:%M:%fZ','now','-20 minutes')
+    AND json_extract(${alias}.metadata_json,'$.memoryIndex.recallable') IS NOT 0
+    AND NOT EXISTS(SELECT 1 FROM memory_organization_summaries s WHERE s.memory_id=${alias}.id)
+    AND ${organizationVisible(alias, true)}`;
+}
+
+// 拾い直しの権利を AI の前に確保する。試行回数と次回時刻（15分、1時間、6時間、24時間）を1文で更新し、changes=0 なら呼ばない。
+// 版が変わった行は1回目に戻す。
+async function claimEmbeddingRetry(row: Pick<MemoryRow, "id" | "updated_at" | "topic_revision">, env: Env): Promise<boolean> {
+  const attempts = `CASE WHEN memory_embedding_retries.source_revision=excluded.source_revision THEN memory_embedding_retries.attempts+1 ELSE 1 END`;
+  const result = await env.DB.prepare(
+    `INSERT INTO memory_embedding_retries(memory_id,source_revision,attempts,next_attempt_at)
+     SELECT m.id,m.topic_revision,1,strftime('%Y-%m-%dT%H:%M:%fZ','now','+15 minutes')
+     FROM memories m WHERE m.id=? AND m.topic_revision=? AND m.updated_at=? AND ${embeddingRetryCandidate("m")}
+     ON CONFLICT(memory_id) DO UPDATE SET
+       source_revision=excluded.source_revision,
+       attempts=${attempts},
+       next_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ','now',CASE ${attempts} WHEN 1 THEN '+15 minutes' WHEN 2 THEN '+60 minutes' WHEN 3 THEN '+360 minutes' ELSE '+1440 minutes' END)
+     WHERE memory_embedding_retries.source_revision<>excluded.source_revision
+       OR (memory_embedding_retries.attempts<${EMBEDDING_RETRY_MAX_ATTEMPTS} AND memory_embedding_retries.next_attempt_at<=${SQL_NOW})`,
+  ).bind(row.id, row.topic_revision, row.updated_at).run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function retryMissingEmbedding(
+  row: Pick<MemoryRow, "id" | "container_tag" | "content" | "updated_at" | "topic_revision">,
+  env: Env,
+): Promise<void> {
+  if (row.topic_revision === null || !(await claimEmbeddingRetry(row, env))) return;
+  const memory: EnrichmentMemory = {
+    id: row.id,
+    containerTag: row.container_tag,
+    content: row.content,
+    updatedAt: row.updated_at,
+    topicRevision: row.topic_revision,
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    embedText(memory.content, env).then(
+      (value): PromiseSettledResult<number[]> => ({ status: "fulfilled", value }),
+      (reason): PromiseSettledResult<number[]> => ({ status: "rejected", reason }),
+    ),
+    // 打ち切った後に遅れて返った埋め込みは、結果として使わず保存しない。
+    new Promise<PromiseSettledResult<number[]>>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ status: "rejected", reason: new Error(`embedding retry timed out after ${EMBEDDING_RETRY_TIMEOUT_MS / 1000}s`) }),
+        EMBEDDING_RETRY_TIMEOUT_MS,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
+  // 処理中に版が変わった・忘却された・recallable:false になった行へは書かない。
+  if (!enrichmentEnabled(env) || !(await memoryStillCurrent(memory, env))) return;
+  if (result.status === "rejected") {
+    // 失敗は persistMemoryEmbedding を通さない。/v4/enrich は updated_at を変えずに新しい版・pending へ進めるため、
+    // 並走した通常側が先に保存した埋め込みを failed に戻さないよう、版・生存・埋め込み未保存・claim 済みを条件にする。
+    const message = diagnosticError(`embedding: ${String(result.reason)}`, env);
+    console.error(JSON.stringify({ event: "embedding_retry_failed", memoryId: memory.id, revision: memory.topicRevision, error: message }));
+    await env.DB.prepare(
+      `UPDATE memories SET embedding_status='failed', vector_status='failed', enrichment_error=?
+       WHERE id=? AND updated_at=? AND topic_revision=? AND is_forgotten=0 AND embedding_json IS NULL
+         AND EXISTS(SELECT 1 FROM memory_embedding_retries r WHERE r.memory_id=memories.id AND r.source_revision=memories.topic_revision)`,
+    ).bind(message, memory.id, memory.updatedAt, memory.topicRevision).run();
+    return;
+  }
+  const errors = await persistMemoryEmbedding(memory, env, result);
+  await env.DB.prepare("DELETE FROM memory_embedding_retries WHERE memory_id=? AND source_revision=?")
+    .bind(memory.id, memory.topicRevision).run();
+  if (errors.length === 0) {
+    // 埋め込み由来（"embedding: " だけ）の記録だけを消す。事実・トピックなど他の段階の記録（"; " 連結）や、
+    // 2,000字で切り詰められた記録は残す。
+    await env.DB.prepare(
+      `UPDATE memories SET enrichment_error=NULL
+       WHERE id=? AND updated_at=? AND topic_revision=? AND is_forgotten=0 AND embedding_json IS NOT NULL
+         AND enrichment_error LIKE 'embedding: %' AND length(enrichment_error)<2000
+         AND enrichment_error NOT LIKE '%; fact %' AND enrichment_error NOT LIKE '%; topic classification: %'
+         AND enrichment_error NOT LIKE '%; vector index: %'`,
+    ).bind(memory.id, memory.updatedAt, memory.topicRevision).run();
+    return;
+  }
+  const message = diagnosticError(errors.join("; "), env);
+  console.error(JSON.stringify({ event: "embedding_retry_failed", memoryId: memory.id, revision: memory.topicRevision, error: message }));
+  await env.DB.prepare(
+    "UPDATE memories SET enrichment_error=? WHERE id=? AND updated_at=? AND topic_revision=? AND is_forgotten=0",
+  ).bind(message, memory.id, memory.updatedAt, memory.topicRevision).run();
+}
+
+async function retryMissingEmbeddings(env: Env): Promise<void> {
+  if (!enrichmentEnabled(env)) return;
+  const rows = await env.DB.prepare(
+    `SELECT m.id,m.container_tag,
+            CASE WHEN instr(m.content, char(0)) > 0 THEN m.content ELSE substr(m.content, 1, ${MAX_EMBEDDING_CONTENT_LENGTH}) END AS content,
+            m.updated_at,m.topic_revision
+     FROM memories m
+     LEFT JOIN memory_embedding_retries r ON r.memory_id=m.id AND r.source_revision=m.topic_revision
+     WHERE ${embeddingRetryCandidate("m")}
+       AND (r.memory_id IS NULL OR (r.attempts<${EMBEDDING_RETRY_MAX_ATTEMPTS} AND r.next_attempt_at<=${SQL_NOW}))
+     ORDER BY COALESCE(r.attempts,0) ASC, m.updated_at DESC, m.id ASC LIMIT ${EMBEDDING_RETRY_LIMIT}`,
+  ).all<Pick<MemoryRow, "id" | "container_tag" | "content" | "updated_at" | "topic_revision">>();
+  const settled = await Promise.allSettled(rows.results.map((row) => retryMissingEmbedding(row, env)));
+  const failures = settled.flatMap((item, index) => item.status === "rejected" ? [{ id: rows.results[index]?.id, reason: item.reason }] : []);
+  for (const failure of failures) {
+    console.error(JSON.stringify({ event: "embedding_retry_row_failed", memoryId: failure.id, error: diagnosticError(failure.reason, env) }));
+  }
+  if (failures[0]) throw failures[0].reason;
+}
+
+// 15分 cron: 前段（照合）が失敗しても拾い直しを実行し、前段の例外を最後に再送出する。
+async function runVectorMaintenance(env: Env): Promise<void> {
+  let failure: { error: unknown } | undefined;
+  try {
+    await reconcileVectors(env);
+  } catch (error) {
+    failure = { error };
+  }
+  try {
+    await retryMissingEmbeddings(env);
+  } catch (error) {
+    if (failure) {
+      console.error(JSON.stringify({ event: "embedding_retry_failed_after_reconcile", error: diagnosticError(error, env) }));
+    } else {
+      failure = { error };
+    }
+  }
+  if (failure) throw failure.error;
+}
+
 async function reconcileVectors(env: Env): Promise<void> {
   await reconcileForgottenVectors(env);
   if (!enrichmentEnabled(env)) return;
@@ -3372,9 +3569,9 @@ async function reconcileVectors(env: Env): Promise<void> {
         env.DB.prepare(
           `UPDATE memories
            SET vector_status = 'indexed', vector_attempted_at = ?
-           WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisible("memories",enrichmentEnabled(env))}
+           WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisibleId("?",enrichmentEnabled(env))}
              ${row.organization_attempt ? `AND ${organizationAttemptSql()}=?` : ""}`,
-        ).bind(now.toISOString(), row.id, row.topic_revision,...(row.organization_attempt?[row.organization_attempt]:[])),
+        ).bind(now.toISOString(), row.id, row.topic_revision, row.id,...(row.organization_attempt?[row.organization_attempt]:[])),
       );
     }
   }
@@ -3420,9 +3617,9 @@ async function reconcileVectors(env: Env): Promise<void> {
           statement: env.DB.prepare(
             `UPDATE memories
              SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
-             WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisible("memories",enrichmentEnabled(env))}
+             WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisibleId("?",enrichmentEnabled(env))}
                ${row.organization_attempt ? `AND ${organizationAttemptSql()}=?` : ""}`,
-          ).bind(vectorMutationId(mutation), attemptedAt, vector.id, row.topic_revision,...(row.organization_attempt?[row.organization_attempt]:[])),
+          ).bind(vectorMutationId(mutation), attemptedAt, vector.id, row.topic_revision, vector.id,...(row.organization_attempt?[row.organization_attempt]:[])),
         });
       }
       const statusResults = await env.DB.batch(statusUpdates.map(({ statement }) => statement));
@@ -3936,8 +4133,8 @@ async function deleteVectorAfterStaleUpsert(id: string, env: Env): Promise<void>
     await env.DB.prepare(
       `UPDATE memories
        SET vector_status = 'pending', vector_mutation_id = NULL, vector_attempted_at = NULL
-       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisible("memories",true)})`,
-    ).bind(id).run();
+       WHERE id = ? AND (is_forgotten = 1 OR NOT ${organizationVisibleId("?",true)})`,
+    ).bind(id, id).run();
   }
   try {
     await deleteForgottenVector(id, env);
@@ -4003,9 +4200,9 @@ async function repairActiveVectorAfterDelete(
     const updated = await env.DB.prepare(
       `UPDATE memories
        SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
-       WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisible("memories",true)}
+       WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0 AND ${organizationVisibleId("?",true)}
          ${current.organization_attempt ? `AND ${organizationAttemptSql()}=? AND embedding_status='done'` : ""}`,
-    ).bind(vectorMutationId(mutation), attemptedAt, id, current.topic_revision,...(current.organization_attempt?[current.organization_attempt]:[])).run();
+    ).bind(vectorMutationId(mutation), attemptedAt, id, current.topic_revision, id,...(current.organization_attempt?[current.organization_attempt]:[])).run();
     if ((updated.meta.changes ?? 0) > 0) return;
   }
 
@@ -4244,7 +4441,7 @@ const worker = {
     const CONSOLIDATION_CRON = "0 18 * * *";
     const task = controller.cron === CONSOLIDATION_CRON
         ? runScheduledConsolidations(env, ctx)
-        : reconcileVectors(env);
+        : runVectorMaintenance(env);
     ctx.waitUntil(task.catch((error) => {
       console.error(JSON.stringify({ event: "scheduled_failed", cron: controller.cron, error: diagnosticError(error, env) }));
       throw error;

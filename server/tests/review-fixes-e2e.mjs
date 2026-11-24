@@ -74,7 +74,7 @@ scenario("target scans use expression index and preserve project priority with l
 });
 scenario("initial scheduled backfill discovers globally once then scans only its target", async (f) => {
   await f.seed(41); await f.drain(); const scans = [];
-  f.DB.hooks.all = (sql, values) => { if (sql.includes("WITH raw AS")) scans.push({ sql, values }); };
+  f.DB.hooks.all = (sql, values) => { if (sql.includes("WITH raw AS") || sql.includes("WITH candidate AS")) scans.push({ sql, values }); };
   worker.scheduled({ cron: "0 18 * * *", scheduledTime: Date.now() }, f.env, f.ctx); await f.drain();
   assert.equal(scans.filter(({ values }) => values.length === 0).length, 1);
   assert.ok(scans.filter(({ values }) => values.length > 0).length >= 2);
