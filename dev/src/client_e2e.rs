@@ -838,10 +838,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
     #[cfg(not(windows))]
     let captured = hook(binary, &home, &project, endpoint, "Stop", payload.clone())?;
     ensure!(
-        captured["systemMessage"]
-            .as_str()
-            .unwrap_or("")
-            .contains("saved 1 documents; pending 0"),
+        captured.get("systemMessage").is_none(),
         "capture failed: {captured}"
     );
     let state: Value = client
@@ -923,10 +920,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
         claude_payload.clone(),
     )?;
     ensure!(
-        claude_captured["systemMessage"]
-            .as_str()
-            .unwrap_or("")
-            .contains("saved 1 documents; pending 0"),
+        claude_captured.get("systemMessage").is_none(),
         "Claude capture failed: {claude_captured}"
     );
     let claude_posts = count_posts(
@@ -1021,10 +1015,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
         let payload = json!({"session_id":session,"transcript_path":path,"cwd":project,"hook_event_name":"Stop","stop_hook_active":false});
         let saved = hook(binary, &home, &project, endpoint, "Stop", payload.clone())?;
         ensure!(
-            saved["systemMessage"]
-                .as_str()
-                .unwrap_or("")
-                .contains("saved 4 documents; pending 0"),
+            saved.get("systemMessage").is_none(),
             "session events capture {session}: {saved}"
         );
         let posts = count_posts(
@@ -1141,7 +1132,7 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
             json!({"session_id":id,"transcript_path":path,"cwd":project,"hook_event_name":"Stop","stop_hook_active":false}),
         )?;
         ensure!(
-            saved["systemMessage"].as_str().unwrap_or("").contains("pending 0"),
+            saved.get("systemMessage").is_none(),
             "resume fixture capture {id}: {saved}"
         );
     }

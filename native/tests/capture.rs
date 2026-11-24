@@ -304,7 +304,8 @@ fn real_stop_capture_redaction_stable_retry_and_concurrent_receipts() {
     let fixture = Fixture::new(&server);
     let first = fixture.run(&["capture"]);
     success(&first);
-    assert!(String::from_utf8_lossy(&first.stdout).contains("saved 1 documents"));
+    // 保留が0件なら通知を出さない。
+    assert!(first.stdout.is_empty());
     {
         let state = server.state.lock().unwrap();
         assert_eq!(state.requests.len(), 1);
@@ -399,7 +400,7 @@ fn claude_session_events_follow_turns_and_are_saved_even_without_completed_turns
     write(&[&human, &compact]);
     let first = fixture.run(&["capture"]);
     success(&first);
-    assert!(String::from_utf8_lossy(&first.stdout).contains("saved 1 documents"));
+    assert!(first.stdout.is_empty());
     {
         let state = server.state.lock().unwrap();
         assert_eq!(state.requests.len(), 1);

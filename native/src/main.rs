@@ -75,9 +75,7 @@ fn run(startup: app_update::Startup) -> Result<()> {
             })();
             match result {
                 Ok(result) => {
-                    if result["saved"].as_u64().unwrap_or(0) > 0
-                        || result["pending"].as_u64().unwrap_or(0) > 0
-                    {
+                    if result["pending"].as_u64().unwrap_or(0) > 0 {
                         print!(
                             "{}",
                             serde_json::json!({"systemMessage":remnifold::locale::tr_with("hook.saved_notice", &[("saved", &result["saved"].to_string()), ("pending", &result["pending"].to_string())])})

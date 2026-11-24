@@ -521,7 +521,7 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
         let result = capture::capture(payload, config)?;
         let saved = result["saved"].as_u64().unwrap_or(0);
         let pending = result["pending"].as_u64().unwrap_or(0);
-        return Ok(if saved > 0 || pending > 0 {
+        return Ok(if pending > 0 {
             json!({"systemMessage":tr_with("hook.saved_notice", &[("saved", &saved.to_string()), ("pending", &pending.to_string())])})
         } else {
             json!({})
