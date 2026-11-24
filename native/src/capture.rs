@@ -575,6 +575,29 @@ fn titles(home: &Path, only_id: Option<&str>) -> Result<HashMap<String, String>>
 fn utf16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
+/// ターン文書とイベント文書で共有するタイトル導出。(伏せ字後の元タイトル, 保存用 safe_title) を返す。
+fn derive_titles(transcript: &Transcript, title: &str, fallback: &str) -> (String, String) {
+    let title = if title.is_empty() {
+        transcript
+            .turns
+            .first()
+            .map(|t| t.user.lines().next().unwrap_or(fallback))
+            .unwrap_or(fallback)
+    } else {
+        title
+    };
+    let title = sanitize_text(title, &[], &mut 0);
+    let projected = project_request_text(&title, false).trim().to_string();
+    let safe_title = truncate_utf16(
+        if projected.is_empty() {
+            fallback
+        } else {
+            &projected
+        },
+        200,
+    );
+    (title, safe_title)
+}
 pub fn build_turn_documents(
     candidate: &Candidate,
     transcript: &Transcript,
@@ -591,26 +614,8 @@ pub fn build_turn_documents(
     } else {
         ("codex", "codex-kagayoi-memory", "Codex task")
     };
-    let title = if title.is_empty() {
-        transcript
-            .turns
-            .first()
-            .map(|t| t.user.lines().next().unwrap_or(fallback))
-            .unwrap_or(fallback)
-    } else {
-        title
-    };
-    let title = sanitize_text(title, &[], &mut 0);
+    let (title, safe_title) = derive_titles(transcript, title, fallback);
     let legacy_title: Vec<u16> = title.encode_utf16().take(200).collect();
-    let projected = project_request_text(&title, false).trim().to_string();
-    let safe_title = truncate_utf16(
-        if projected.is_empty() {
-            fallback
-        } else {
-            &projected
-        },
-        200,
-    );
     let provenance = !text(&project["containerTag"]).trim().is_empty();
     let reuse = container.is_none() && provenance;
     let container = container.filter(|s| !s.is_empty()).unwrap_or("memories");
@@ -662,13 +667,36 @@ pub fn build_turn_documents(
             ));
             start = end;
         }
-        let memory_index = crate::search::build_memory_index(
+        // 通知後の続きは固定ラベルのままだと検索結果から中身が分からないので、索引の説明だけを
+        // 回答由来にする。本文・identity・key には使わない。
+        let continuation = turn.user == crate::claude_transcript::CONTINUATION_LABEL;
+        // 直前の人の依頼が無いときはラベルのまま残す（サーバーは保存した説明から recallable を
+        // 計算し直すため、短い回答だけの説明だと値が変わる）。読み取り時に本文から説明を作り直す。
+        let index_request = transcript.turns[..i]
+            .iter()
+            .rev()
+            .find(|t| continuation && t.user != crate::claude_transcript::CONTINUATION_LABEL)
+            .map(|t| crate::search::continuation_index_request(&turn.assistant, &t.user))
+            .filter(|s| !s.is_empty());
+        // recallable などは従来どおり固定ラベルから決め、説明だけを回答由来に差し替える。
+        // 待ちの後順位化は検索側が本文から判定する（サーバーは索引の項目を絞って返すため）。
+        let mut memory_index = crate::search::build_memory_index(
             &safe_title,
             &turn.user,
             &turn.assistant,
             &turn.source_timestamp,
             "conversation",
         );
+        if let Some(request) = &index_request {
+            memory_index["description"] = crate::search::build_memory_index(
+                &safe_title,
+                request,
+                &turn.assistant,
+                &turn.source_timestamp,
+                "conversation",
+            )["description"]
+                .clone();
+        }
         for (p, (content, hash)) in parts.iter().enumerate() {
             let key = format!("{identity}:{}:{hash}", p + 1);
             let mut index = memory_index.clone();
@@ -807,16 +835,19 @@ pub fn capture(payload: &Value, config: &Config) -> Result<Value> {
         return Err(CaptureFailure("transcript").into());
     }
     let project = stage("transcript", get_project_context(Path::new(cwd)))?;
+    let mut events = vec![];
     let (transcript, title) = if candidate.meta["format"] == "claude" {
         // Claude Code はタイトルを記録内の custom-title 行に持つ。
-        stage(
+        let (transcript, title, found) = stage(
             "transcript",
-            crate::claude_transcript::parse(
+            crate::claude_transcript::parse_with_events(
                 &candidate.file_path,
                 text(&candidate.meta["id"]),
                 &[&config.api_key],
             ),
-        )?
+        )?;
+        events = found;
+        (transcript, title)
     } else {
         let transcript = stage(
             "transcript",
@@ -836,10 +867,23 @@ pub fn capture(payload: &Value, config: &Config) -> Result<Value> {
         );
         (transcript, title)
     };
-    let documents = stage(
+    // ターン文書を先、イベント文書を後に送る（90秒枠でターン保存を押し出さないため）。
+    let mut documents = stage(
         "transcript",
         build_turn_documents(&candidate, &transcript, &project, &title, 120_000, None),
     )?;
+    let turn_count = documents.len();
+    if !events.is_empty() {
+        let safe_title = derive_titles(&transcript, &title, "Claude Code task").1;
+        documents.extend(crate::session_events::build_documents(
+            &candidate,
+            &events,
+            &project,
+            &safe_title,
+            None,
+        ));
+    }
+    let event_count = documents.len() - turn_count;
     let state_id = sha256(format!(
         "{}:{}:{}",
         config.base_url,
@@ -877,7 +921,7 @@ pub fn capture(payload: &Value, config: &Config) -> Result<Value> {
         )?;
         saved += 1;
     }
-    Ok(json!({"saved":saved,"pending":pending.len()-saved,"completedTurns":transcript.turns.len()}))
+    Ok(json!({"saved":saved,"pending":pending.len()-saved,"completedTurns":transcript.turns.len(),"events":event_count}))
 }
 
 pub fn run_import(args: &[String]) -> Result<()> {
@@ -1283,6 +1327,74 @@ mod tests {
             docs[0]["metadata"]["sourceTimestamp"],
             "2026-01-01T00:00:00Z"
         );
+    }
+    #[test]
+    fn continuation_turns_keep_ids_and_get_an_answer_description() {
+        let c = Candidate {
+            file_path: PathBuf::new(),
+            meta: json!({"id":"session","rootSessionId":"session","isSubagent":false}),
+            size: 0,
+            modified: SystemTime::UNIX_EPOCH,
+            recent: false,
+        };
+        let label = crate::claude_transcript::CONTINUATION_LABEL;
+        let t = Transcript {
+            turns: vec![
+                Turn {
+                    user: "テストを実行して".into(),
+                    assistant: "実行を開始しました。".into(),
+                    source_timestamp: String::new(),
+                },
+                Turn {
+                    user: label.into(),
+                    assistant: "テストの完了を待っています。".into(),
+                    source_timestamp: String::new(),
+                },
+            ],
+            redactions: 0,
+        };
+        let docs = build_turn_documents(&c, &t, &json!({"containerTag":"project"}), "Task", 120000, None).unwrap();
+        // 変更前の実装で取った customId（本文のSHA-256由来）。
+        assert_eq!(
+            docs[1]["customId"],
+            "codex-turn-v2:session:2:65ef680a4124f71c5c32d17efa753ba5a1de153bef2041b93824208bd9b13353:1:65ef680a4124f71c"
+        );
+        let index = &docs[1]["metadata"]["memoryIndex"];
+        assert_eq!(
+            index["description"],
+            "テストの完了を待っています。（直前の依頼: テストを実行して）"
+        );
+        assert!(index.get("lowInformation").is_none());
+        assert!(docs[1]["content"].as_str().unwrap().contains(label));
+    }
+    #[test]
+    fn brief_continuation_answer_keeps_recallable_of_the_fixed_label() {
+        let c = Candidate {
+            file_path: PathBuf::new(),
+            meta: json!({"id":"session","rootSessionId":"session","isSubagent":false}),
+            size: 0,
+            modified: SystemTime::UNIX_EPOCH,
+            recent: false,
+        };
+        let label = crate::claude_transcript::CONTINUATION_LABEL;
+        let turn = |assistant: &str| Transcript {
+            turns: vec![Turn {
+                user: label.into(),
+                assistant: assistant.into(),
+                source_timestamp: String::new(),
+            }],
+            redactions: 0,
+        };
+        let index = |assistant: &str| {
+            build_turn_documents(&c, &turn(assistant), &json!({"containerTag":"project"}), "Task", 120000, None)
+                .unwrap()[0]["metadata"]["memoryIndex"]
+                .clone()
+        };
+        let brief = index("ありがとうございます。");
+        assert_eq!(brief["description"], label);
+        let legacy = crate::search::build_memory_index("Task", label, "ありがとうございます。", "", "conversation");
+        assert_eq!(brief["recallable"], legacy["recallable"]);
+        assert_eq!(brief["recallable"], true);
     }
     #[test]
     fn fixed_diagnostic() {

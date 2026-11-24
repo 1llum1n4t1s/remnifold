@@ -461,6 +461,16 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
         let name = text(&payload["tool_name"])
             .strip_prefix("mcp__remnifold__")
             .unwrap_or("");
+        let mut updated = payload
+            .get("tool_input")
+            .filter(|v| truthy(v))
+            .cloned()
+            .unwrap_or(json!({}));
+        // "current" は今のセッション ID に解決する。入力全体を置換するため他の項目はそのまま返す。
+        let session = text(&payload["session_id"]).trim();
+        if name == "search_memory" && updated["sessionId"] == "current" && !session.is_empty() {
+            updated["sessionId"] = json!(session);
+        }
         return Ok(
             if [
                 "search_memory",
@@ -473,7 +483,7 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
             ]
             .contains(&name)
             {
-                json!({"hookSpecificOutput":{"hookEventName":event,"permissionDecision":"allow","permissionDecisionReason":"Memory index and document access is read-only.","updatedInput":payload.get("tool_input").filter(|v| truthy(v)).cloned().unwrap_or(json!({}))}})
+                json!({"hookSpecificOutput":{"hookEventName":event,"permissionDecision":"allow","permissionDecisionReason":"Memory index and document access is read-only.","updatedInput":updated}})
             } else {
                 json!({})
             },
@@ -823,6 +833,36 @@ mod tests {
             .unwrap(),
             json!({})
         );
+    }
+
+    #[test]
+    fn pretool_resolves_current_session_id_only_for_search_memory() {
+        let resolve = |name: &str, session: Value| {
+            run_hook(
+                "PreToolUse",
+                &json!({"tool_name":name,"session_id":session,"tool_input":{"query":"q","sessionId":"current","includeProfile":true}}),
+                None,
+            )
+            .unwrap()["hookSpecificOutput"]["updatedInput"]
+                .clone()
+        };
+        let input = resolve("mcp__remnifold__search_memory", json!(" abc "));
+        assert_eq!(
+            input,
+            json!({"query":"q","sessionId":"abc","includeProfile":true})
+        );
+        // ID が空・無いときと他のツールは "current" のまま返す（MCP が固定エラーにする）。
+        assert_eq!(resolve("mcp__remnifold__search_memory", json!("  "))["sessionId"], "current");
+        assert_eq!(resolve("mcp__remnifold__search_memory", Value::Null)["sessionId"], "current");
+        assert_eq!(resolve("mcp__remnifold__getDocument", json!("abc"))["sessionId"], "current");
+        // 具体的な ID は変えない。
+        let explicit = run_hook(
+            "PreToolUse",
+            &json!({"tool_name":"mcp__remnifold__search_memory","session_id":"abc","tool_input":{"query":"q","sessionId":"other"}}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(explicit["hookSpecificOutput"]["updatedInput"]["sessionId"], "other");
     }
 
     #[test]

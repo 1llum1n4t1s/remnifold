@@ -376,6 +376,61 @@ fn real_stop_capture_redaction_stable_retry_and_concurrent_receipts() {
 }
 
 #[test]
+fn claude_session_events_follow_turns_and_are_saved_even_without_completed_turns() {
+    let server = Server::new();
+    let fixture = Fixture::new(&server);
+    let s = fixture.session.clone();
+    let human = json!({"type":"user","sessionId":s,"timestamp":"2026-02-02T00:00:00Z","origin":{"kind":"human"},"message":{"role":"user","content":"Await request"}});
+    let compact = json!({"type":"user","sessionId":s,"uuid":"c1","isCompactSummary":true,"timestamp":"2026-02-02T00:00:01Z","message":{"role":"user","content":"Checkpoint summary text"}});
+    let queued = json!({"type":"attachment","sessionId":s,"uuid":"q1","timestamp":"2026-02-02T00:00:02Z","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"Midturn note","origin":{"kind":"human"}}});
+    let answer = json!({"type":"assistant","sessionId":s,"timestamp":"2026-02-02T00:00:03Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"Final reply"}]}});
+    let write = |rows: &[&Value]| {
+        fs::write(
+            &fixture.transcript,
+            rows.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap()
+    };
+    // 回答待ちでターンが0件でも、イベントだけが保存される。
+    write(&[&human, &compact]);
+    let first = fixture.run(&["capture"]);
+    success(&first);
+    assert!(String::from_utf8_lossy(&first.stdout).contains("saved 1 documents"));
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.requests.len(), 1);
+        let doc = &state.requests[0];
+        assert_eq!(doc["customId"], format!("claude-event-v1:{s}:compaction:c1"));
+        assert_eq!(doc["metadata"]["type"], "session-event");
+        assert!(doc["metadata"].get("turn").is_none() && doc["metadata"].get("captureKey").is_none());
+        assert_eq!(doc["metadata"]["memoryIndex"]["recallable"], false);
+    }
+    // 再実行では再送されない。完了ターンと新しいイベントが増えたら、ターンが先に送られる。
+    let again = fixture.run(&["capture"]);
+    success(&again);
+    assert!(String::from_utf8_lossy(&again.stdout).trim().is_empty());
+    assert_eq!(server.state.lock().unwrap().requests.len(), 1);
+    write(&[&human, &compact, &queued, &answer]);
+    success(&fixture.run(&["capture"]));
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.requests.len(), 3);
+    assert!(
+        state.requests[1]["customId"]
+            .as_str()
+            .unwrap()
+            .starts_with("codex-turn-v2:")
+    );
+    assert_eq!(
+        state.requests[2]["customId"],
+        format!("claude-event-v1:{s}:message:q1")
+    );
+}
+
+#[test]
 fn missing_acknowledgement_retries_same_id_without_receipt_or_secret_diagnostics() {
     let server = Server::new();
     server.acknowledge.store(false, Ordering::SeqCst);

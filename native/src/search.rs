@@ -159,6 +159,78 @@ pub fn index_request_text(s: &str) -> String {
         })
         .to_string()
 }
+fn request_line(request: &str) -> String {
+    let projected = index_request_text(request);
+    first(
+        projected
+            .rsplit("### Current user request\n")
+            .next()
+            .unwrap_or(""),
+    )
+}
+/// 通知後の「続き」ターンの説明。回答の先頭1行を先に置き、直前の人の依頼があれば添える。
+/// 回答が空なら空文字を返し、呼び出し側は従来のラベルのままにする。
+pub fn continuation_description(answer_line: &str, previous_request_line: &str) -> String {
+    if answer_line.is_empty() {
+        return String::new();
+    }
+    if previous_request_line.is_empty() {
+        return answer_line.to_owned();
+    }
+    short_text(
+        &format!(
+            "{}（直前の依頼: {}）",
+            short_text(answer_line, 120),
+            previous_request_line
+        ),
+        180,
+    )
+}
+/// 続きターンの説明を、応答本文と直前の人の依頼本文（なければ空）から作る。
+pub fn continuation_index_request(response: &str, previous_user: &str) -> String {
+    continuation_description(&first(response), &request_line(previous_user))
+}
+/// 短い応答の全文が「今まだ待っている・実行中」だけを述べているか。結果を述べる文が
+/// 1つでもあれば偽（結果を落とす誤判定を避けるため、取りこぼしは許容する）。
+pub fn continuation_wait(response: &str) -> bool {
+    let text = response.trim();
+    if text.is_empty()
+        || text.encode_utf16().count() >= 200
+        || text.contains('`')
+        || re!(r"(?m)^\s*(?:#{1,6}\s|[-*+•・>|]|\d+[.)．]\s)").is_match(text)
+        || re!(r"[?？]").is_match(text)
+        // 完了・成果を示す絵文字は、待ちの前に結果を述べている印として扱う。
+        || re!(r"[✅🎉📋📝🧹✨]").is_match(text)
+    {
+        return false;
+    }
+    let mut waiting = false;
+    for sentence in re!(r"[。！!\n]+|\.\s").split(text) {
+        let sentence: String = sentence
+            .chars()
+            .filter(|c| !matches!(*c as u32, 0x1F000..=0x1FFFF | 0x2190..=0x2BFF | 0xFE0F | 0x200D))
+            .collect();
+        let sentence = sentence.trim();
+        if !sentence.chars().any(char::is_alphanumeric)
+            || re!(r"^(?:はい|了解|承知|分かり|わかり|ありがとう|お疲れ)(?:です|ました|しました|ございます|様です|さまです)?[、，,\s]*$").is_match(sentence)
+        {
+            continue;
+        }
+        // 「開始しました」は待ちの前置きとして許し、その後ろに結果が続けば下で偽にする。
+        let rest = re!(r"^.*?(?:開始|起動|投入|送信|依頼|委任)(?:しました|したところ)").replace(sentence, "");
+        if re!(r"(?i)済|終わ(?:っ|り)|終了(?:し|です)|完了(?:し|です)|ました|でした|ません|なかっ|取り消|見つか|直し|直す|修正|問題|指摘|成功|失敗|エラー|通過|合格|できま|できた|できて|受理|用意|届いた(?:よ|ので|。|$)|届きました|終え|終了通知|反映|保存|整っ|\b(?:completed?|finished|failed|passed|succeeded|done|errors?|found|fixed|cancel\w*|issues?|saved|cleaned|corrected|draft|weighted|now show)\b").is_match(&rest) {
+            return false;
+        }
+        if re!(r"(?i)待機|待っ(?:て|ておき)|待ち(?:ます|です|中)|(?:実行|処理|進行|動作)中|\bwaiting\b|still (?:running|in progress)|standing by").is_match(&rest) {
+            waiting = true;
+        } else if !rest.trim().chars().all(|c| !c.is_alphanumeric())
+            && !re!(r"(?:報告|連絡|共有|お知らせ|お伝え|確認|対応|続行|再開)(?:し|いた)?ます|次第|出たら").is_match(&rest)
+        {
+            return false;
+        }
+    }
+    waiting
+}
 pub fn build_memory_index(
     title: &str,
     request: &str,
@@ -167,13 +239,7 @@ pub fn build_memory_index(
     source_kind: &str,
 ) -> Value {
     let title = short_text(&crate::capture::project_request_text(title, false), 100);
-    let projected = index_request_text(request);
-    let request_line = first(
-        projected
-            .rsplit("### Current user request\n")
-            .next()
-            .unwrap_or(""),
-    );
+    let request_line = request_line(request);
     let sections: Vec<_> = unique(
         response
             .lines()
@@ -278,17 +344,54 @@ pub fn document_index(doc: &Value, fallback_container: &str, terms: &[String]) -
                 description = text(&saved["title"]).to_owned();
             }
         }
-        build_memory_index(
+        let kind = if saved["sourceKind"].is_null() {
+            "conversation"
+        } else {
+            text(&saved["sourceKind"])
+        };
+        // サーバーは保存した索引の項目を絞って返すため、続きターンかどうかは本文の依頼節から
+        // 毎回判定する（本文が無い・応答が欠ける場合は何もしない）。
+        // 整理要約などが元ターンの本文を含んでも、会話の記録以外は対象にしない。
+        let continuation = kind == "conversation"
+            && compact(&request) == crate::claude_transcript::CONTINUATION_LABEL;
+        let continuation_line = if continuation && !response.trim().is_empty() {
+            continuation_index_request(&response, "")
+        } else {
+            String::new()
+        };
+        // recallable は従来どおり固定ラベルから決め、説明だけを回答由来に差し替える。
+        let mut v = build_memory_index(
             text(&saved["title"]),
-            &description,
+            if continuation {
+                crate::claude_transcript::CONTINUATION_LABEL
+            } else {
+                &description
+            },
             "",
             text(&saved["sourceUpdatedAt"]),
-            if saved["sourceKind"].is_null() {
-                "conversation"
+            kind,
+        );
+        if continuation {
+            let line = if compact(&description) == crate::claude_transcript::CONTINUATION_LABEL {
+                continuation_line.as_str()
             } else {
-                text(&saved["sourceKind"])
-            },
-        )
+                description.as_str()
+            };
+            if !line.is_empty() {
+                v["description"] = build_memory_index(
+                    text(&saved["title"]),
+                    line,
+                    "",
+                    text(&saved["sourceUpdatedAt"]),
+                    kind,
+                )["description"]
+                    .clone();
+            }
+        }
+        if continuation && continuation_wait(&response) {
+            v["lowInformation"] = json!(true)
+        }
+        v
     } else {
         let dates = unique(
             re!(r"(?m)^updated_at:\s*(\S+)\s*$")
@@ -534,6 +637,11 @@ pub fn format_index_item(v: &Value) -> String {
     }
     if v["consolidation"] == true {
         result += " | kind=consolidated-checkpoint"
+    } else if let Some(kind) = v["sourceKind"]
+        .as_str()
+        .filter(|k| ["compaction-summary", "mid-turn-message", "question-answer"].contains(k))
+    {
+        result += &format!(" | kind={kind}")
     }
     if !text(&v["searchExcerpt"]).is_empty() {
         result += &format!(
@@ -1021,6 +1129,10 @@ fn latest(candidates: Vec<Candidate>) -> Vec<Candidate> {
 fn source_date(index: &Value) -> i64 {
     date_number(choose(&[&index["sourceUpdatedAt"], &index["updatedAt"]]))
 }
+/// 待ちだけの記録（lowInformation）を後ろへ回す。
+fn compare_low_information(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    (a.index["lowInformation"] == true).cmp(&(b.index["lowInformation"] == true))
+}
 fn compare_project(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.project_only.cmp(&a.project_only).then_with(|| {
         if a.project_only && b.project_only {
@@ -1041,7 +1153,11 @@ impl SessionFilter {
     // 今の ID（onlySessionId）が空なら絞り込みなし。旧 ID は重複を除き、今の ID を含めて最大 8 件、ID は 160 バイトまで。
     // until が空なら上限なし、解釈できない旧 ID は使わない（fail closed）。
     fn from_options(options: &Value) -> Self {
-        let current = text(&options["onlySessionId"]).trim();
+        let mut current = text(&options["onlySessionId"]).trim();
+        // 手動検索（MCP の sessionId）は、自動想起の指定が無いときだけ今の ID として扱う。
+        if current.is_empty() && options["automatic"] != true {
+            current = text(&options["sessionId"]).trim();
+        }
         if current.is_empty() {
             return Self::default();
         }
@@ -1181,6 +1297,8 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
         let mut body = json!({"allContainers":true,"q":query,"limit":40});
         if automatic {
             body["indexOnly"] = json!(true);
+        }
+        if session.is_active() {
             session.apply_to(&mut body);
         }
         match request(config, "/v4/search", Some(&body), options) {
@@ -1246,6 +1364,8 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
                 let mut body = json!({"containerTag":tag,"q":query,"limit":20});
                 if automatic {
                     body["indexOnly"] = json!(true);
+                }
+                if session.is_active() {
                     session.apply_to(&mut body);
                 }
                 request(config, "/v4/search", Some(&body), options)
@@ -1262,7 +1382,7 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
     }
     // 今のセッションだけを許す指定では、改訂選択・件数上限・ハイドレーションより前に絞る。
     // sessionId の無い記録は一致しないため落ちる（fail closed）。
-    if automatic && session.is_active() {
+    if session.is_active() {
         candidates.retain(|c| session.accepts(&c.index))
     }
     for c in &mut candidates {
@@ -1283,6 +1403,7 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
         b.relevance
             .total_cmp(&a.relevance)
             .then_with(|| compare_project(a, b))
+            .then_with(|| compare_low_information(a, b))
             .then_with(|| {
                 b.row["semanticSimilarity"]
                     .as_f64()
@@ -1344,6 +1465,7 @@ pub fn search_index(config: &Config, options: &Value) -> Result<Value> {
         b.relevance
             .total_cmp(&a.relevance)
             .then_with(|| compare_project(a, b))
+            .then_with(|| compare_low_information(a, b))
             .then_with(|| b.index_relevance.total_cmp(&a.index_relevance))
             .then_with(|| {
                 if automatic {
@@ -2526,6 +2648,133 @@ mod tests {
         }));
         assert!(unbounded.accepts(&doc("nolimit", None, None)));
         assert!(unbounded.accepts(&doc("nolimit", None, Some("garbage"))));
+    }
+    #[test]
+    fn manual_session_id_filters_request_and_old_server_rows() {
+        // 手動検索の sessionId は今の ID として扱う。自動想起は onlySessionId だけを見る。
+        let manual = SessionFilter::from_options(&json!({"sessionId": " mine "}));
+        assert_eq!(manual.request_fields(), json!({"sessionId": "mine"}));
+        let automatic = SessionFilter::from_options(&json!({"sessionId": "mine", "automatic": true}));
+        assert!(!automatic.is_active());
+        let both = SessionFilter::from_options(&json!({"sessionId": "mine", "onlySessionId": "now"}));
+        assert_eq!(both.request_fields(), json!({"sessionId": "now"}));
+        // 絞らず返す旧サーバーでも、他セッションの行は結果に出ない。
+        let session_row = |id: &str, session: &str| {
+            let mut row = row(id, "Selection state");
+            row["metadata"]["sessionId"] = json!(session);
+            row
+        };
+        let (config, handle, requests) = fixture(vec![
+            json!({"searchScope":"all-containers","searchedContainers":["memories"],"spaceDiscoveryComplete":true,"results":[session_row("other", "elsewhere"), session_row("mine", "mine")]}),
+        ]);
+        let result = search_index(&config, &json!({"query":"Selection state","sessionId":"mine"})).unwrap();
+        handle.join().unwrap();
+        let ids: Vec<_> = result["results"].as_array().unwrap().iter().map(|i| text(&i["id"])).collect();
+        assert_eq!(ids, vec!["mine"]);
+        let body = requests.lock().unwrap()[0]["body"].clone();
+        assert_eq!(body["sessionId"], "mine");
+        assert!(body.get("indexOnly").is_none());
+    }
+    #[test]
+    fn continuation_wait_judges_waiting_but_not_results() {
+        for wait in [
+            "テストの完了を待っています。",
+            "審査待ちです。",
+            "まだ実行中です。",
+            "バックグラウンドで待機します。",
+            "Waiting for the build.",
+            "The job is still running.",
+            "実行を開始しました。完了を待っています。🙂",
+            "了解しました。結果が出たら報告します。まだ実行中です。",
+        ] {
+            assert!(continuation_wait(wait), "{wait}");
+        }
+        for result in [
+            "テストは終わりました。",
+            "変更していません。待機はしていません。",
+            "片付け済みです。",
+            "問題は見つかりませんでした。",
+            "処理は取り消されました。待っています。",
+            "60分待っても完了しなかった。",
+            "CIの結果を待ってから修正を入れました。",
+            "実行を開始しました。",
+            "bootstrap も受理されたよ 🎉 Setup の run を待ってるね ⏳",
+            "Draft is 230 weighted characters ✅ Waiting for CI to finish.",
+            "待っています。\n- 項目",
+            "テストが完了し、次は審査待ちです。",
+            "ビルドに失敗したので、再実行を待ちます。",
+            "Build completed. Waiting for review.",
+            "Tests passed; waiting for CI.",
+            "どちらにするか待っていますが、どちらですか？",
+            "",
+        ] {
+            assert!(!continuation_wait(result), "{result}");
+        }
+        assert!(!continuation_wait("### 結果\n待機します。"));
+        assert!(!continuation_wait(&format!("待機します。{}", "あ".repeat(300))));
+    }
+    #[test]
+    fn continuation_label_description_is_rebuilt_only_with_content() {
+        let label = crate::claude_transcript::CONTINUATION_LABEL;
+        let doc = |content: &str| {
+            json!({"id":"c","content":content,"metadata":{"memoryIndex":{
+                "version":1,"title":"Task","description":label,"recallable":true,"sourceKind":"conversation"}}})
+        };
+        let with = document_index(
+            &doc("### User request\n(Continuation after a background notification)\n\n### Final assistant response\nテストの完了を待っています。"),
+            "memories",
+            &[],
+        );
+        assert_eq!(with["description"], "テストの完了を待っています。");
+        assert_eq!(with["lowInformation"], true);
+        // 保存済みの説明が回答由来でも、本文から続きターンを判定して待ちを付ける。
+        let derived = json!({"id":"c","content":"### User request\n(Continuation after a background notification)\n\n### Final assistant response\n待機します。","metadata":{"memoryIndex":{
+            "version":1,"title":"Task","description":"待機します。","recallable":true,"sourceKind":"conversation"}}});
+        let derived = document_index(&derived, "memories", &[]);
+        assert_eq!(derived["description"], "待機します。");
+        assert_eq!(derived["lowInformation"], true);
+        assert_eq!(derived["recallable"], true);
+        // 複数partの後続など、応答が取れないときは付けない。
+        let partial = doc("### User request\n(Continuation after a background notification)");
+        assert!(document_index(&partial, "memories", &[]).get("lowInformation").is_none());
+        let result = document_index(
+            &doc("### User request\n(Continuation after a background notification)\n\n### Final assistant response\n修正が終わり、全テストが通りました。"),
+            "memories",
+            &[],
+        );
+        assert_eq!(result["description"], "修正が終わり、全テストが通りました。");
+        assert!(result.get("lowInformation").is_none());
+        let without = document_index(&doc(""), "memories", &[]);
+        assert_eq!(without["description"], label);
+        assert!(without.get("lowInformation").is_none());
+        // 保存値の lowInformation は読まない。
+        let stored = json!({"id":"s","content":"x","metadata":{"memoryIndex":{
+            "version":1,"title":"Task","description":"待つだけ","lowInformation":true}}});
+        assert!(document_index(&stored, "memories", &[]).get("lowInformation").is_none());
+    }
+    #[test]
+    fn low_information_records_sort_after_equal_relevance_records() {
+        // サーバーは memoryIndex を7項目だけで作り直して返すため、保存した印には頼らず、
+        // 本文の依頼節（固定ラベル）と回答から検索側が判定する。
+        let label = crate::claude_transcript::CONTINUATION_LABEL;
+        let served = |id: &str, request: &str, response: &str| {
+            let index = build_memory_index("Selection state", request, response, "2026-10-01T00:00:00.000Z", "conversation");
+            let keys = ["version", "title", "description", "sections", "recallable", "sourceKind", "sourceUpdatedAt"];
+            let seven: Value = keys.iter().map(|k| (k.to_string(), index[*k].clone())).collect::<serde_json::Map<_, _>>().into();
+            assert_eq!(index.as_object().unwrap().len(), keys.len());
+            json!({"id":id,"containerTag":"memories",
+                "content":format!("### User request\n{request}\n\n### Final assistant response\n{response}"),
+                "metadata":{"memoryIndex":seven}})
+        };
+        let low = served("low", label, "Selection state の結果を待っています。");
+        let normal = served("normal", label, "Selection state の修正が終わりました。");
+        let (config, handle, _) = fixture(vec![
+            json!({"searchScope":"all-containers","searchedContainers":["memories"],"spaceDiscoveryComplete":true,"results":[low,normal]}),
+        ]);
+        let result = search_index(&config, &json!({"query":"Selection state"})).unwrap();
+        handle.join().unwrap();
+        let ids: Vec<_> = result["results"].as_array().unwrap().iter().map(|i| text(&i["id"])).collect();
+        assert_eq!(ids, vec!["normal", "low"]);
     }
     #[test]
     fn expired_deadline_rejects_before_network() {

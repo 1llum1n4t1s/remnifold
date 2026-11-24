@@ -999,6 +999,110 @@ pub fn run(repo: &Path, tools: &Toolchain, work: &Path, binary: &Path) -> Result
         "Claude capture disclosed internal rows or secrets"
     );
     checks.push("native Stop captures Claude Code transcripts final-only with claude-code provenance and suppresses acknowledged retries");
+    // セッションイベント文書（圧縮要約・途中発言・質問回答）は turns と別系統で保存され、
+    // sessionId 付きの手動検索で同じセッションのものだけが返る。recallable:false の要約も本文の語で引ける。
+    let events_session = "native-claude-events-session";
+    let events_other = "native-claude-events-other";
+    for session in [events_session, events_other] {
+        let path = claude_dir.join(format!("{session}.jsonl"));
+        let rows = [
+            json!({"type":"user","sessionId":session,"cwd":project,"timestamp":"2026-02-02T00:00:00Z","origin":{"kind":"human"},"message":{"role":"user","content":"EventsBase request"}}),
+            json!({"type":"assistant","sessionId":session,"timestamp":"2026-02-02T00:00:01Z","message":{"id":"msg-e1","role":"assistant","content":[{"type":"text","text":"EventsBase answer"}]}}),
+            json!({"type":"user","sessionId":session,"uuid":"c1","isCompactSummary":true,"timestamp":"2026-02-02T00:00:02Z","message":{"role":"user","content":"Summary carrying Zorbakplum detail"}}),
+            json!({"type":"attachment","sessionId":session,"uuid":"q1","timestamp":"2026-02-02T00:00:03Z","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"Midturn Quuxelmid note","origin":{"kind":"human"}}}),
+            json!({"type":"assistant","sessionId":session,"timestamp":"2026-02-02T00:00:04Z","message":{"id":"msg-e2","role":"assistant","content":[{"type":"tool_use","id":"toolu_e1","name":"AskUserQuestion","input":{}}]}}),
+            json!({"type":"user","sessionId":session,"timestamp":"2026-02-02T00:00:05Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_e1","content":"x"}]},"toolUseResult":{"questions":[{"question":"Which Dravixtopic applies?","header":"Topic","options":[{"label":"Alpha"},{"label":"Beta"}]}],"answers":{"Which Dravixtopic applies?":"Selvarune"}}}),
+            json!({"type":"custom-title","customTitle":"EventsNative title","sessionId":session}),
+        ];
+        fs::write(
+            &path,
+            rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )?;
+        let payload = json!({"session_id":session,"transcript_path":path,"cwd":project,"hook_event_name":"Stop","stop_hook_active":false});
+        let saved = hook(binary, &home, &project, endpoint, "Stop", payload.clone())?;
+        ensure!(
+            saved["systemMessage"]
+                .as_str()
+                .unwrap_or("")
+                .contains("saved 4 documents; pending 0"),
+            "session events capture {session}: {saved}"
+        );
+        let posts = count_posts(
+            &client
+                .get(format!("{endpoint}/__state"))
+                .send()?
+                .error_for_status()?
+                .json()?,
+        );
+        hook(binary, &home, &project, endpoint, "Stop", payload)?;
+        ensure!(
+            count_posts(
+                &client
+                    .get(format!("{endpoint}/__state"))
+                    .send()?
+                    .error_for_status()?
+                    .json()?
+            ) == posts,
+            "acknowledged session events resent for {session}"
+        );
+    }
+    let raw_document = |id: &str| -> Result<Value> {
+        Ok(client
+            .get(format!("{endpoint}/v3/documents/{id}"))
+            .bearer_auth(API_KEY)
+            .send()?
+            .error_for_status()?
+            .json()?)
+    };
+    let mut event_ids = vec![];
+    for (word, kind) in [
+        ("Zorbakplum", "compaction"),
+        ("Quuxelmid", "message"),
+        ("Selvarune", "answer"),
+    ] {
+        let found = mcp.tool(
+            "search_memory",
+            json!({"query":word,"sessionId":events_session}),
+        )?;
+        let results = found["results"]
+            .as_array()
+            .with_context(|| format!("session event search {kind}: {found}"))?;
+        ensure!(!results.is_empty(), "session event {kind} not returned: {found}");
+        let mut hit = false;
+        for row in results {
+            let raw = raw_document(row["id"].as_str().context("session event id")?)?;
+            ensure!(
+                raw["metadata"]["sessionId"] == events_session,
+                "session filter returned another session: {}",
+                raw["metadata"]
+            );
+            if raw["metadata"]["eventKind"] == kind {
+                let metadata = &raw["metadata"];
+                ensure!(
+                    metadata["type"] == "session-event"
+                        && metadata["turn"].is_null()
+                        && metadata["captureKey"].is_null()
+                        && (kind != "compaction" || metadata["memoryIndex"]["recallable"] == false),
+                    "session event {kind} metadata: {metadata}"
+                );
+                event_ids.push(row["id"].as_str().unwrap_or("").to_string());
+                hit = true;
+            }
+        }
+        ensure!(hit, "session event {kind} missing by body-only word: {found}");
+    }
+    let recent: Value = client
+        .post(format!("{endpoint}/v3/documents/list"))
+        .bearer_auth(API_KEY)
+        .json(&json!({"projection":"index","recentTasks":true,"page":1,"limit":50}))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    ensure!(
+        event_ids.iter().all(|id| !recent.to_string().contains(id.as_str())),
+        "session events appeared in recentTasks: {recent}"
+    );
+    checks.push("native Stop stores session-event documents after turns, resends nothing, and sessionId search returns the three kinds (recallable:false checkpoint by body-only word) without leaking other sessions or recentTasks");
     // 既定の recallScope=session で、再開前の同じ会話（旧 ID A）の記録だけが、A の時刻の上限以下に限って注入されること。
     // クライアントが transcript の timestamp（ミリ秒付き ISO 8601・Z）をそのまま sessionUntil として送り、
     // 実 workerd のサーバーが julianday() で射影の source_date と比べる。書式が噛み合わなければ 0 件になるため、実物の書式で通す。
@@ -2384,7 +2488,9 @@ fn recall_contracts(
             }
             f.sql("UPDATE container_tags SET updated_at = '2000-01-01T00:00:00.000Z' WHERE tag = 'oldest-tail'",json!([]))?;
             f.clear_counts()?;
-            let result = f.search("NeedleTail")?;
+            let result = f
+                .mcp
+                .tool("search_memory", json!({"query":"NeedleTail","includeProfile":true}))?;
             ensure!(
                 result.to_string().contains(&wanted)
                     && result["searchScope"] == "all-containers"

@@ -51,7 +51,7 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
     let (requests_tx, requests_rx) = mpsc::channel();
     let fixture = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(25);
-        for _ in 0..5 {
+        for _ in 0..7 {
             let mut stream = support::accept_blocking(&listener, || Instant::now() < deadline)
                 .expect("fixture accept timed out");
             stream
@@ -95,6 +95,11 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
                 json!({"user":{"id":"owner","name":"Local"},"role":"owner","accessType":"api-key"})
             } else if first.starts_with("GET /v3/container-tags") {
                 json!({"spaces":[{"containerTag":"memories","documentCount":1}],"pagination":{"hasMore":false}})
+            } else if first.starts_with("POST /v4/search ") {
+                let row = |id: &str, session: &str| {
+                    json!({"id":id,"containerTag":"memories","metadata":{"sessionId":session,"memoryIndex":{"version":1,"title":"Selection state","description":"Selection state","sections":[],"recallable":true,"sourceKind":"conversation","sourceUpdatedAt":"2026-10-01T00:00:00Z"}}})
+                };
+                json!({"searchScope":"all-containers","searchedContainers":["memories"],"spaceDiscoveryComplete":true,"results":[row("other-doc","elsewhere"),row("mine-doc","mine")]})
             } else {
                 panic!("unexpected fixture route {first}");
             };
@@ -256,6 +261,49 @@ fn real_mcp_transport_preserves_protocol_storage_and_roots() {
         identity["result"]["structuredContent"]["defaultStorageContainer"],
         "memories"
     );
+    // 未解決の "current" は固定エラーで、検索リクエストを送らない。
+    let unresolved = mcp.exchange(
+        12,
+        "tools/call",
+        json!({"name":"search_memory","arguments":{"query":"Selection","sessionId":"current"}}),
+    );
+    assert_eq!(unresolved["result"]["isError"], true);
+    assert!(
+        unresolved["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("resolved only by the Remnifold Claude Code hook")
+    );
+    // 既定ではコンテナー一覧を省き、sessionId で他セッションの行を除く。
+    let search = mcp.exchange(
+        13,
+        "tools/call",
+        json!({"name":"search_memory","arguments":{"query":"Selection","sessionId":"mine"}}),
+    );
+    let structured = &search["result"]["structuredContent"];
+    assert!(structured.get("searchedContainers").is_none());
+    assert!(structured.get("profile").is_none());
+    assert_eq!(structured["discoveredContainerCount"], 1);
+    assert_eq!(structured["results"].as_array().unwrap().len(), 1);
+    assert_eq!(structured["results"][0]["id"], "mine-doc");
+    // whoAmI の GET 2 件が先に積まれているので、検索リクエストまで読み飛ばす。
+    let (_, body) = loop {
+        let request = requests_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if request.0.starts_with("POST /v4/search ") {
+            break request;
+        }
+    };
+    assert_eq!(body["sessionId"], "mine");
+    assert!(body.get("indexOnly").is_none());
+    // includeProfile:true ではコンテナー一覧を従来どおり返す。
+    let profiled = mcp.exchange(
+        14,
+        "tools/call",
+        json!({"name":"search_memory","arguments":{"query":"Selection","sessionId":"mine","includeProfile":true}}),
+    );
+    let structured = &profiled["result"]["structuredContent"];
+    assert_eq!(structured["searchedContainers"], json!(["memories"]));
+    assert_eq!(structured["profile"]["containers"], json!(["memories"]));
     fixture.join().unwrap();
     let error = mcp.exchange(11,"tools/call",json!({"name":"add_memory","arguments":{"content":"local-mcp-fixture-key","sourceFolder":"relative/local-mcp-fixture-key"}}));
     assert_eq!(error["result"]["isError"], true);
