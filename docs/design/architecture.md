@@ -30,3 +30,9 @@ D1 の過負荷は `request_overloaded` と記録し、503 と `Retry-After: 10`
 - 索引照合は索引/保存タイトル、説明、セクション、現在の話題をつないだ1文字列を `GLOB` で調べ、用語ごとの `json_each` を使わない。Unicode の大小文字変種を含む。`NOT v1 OR match` の3値優先、重み、rowid の同順位は射影前と同一で、サーバーテストが行、`rowsRead`、プランを比べる。
 - 射影のトリガーは `memories` に書き戻さない。想起候補の本文読み取りは旧文書の互換索引を導出するが、保存メタデータは更新しない。
 - MCP で `searchedContainers` を省いても `discoveredContainerCount`、`searchScope`、`spaceDiscoveryComplete` は残る。
+
+## D1 の更新コスト
+
+SQLite は UPDATE の準備時に発火しうるトリガー本体を展開するため、移行 0016 は `memories_after_update`、`memory_organization_source_update`、`memory_organization_capture_conflict_update`、`memory_search_projection_memory_update` を状態だけの更新から外す。射影の `OLD.rowid IS NOT NEW.rowid` は `OF` に書けない。0017 では、`vector_attempted_at` が NULL で並ぶとき上限内で選ばれる `indexed` 行だけは変わりうる。
+
+0018 は衝突処理を `memory_organization_capture_invalidations` への `INSERT OR ABORT` に集め、失敗を元の文へ伝える。準備命令数は upsert の例で 164,181 から 19,259。`recursive_triggers` が ON なら上限近くの依存連鎖は1段早く失敗する。

@@ -12,7 +12,7 @@ Remnifold は、現在の製品、プラグイン、リポジトリの名前で�
 - 0016 は4つの `memories` UPDATE トリガーを `AFTER UPDATE OF` に限定する。状態列だけの更新は重い本体を準備しない。`WHEN` の列は `OF` にも含め、`rowid` は更新しない。発火順を保つ。
 - 0017 は custom ID とベクトル照合の索引を加える。コードで強制するのは `replaceFacts` の `idx_facts_identity` だけ。
 - 0018 は capture 衝突の無効化を空ビュー上の1つの INSTEAD OF トリガーに集める。R（兄弟）、S（依存要約）、P（ピア）を文ごとに再評価し、実体化しない。既存ビューの変更時は展開式も直し、同値性を確かめる。依存連鎖でのトリガー深さは3から4に増える（workerd の測定上限10、D1 本番は未確認）。戻すには新しい移行を使う。
-- 0019 は統合ソースのカバリング索引に替える。対象の集計は、生きた全行に検索射影があることを前提とする。
+- 0019 は統合ソースのカバリング索引に替える。`consolidationTargets` は `projectKey` なしなら射影で絞った後に `is_forgotten = 0` と `sm_consolidation` を確かめ、射影の欠落は対象の黙った欠落になる。`projectKey` ありでは 0007 の索引を使う。
 - 0020 は埋め込みの再試行表と候補索引を加え、Worker より先に適用する。
 - 0021 は抽出（事実・トピック）の再試行表 `memory_extraction_retries`（主キー `memory_id`、版ごとの試行回数と次回時刻、行の削除で連鎖削除）、cron の重複起動で AI を2回呼ばないための1行だけの枠表 `memory_extraction_retry_slot`、部分索引 `idx_memories_extraction_backlog` を加え、Worker より先に適用する。`memories` の列は増えない。
 

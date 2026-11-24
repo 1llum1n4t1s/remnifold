@@ -1,4 +1,4 @@
-# Setup registration configuration
+# Configuration
 
 ## Setup の登録
 
@@ -28,3 +28,9 @@
 ## Linux の詳細
 
 autostart は `Terminal=false`、`NoDisplay=true`、`X-GNOME-Autostart-enabled=true`。`XDG_CONFIG_HOME` が未設定か相対なら `~/.config` を使い、上書き時は `/usr/bin/env "REMNIFOLD_HOME=…"` を前置する。引数は引用し、`"`、バッククォート、`$`、`\` をエスケープして、文字列の `\` と `%` は二重にする。`PPid` で祖先を、`/proc/<pid>/exe` が AppImage 自体かでランタイムを除外する。`UpdateNix` は展開後に `mv -f`（`pkexec` へのフォールバックあり）で置き換える。
+
+## 抽出の拾い直しの調整
+
+動作は [enrichment-and-topics.md](enrichment-and-topics.md#抽出の拾い直し)。平均約20 Neurons/件で、上限48件/日なら約960/日、長い応答が多ければ約1,700〜2,750/日（無料枠10,000/日）。`server/src/index.ts` の定数は `EXTRACTION_RETRY_INTERVAL_MINUTES`（30。60なら24件/日）、`EXTRACTION_RETRY_BUSY_DAY_THRESHOLD`、`EXTRACTION_RETRY_MAX_ATTEMPTS`、`EXTRACTION_RETRY_TIMEOUT_MS`。
+
+任意の `EXTRACTION_BACKLOG_UNTIL`（ISO 8601 UTC）は期限付きの一括モード。未設定・空・不正・過去、期限の7日前より早い間は通常モード。15分枠ごとに最大20件を同時4件で処理し、忙しい日の判定を飛ばす。cron 開始から8分で新しい行を始めず、失敗しても残りを続け、最初の例外を最後に再送出する。最大80件/時（約1,600 Neurons/時）なので期限を短くし、`wrangler*.jsonc` に常設せず、過ぎたら外す。
