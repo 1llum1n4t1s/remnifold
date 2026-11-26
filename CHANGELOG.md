@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.41 - 2026-11-27
+
 ### 変更
 
 - Windows の Setup が、Claude Code または Codex が Toolport ゲートウェイにつながっていて、Toolport の registry に `remnifold` を `mcp` 引数で起動する有効なサーバーがある（使われる全プロファイルで有効）ときは、`claude mcp add` / `codex mcp add` による直接登録を省くようにしました。Windows 以外では判定せず直接登録し、Windows でも判定できない場合は直接登録します。前回未完了（CLI が無かった・失敗した）のクライアントも同じ判定にかけます。既存の直接登録は外さず、Setup が一度直接登録したクライアントは、利用者が外しても自動では足し直しません（戻すのは Setup が省いたクライアントだけ）。省いたあとクライアントから Toolport ゲートウェイが消えた場合、または Toolport が指す `remnifold` の実行ファイルが無くなった場合は、次の起動時（`mcp` の起動・引数なしの起動・ログオン時の適用）に直接登録へ戻します。Toolport 側で無効化・削除した場合は足しません。Claude Code のフックは省いた場合も統合しますが、Claude Code の CLI も `~/.claude` フォルダーも無いときは作りません。`remnifold.json` の `mcpRegistration`（`auto` 既定 / `direct` / `off`）で止められます。手動の `connect` は常に直接登録し、Toolport が既に提供している場合は結果 JSON に `toolport` の重複の通知を付けます。
