@@ -2295,16 +2295,34 @@ const SEARCH_LOWER_VARIANTS: Record<string, string> = {
   "ᾳ": "ᾼ", "ῃ": "ῌ", "ῳ": "ῼ", "ω": "Ω", "k": "K", "å": "Å",
 };
 
+// D1 は LIKE/GLOB のパターンを UTF-8 で 50 バイトまでに制限し、超えると検索全体が失敗する。
+// https://developers.cloudflare.com/d1/platform/limits/
+const D1_PATTERN_MAX_BYTES = 50;
+
+// 両端の `*` を含めて上限に収める。収まらない語は末尾を落として先頭部分の一致にする。
+// 1文字分の断片（`[..]` を含む）を単位に切るので、文字クラスやコードポイントは分断しない。
+function boundedGlobPattern(fragments: string[]): string {
+  const encoder = new TextEncoder();
+  let body = "";
+  let bytes = 2;
+  for (const fragment of fragments) {
+    bytes += encoder.encode(fragment).length;
+    if (bytes > D1_PATTERN_MAX_BYTES) break;
+    body += fragment;
+  }
+  return `*${body}*`;
+}
+
 function indexQueryPatterns(terms: string[]): string {
   // SQLite lowerはASCIIだけを畳む。非ASCIIの大小文字はUnicode文字クラスで候補に戻す。
-  const patterns = terms.map((term) => ({ weight: Math.min(12, term.length), pattern: `*${[...term].map((letter) => {
+  const patterns = terms.map((term) => ({ weight: Math.min(12, term.length), pattern: boundedGlobPattern([...term].map((letter) => {
     if (letter === "*") return "[*]";
     if (letter === "?") return "[?]";
     if (letter === "[") return "[[]";
     const upper = letter.toUpperCase();
     const variants = letter + (/[^\x00-\x7F]/u.test(letter) && upper !== letter && [...upper].length === 1 ? upper : "") + (SEARCH_LOWER_VARIANTS[letter] ?? "");
     return [...variants].length > 1 ? `[${variants}]` : letter;
-  }).join("")}*` }));
+  })) }));
   return JSON.stringify(patterns);
 }
 

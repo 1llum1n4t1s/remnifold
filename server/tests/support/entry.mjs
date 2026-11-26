@@ -18,6 +18,7 @@ import "../recent-tasks-load.test.mjs";
 import "../search-load.test.mjs";
 import "../search-projection.test.mjs";
 import "../search-session.test.mjs";
+import "../search-pattern-limit.test.mjs";
 import "../trigger-update-columns.test.mjs";
 import "../capture-conflict-single-body.test.mjs";
 import "../consolidation-due.test.mjs";
