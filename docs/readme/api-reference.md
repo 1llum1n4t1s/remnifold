@@ -3,7 +3,7 @@
 ## Find and read
 
 - `listTopics` lists content categories. Pass a `topic` to `listDocuments` or `listMemories`; `__unclassified__` selects records with no current topic, including failed, disabled or skipped classification. Both legacy spaces and shared records are included.
-- `search_memory` searches all stored projects by default. `sessionId` limits it to one session. `"current"` works only in Claude Code, where its `PreToolUse` hook resolves it for the directly registered `mcp__remnifold__search_memory` and for `search_memory` called through the Toolport gateway's `toolport_call_tool` (see [MCP registration](configuration.md#mcp-registration)); Codex, other gateways and calls inside `toolport_run_script` must use an actual ID. `includeProfile: true` adds the searched container list.
+- `search_memory` searches all stored projects by default. `sessionId` limits it to one session. `"current"` works only in Claude Code, where its `PreToolUse` hook resolves it for the directly registered `mcp__remnifold__search_memory` and for `search_memory` called through the Toolport gateway's `toolport_call_tool` (see [MCP registration](mcp-registration.md)); Codex, other gateways and calls inside `toolport_run_script` must use an actual ID. `includeProfile: true` adds the searched container list.
 - `getDocument` reads a full record. Organized summaries and checkpoints can include source previews and `sourceCursor` paging.
 - `listSpaces` exposes physical spaces for compatibility and diagnostics.
 
@@ -17,4 +17,4 @@ Global search includes spaces beyond the old discovery limit. An older server us
 
 Checkpoint content and metadata cannot be updated directly (HTTP 409). Edit its sources and regenerate it. Re-enrichment and deletion remain supported.
 
-Use `whoAmI` to check the connection and space discovery. Recall settings are in [configuration](configuration.md#recall).
+Use `whoAmI` to check the connection and space discovery. Recall settings are in [configuration](recall-settings.md).

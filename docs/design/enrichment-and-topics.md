@@ -20,7 +20,7 @@
 
 ## 抽出の拾い直し
 
-事実・トピックが未完了で埋め込み済みの行は、15分 cron の3段目 `retryMissingExtractions` が30分に1件、1行最大3回まで拾い直す。条件・確保・既知の未対応は [vector-reconciliation.md](vector-reconciliation.md#抽出の拾い直し)、消費と定数は [configuration.md](configuration.md#抽出の拾い直しの調整)。
+事実・トピックが未完了で埋め込み済みの行は、15分 cron の3段目 `retryMissingExtractions` が30分に1件、1行最大3回まで拾い直す。条件・確保・既知の未対応は [vector-reconciliation.md](vector-reconciliation.md#抽出の拾い直し)、消費と定数は下の「抽出の拾い直しの調整」。
 
 ## 事実の新旧と復帰
 
@@ -35,3 +35,9 @@
 ## D1 の更新コスト
 
 トリガーの準備費用は [architecture.md](architecture.md#d1-の更新コスト)、統合対象の集計は [storage-and-provenance.md](storage-and-provenance.md) を参照。
+
+## 抽出の拾い直しの調整
+
+平均約20 Neurons/件で、上限48件/日なら約960/日、長い応答が多ければ約1,700〜2,750/日（無料枠10,000/日）。定数は `server/src/index.ts` の `EXTRACTION_RETRY_INTERVAL_MINUTES`（30）、`_BUSY_DAY_THRESHOLD`、`_MAX_ATTEMPTS`、`_TIMEOUT_MS`。
+
+任意の `EXTRACTION_BACKLOG_UNTIL`（ISO 8601 UTC）は期限前7日間だけ効く一括モードで、15分枠ごとに最大20件を同時4件で処理し、忙しい日の判定を飛ばす。cron 開始から8分で新しい行を始めず、失敗しても続けて最初の例外を最後に再送出する。最大約1,600 Neurons/時なので `wrangler*.jsonc` に常設せず、期限が過ぎたら外す。

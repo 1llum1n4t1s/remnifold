@@ -14,7 +14,7 @@ Automatic recall is off by default. With it enabled, `recallScope: session` sear
 
 Set `recallScope: all` to search all sessions and include labeled recent work. These entries suggest prior work without implying relevance. Automatic context is an index of titles, descriptions, sections, dates and IDs, sometimes with a short original passage to verify. It prefers relevant checkpoints without repeating covered originals.
 
-The default is three records, at most 3,000 UTF-16 units. Unchanged entries are not repeated until the context is compacted or cleared. Short follow-ups can recover a concrete topic from bounded session history. Without one, no search runs. See [recall architecture](architecture.md#recall) and [configuration](configuration.md#recall).
+The default is three records, at most 3,000 UTF-16 units. Unchanged entries are not repeated until the context is compacted or cleared. Short follow-ups can recover a concrete topic from bounded session history. Without one, no search runs. See [recall architecture](architecture.md#recall) and [configuration](recall-settings.md).
 
 ## Capture and checkpoints
 

@@ -11,8 +11,22 @@ Worker は `server/src/` の TypeScript。`dev/` のタスクランナーは整�
 一般利用者はユーザー単位の Velopack Setup（packId `RemnifoldApp`、Windows は `%LOCALAPPDATA%\RemnifoldApp\current\remnifold.exe`）を使う。strict な `install` は別フォルダー（`Programs\Remnifold`）の上級者向け経路で、1.0.32 で凍結した（オーナー決定、2026-11-18）。それより新しい版は Setup だけで公開する。`connect` は実行した側の実行ファイルで登録を置き換える。設定と状態は `native/src/paths.rs` のフォルダーに置き、更新で置き換わる導入フォルダーには入れない。
 
 - 取得と適用の分離、公開の流れ: [workflow.md](workflow.md)
-- 登録、ログオンのエントリ、プロセス検出、OS ごとの差: [configuration.md](configuration.md)
+- Setup の登録と Toolport 判定: [configuration.md](configuration.md)
 - 署名者の検証と信頼の限界: [security.md](security.md)
 - Linux の隔離 E2E と未検証の範囲: [testing.md](testing.md)
 
 引数なしの端末起動は MCP クライアントではないため、登録の後にインストール状態と自動更新を説明し、対話的で接続がなければサーバー URL を尋ねて `setup` を始める。stdin がパイプなら既定の `mcp` として動く。
+
+## OS ごとの登録
+
+| OS | ログオンのエントリ | プロセス検出 |
+| --- | --- | --- |
+| Windows | HKCU `Run` の `<packId> Update`、`conhost.exe --headless` | 導入フォルダーの実行ファイル |
+| macOS | LaunchAgent `com.kagayoi.<packId>.update.plist` | バンドルに対する `proc_listallpids`/`proc_pidpath` |
+| Linux | XDG autostart の `com.kagayoi.<packId>.update.desktop` | `/proc/<pid>/environ` の `APPIMAGE` |
+
+別の導入を指す同名のエントリは変えず、設定済みの `REMNIFOLD_HOME` は引き継ぐ。macOS と Linux には Velopack のフックもアンインストーラーもない。
+
+- macOS の plist は `RunAtLoad` と `AbandonProcessGroup`（ないと launchd が `UpdateMac` を終了させる）を持ち、bootstrap しないので初回は次のログイン。`.pkg` の postinstall には `VELOPACK_FIRSTRUN` が渡らないことがある。
+- Linux は AppImage 自体を登録し、移動は新しいパスとして扱う。`Exec` は Desktop Entry の規則で引用・エスケープし、改行を拒む。所有は `X-Remnifold-Executable=<path>` の完全一致。検出は呼び出し元、祖先（`PPid`）、AppImage ランタイムを除き、継承した子 CLI も使用中に数える。`UpdateNix` は `mv -f`（`pkexec` へのフォールバックあり）で置き換える。
+- `uninstall-setup --apply` は自身を指す登録、ログオンのエントリ、状態を除く（既定は計画の表示）。Windows のアンインストールフックも同じ。エントリがなければ CLI の失敗は不在とみなす。
