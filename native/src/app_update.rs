@@ -244,7 +244,7 @@ impl SetupContext {
 }
 
 /// インストール・更新の直後の登録（Windows のフック）。`fresh`（インストール）のときは前回の状態を忘れ、
-/// Claude Code・Codex とログオン時の適用を全て張り直す。更新では [`registration::plan`] のとおり、
+/// Claude Code・Codex とログオン時の適用を全て張り直す。更新では [`registration::plan_with_hooks_target`] のとおり、
 /// ログオン時の適用とフックだけを張り直し、MCP の登録はパスが同じなら CLI を呼ばない（使用中のセッションの
 /// 登録を外して付け直さない）。CLI は1回3秒で打ち切り（フックの時間制限のため）、終わらなかった CLI は状態に
 /// 未完了と残して、ログオン時の `update-apply` などでやり直す。
@@ -370,11 +370,7 @@ pub fn startup() -> Startup {
             })
             .on_after_update_fast_callback(|_| {
                 guarded("updated", || {
-                    register_everything(
-                        "updated",
-                        false,
-                        Some(registration::UPDATED_HOOK_BUDGET),
-                    )
+                    register_everything("updated", false, Some(registration::UPDATED_HOOK_BUDGET))
                 })
             })
             .on_before_uninstall_fast_callback(|_| guarded("uninstall", unregister_everything));

@@ -16,5 +16,6 @@ pub mod release_manifest;
 pub mod search;
 pub mod session_events;
 pub mod throttle;
+pub mod toolport;
 pub mod topics_setup;
 pub mod updater;

@@ -206,6 +206,7 @@ pub fn read_settings(config: &Config) -> Value {
         "codexHome": config.codex_home.to_string_lossy(),
         "configHome": config.roots.config.to_string_lossy(),
         "recallMode": raw.get("recallMode").filter(|v| !v.is_null() && *v != "" && *v != false).cloned().unwrap_or(json!("off")),
+        "mcpRegistration": raw.get("mcpRegistration").cloned().unwrap_or(Value::Null),
         "maxMemories": memories,
         "maxRecentTasks": raw["maxRecentTasks"].as_f64().filter(|n| n.is_finite() && n.fract()==0.0).map(|n| n.clamp(0.0,3.0) as i64).unwrap_or(2),
         "recallScope": if raw["recallScope"] == "all" { "all" } else { "session" },

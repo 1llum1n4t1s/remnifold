@@ -2,13 +2,13 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^mcp__remnifold__",
+        "matcher": "^mcp__remnifold__|^mcp__toolport__toolport_call_tool$",
         "hooks": [
           {
             "type": "command",
             "command": "cargo run --quiet --locked --manifest-path \"${PLUGIN_ROOT}/native/Cargo.toml\" -- hook PreToolUse",
             "timeout": 5,
-            "statusMessage": "Checking memory access..."
+            "statusMessage": "Checking tool access..."
           }
         ]
       }

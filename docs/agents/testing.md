@@ -7,7 +7,8 @@
 - ネイティブ CLI/MCP/フックの子プロセステストは、認証済みフィクスチャで保存、検索、忘却、capture、想起、setup、import、旧リーダー移行を行う。ツールの形、Unicode、伏せ字化した失敗、上限付き待機、受領記録の並行性、v2 マルチパート、確認済み再試行の抑止を保つ。
 - Codex import は Codex だけを読む。Claude の行は `type` で分類し、thinking、ツール、要求コピー、サイドチェーン、メタ、他セッションを除く。通知の継続は以前のキーを変えない。
 - 圧縮要約、途中発言、質問回答は別記録で、turn/part/captureKey/captureVersion を持たず、uuid（回答は tool use ID）ごとに 1 件とする。圧縮は `recallable: false`。連絡先の伏せ字と個人情報の回答の置き換えを検証する。
-- 手動検索の `sessionId: "current"` は直接登録の Claude `PreToolUse` だけが解決し、ゲートウェイでは解決しない。
+- 手動検索の `sessionId: "current"` は Claude `PreToolUse` だけが解決する（直接登録と、Toolport の `toolport_call_tool` 経由。他のゲートウェイや `toolport_run_script` 内では解決しない）。Toolport 経由は、`name` が「registry 上の Remnifold サーバーの id を前置きに変換したもの（`[A-Za-z0-9_]` 以外を `_` に）+ `__` + 読み取り7ツール」と完全一致するときだけで、別名・書き込みツール・registry が読めない場合は許可しない。
+- `native/src/toolport.rs` は Edictora `crates/edictora/src/install/toolport.rs` が正本のバイト同一の複製で、ここでは編集しない。判定ルールのテストは正本のファイル内にあり、Remnifold では `app_update::registration::plan` に判定を注入して（Windows 以外は判定せず直接登録、実行ファイルが無ければ直接登録へ戻す、前回未完了のクライアントも判定する、Claude Code の CLI も `~/.claude` も無ければフックを作らない）確かめる。
 
 ## 想起
 

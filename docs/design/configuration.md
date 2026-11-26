@@ -9,6 +9,22 @@
 - `recallMode` が off（未設定も off）なら `SessionStart` と `UserPromptSubmit` を外し、`Stop` と `PreToolUse` は残す。モードが変わるか記録がなければ、この実行ファイルを指す自身のフックを持つ設定だけを CLI なしで書き直す。反映は次のセッションから。静的なプラグインと strict の登録は 4 フックを保ち、実行時の off 確認に頼る。
 - macOS と Linux には Velopack のフックもアンインストーラーもない。引数なしの起動で同期的に登録し、`mcp` の更新スレッドが再確認する。最小限の `PATH` に備えて、`~/.local/bin`、`~/.claude/local`、`~/.npm-global/bin`、`/usr/local/bin` と Homebrew の場所（macOS `/opt/homebrew/bin`、Linux `/home/linuxbrew/.linuxbrew/bin`）も探し、CLI のフォルダーを子の `PATH` の先頭に足す。
 
+## Toolport 判定と `mcpRegistration`
+
+判定は `native/src/toolport.rs`。これは Edictora の `crates/edictora/src/install/toolport.rs` を正本とする、バイト単位で同一の複製（Plumivox も同じ複製）で、ここでは編集しない。直すときは正本を直して複製し直す。複製先でビルド・lint が通らなければ止めて正本を見直す。製品ごとの違い（`binary_stem`・`mode_arg`）は呼び出し側が渡す。クライアントごとに、(a) クライアント設定（Claude Code は `<CLAUDE_CONFIG_DIR>/.claude.json` またはホームの `.claude.json` の最上位 `mcpServers`、Codex は `<CODEX_HOME>/config.toml` または `~/.codex/config.toml` の `[mcp_servers.*]`）に実在する Toolport ゲートウェイ（stdio、`toolport-gateway` 系のファイル名か registry の `clientManagedEntries` と一致）があり、(b) Toolport registry（クライアント側ゲートウェイの env、プロセス環境の `TOOLPORT_REGISTRY` / `TOOLPORT_DATA_DIR`、Windows 既定 `%APPDATA%\Toolport\registry.json` の順。`version` は 3）に、`remnifold` を `mcp` 引数で起動する有効な stdio サーバーがあり、使われる全プロファイルの `enabledServerIds` に入っているとき `Served` とする。結果は `Served` / `NotConnected` / `NotServed` / `Unknown`。Windows 以外では何も読まずに `Unknown` とし、判定せず直接登録する。registry が無い・読めない・形式が想定外のときも `Unknown`（直接登録）。条件を満たすサーバーがあっても `command` の実行ファイルが実在しない（または絶対パスでない）ときは、Toolport が提供できない状態なので `NotConnected` として扱い、直接登録へ戻す。Toolport 側での無効化・削除（`NotServed`）とは区別する。サーバーの `env` は読まず、`quarantine.json` は見ない。
+
+`mcpRegistration`（`remnifold.json`、`auto` 既定 / `direct` / `off`。小文字の完全一致のみで、`"Off"`・前後に空白があるものなどの不正値は auto 扱いでログ。null・未設定は警告なしで auto）。状態ファイルに `skipped`（`claude`/`codex` ごとに `toolport` か `off`）を持ち、`done`（直接登録済み）の意味は変えない。
+
+- 新しいパス・状態の作り直し: `off` は `skipped=off`、auto で `Served` は CLI を呼ばず `skipped=toolport`、それ以外は直接登録する。制約: 状態を作り直すとき（初回・exe の場所の変更・状態ファイルなし）に Toolport が提供中なら CLI を呼ばないため、移動前の exe を指す既存の直接登録は付け替えられずに残る（既存の直接登録は外さない方針）。必要なら `claude mcp remove remnifold --scope user` で外す。
+- 前回未完了（`done` にも `skipped` にも無い。CLI が無かった・失敗した）のクライアント: 後で処理するときも判定する。auto は CLI があるときだけ判定し、`Served` なら `skipped=toolport`、それ以外は直接登録する。`direct` は判定せず直接登録、`off` は `skipped=off`。
+- 版だけの更新・通常起動: `done` には触れず、`skipped=toolport` かつ auto のときだけ判定し直し、`NotConnected`（ゲートウェイが消えた、または Toolport が指す実行ファイルが無い）なら直接登録する。契機は `mcp` の起動・引数なしの起動・ログオン時の適用（`native/src/app_update/registration.rs`）で、「次の更新」ではない。`NotServed`（Toolport 側で無効化・削除）と `Unknown` は何もしない。
+- Setup が一度直接登録したクライアント（`done`）は、利用者が外しても自動では足し直さない。戻すのは Setup が省いたクライアント（`skipped`）だけ。
+- モード変更後: `direct` は `skipped` を直接登録し、`auto` は `skipped=off` を新規扱いで判定し、`off` は何もしない。
+- 既存の直接登録は外さない。アンインストールは従来どおり自分を指す直接登録だけを外し、Toolport の設定には書かない。
+- Claude Code のフックは、`Served`・`off` でも統合する。ただし Claude Code の CLI があるか `~/.claude` フォルダーがあるときだけで、どちらも無ければフックも作らず `skipped` も記録しない（次回また判断する）。版更新でのフックの張り直し条件は `done` と `skipped` の和集合に `claude` が含まれるときで、`state.recall` もフックだけ統合した場合に記録する。
+- 手動 `connect` は判定せず直接登録し、`Served` なら結果 JSON に `toolport: {serverId, command, duplicate: true}` を付ける（状態ファイルは変えない）。
+- 直接登録だけを外すには `claude mcp remove remnifold --scope user`（`connect claude-code --remove --apply` はフックも外す）か `codex mcp remove remnifold` を使う。
+
 ## OS ごとの設定
 
 | OS | ログオンのエントリ | プロセス検出 |

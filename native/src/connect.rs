@@ -109,10 +109,10 @@ type HookDef = (
 const HOOKS: [HookDef; 4] = [
     (
         "PreToolUse",
-        Some("^mcp__remnifold__"),
+        Some("^mcp__remnifold__|^mcp__toolport__toolport_call_tool$"),
         5,
         false,
-        "Checking memory access...",
+        "Checking tool access...",
         false,
     ),
     (
@@ -137,6 +137,49 @@ const HOOKS: [HookDef; 4] = [
 /// 自動想起（注入）が有効か。フックの実行時（`hooks::run_hook`）と同じ判定にする: 接続設定を読めない
 /// ときも同じ代わりの設定から [`crate::common::read_settings`] で `recallMode` を読み、無ければ off。
 pub fn recall_enabled() -> bool {
+    setup_settings().recall
+}
+
+/// Claude Code・Codex への MCP の自動登録の方針（`remnifold.json` の `mcpRegistration`）。
+/// `Auto`（既定）は Toolport が既に提供しているクライアントへの新しい直接登録を省き、`Direct` は常に直接登録し、
+/// `Off` は自動の追加・修復をしない（アンインストール時の解除は続ける）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpMode {
+    #[default]
+    Auto,
+    Direct,
+    Off,
+}
+
+impl McpMode {
+    /// 設定値から方針を決める。無い（null）は `Auto`。小文字の完全一致（`auto`/`direct`/`off`）だけを受け付け、大文字・前後の空白付きなど不正な値は `Auto` とし、2つ目を false にする。
+    pub fn from_setting(value: &Value) -> (McpMode, bool) {
+        match value {
+            Value::Null => (McpMode::Auto, true),
+            Value::String(text) => match text.as_str() {
+                "auto" => (McpMode::Auto, true),
+                "direct" => (McpMode::Direct, true),
+                "off" => (McpMode::Off, true),
+                _ => (McpMode::Auto, false),
+            },
+            _ => (McpMode::Auto, false),
+        }
+    }
+}
+
+/// Setup の登録が使う接続設定（1回だけ読み、判定と書き込みで同じ値を使う）。
+#[derive(Debug, Clone, Copy)]
+pub struct SetupSettings {
+    /// 自動想起（注入）が有効か。
+    pub recall: bool,
+    /// MCP の自動登録の方針。
+    pub mode: McpMode,
+    /// `mcpRegistration` が不正な値で、`Auto` として扱ったか（ログ用）。
+    pub invalid_mode: bool,
+}
+
+/// 接続設定（`remnifold.json`）から [`SetupSettings`] を読む。読めないときは [`recall_enabled`] と同じ代わりの設定を使う。
+pub fn setup_settings() -> SetupSettings {
     use crate::common::{Config, codex_home, load_config, read_settings};
     let config = load_config(None).unwrap_or_else(|_| Config {
         base_url: String::new(),
@@ -145,7 +188,26 @@ pub fn recall_enabled() -> bool {
         codex_home: codex_home(),
         roots: crate::paths::Roots::current(),
     });
-    read_settings(&config)["recallMode"] != "off"
+    let settings = read_settings(&config);
+    let (mode, valid) = McpMode::from_setting(&settings["mcpRegistration"]);
+    SetupSettings {
+        recall: settings["recallMode"] != "off",
+        mode,
+        invalid_mode: !valid,
+    }
+}
+
+/// Toolport の判定が Remnifold の MCP サーバーを見分けるための製品情報。
+pub const TOOLPORT_PRODUCT: crate::toolport::Product = crate::toolport::Product {
+    binary_stem: "remnifold",
+    mode_arg: "mcp",
+};
+
+/// 手動の `connect` の結果へ、Toolport が既に提供している場合の重複の通知を付ける（登録は止めない）。
+fn attach_toolport_notice(result: &mut Value, detection: crate::toolport::Detection) {
+    if let crate::toolport::Detection::Served { server_id, command } = detection {
+        result["toolport"] = json!({"serverId": server_id, "command": command, "duplicate": true});
+    }
 }
 
 /// `recall` のときに登録するフックのイベント名。
@@ -223,11 +285,22 @@ pub fn run(args: &[String]) -> Result<()> {
         "Remnifold is not installed at {}. Run remnifold install --version <version> --apply first.",
         executable.display()
     );
-    let result = match tool {
-        "claude-code" => claude_code(&executable, cli, apply, false, recall_enabled())?,
-        "codex" => codex(&executable, cli, apply, false)?,
+    let (mut result, client) = match tool {
+        "claude-code" => (
+            claude_code(&executable, cli, apply, false, recall_enabled())?,
+            crate::toolport::ClientId::ClaudeCode,
+        ),
+        "codex" => (
+            codex(&executable, cli, apply, false)?,
+            crate::toolport::ClientId::Codex,
+        ),
         _ => bail!("Unknown tool. Use claude-code or codex."),
     };
+    // 登録は判定に関わらず従来どおり行い、Toolport が既に提供しているときだけ重複を知らせる。
+    attach_toolport_notice(
+        &mut result,
+        crate::toolport::detect(&TOOLPORT_PRODUCT, client, &crate::toolport::Env::process()),
+    );
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -322,6 +395,19 @@ fn claude_code(
     bounded: bool,
     recall: bool,
 ) -> Result<Value> {
+    let mut result = claude_hooks(executable, apply, recall)?;
+    let mcp_args = mcp_add_args(executable, true);
+    result["mcpCommand"] = json!(format!("claude {}", display_args(&mcp_args)));
+    if !apply {
+        return Ok(result);
+    }
+    result["mcp"] = register_mcp(cli.or_else(|| find_cli("claude")), &mcp_args, true, bounded)?;
+    Ok(result)
+}
+
+/// Claude Code のフック（settings.json）だけを統合する。MCP の登録（CLI）は行わない。
+/// Toolport が MCP を提供している・自動登録を止めている場合でも、フックは統合する。
+fn claude_hooks(executable: &Path, apply: bool, recall: bool) -> Result<Value> {
     let settings_path = claude_settings_path();
     let mut settings = match fs::read(&settings_path) {
         Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map_err(|_| {
@@ -332,7 +418,6 @@ fn claude_code(
     };
     let before = settings.clone();
     merge_hooks(&mut settings, executable, recall)?;
-    let mcp_args = mcp_add_args(executable, true);
     let mut result = json!({
         "tool":"claude-code",
         "applied":apply,
@@ -340,8 +425,7 @@ fn claude_code(
         "settings":settings_path,
         "hooks": registered_events(recall),
         "recallHooks": recall,
-        "hooksChanged": settings != before,
-        "mcpCommand": format!("claude {}", display_args(&mcp_args))
+        "hooksChanged": settings != before
     });
     if !apply {
         return Ok(result);
@@ -359,7 +443,6 @@ fn claude_code(
             false,
         )?;
     }
-    result["mcp"] = register_mcp(cli.or_else(|| find_cli("claude")), &mcp_args, true, bounded)?;
     Ok(result)
 }
 
@@ -669,6 +752,27 @@ pub fn refresh_claude_hooks_for_setup(executable: &Path, recall: bool) -> (bool,
     }
 }
 
+/// Toolport が MCP を提供している（または自動登録を止めている）Claude Code で、フックだけを統合する
+/// （CLI は呼ばない。settings.json が無ければ作る）。返す bool は、統合が済んだ（変更不要を含む）か。
+pub fn integrate_claude_hooks_for_setup(executable: &Path, recall: bool) -> (bool, String) {
+    match claude_hooks(executable, true, recall) {
+        Ok(value) => (
+            true,
+            if value["hooksChanged"] == true {
+                "claude: hooks integrated (MCP registration not needed)".to_string()
+            } else {
+                "claude: hooks unchanged (MCP registration not needed)".to_string()
+            },
+        ),
+        Err(error) => (false, format!("claude: hooks failed: {error}")),
+    }
+}
+
+/// Claude Code の設定フォルダー（`~/.claude`、`CLAUDE_CONFIG_DIR` があればそれ）があるか。
+pub fn claude_home_exists() -> bool {
+    claude_settings_path().parent().is_some_and(Path::is_dir)
+}
+
 /// その CLI が見つかるか（プロセスを起動しない軽い確認。登録をやり直すべきかの判定に使う）。
 pub fn cli_available(tool: &str) -> bool {
     find_cli(tool).is_some()
@@ -900,7 +1004,7 @@ mod tests {
         assert_eq!(start[1]["hooks"][0]["command"], expected);
         assert_eq!(
             settings["hooks"]["PreToolUse"][0]["matcher"],
-            "^mcp__remnifold__"
+            "^mcp__remnifold__|^mcp__toolport__toolport_call_tool$"
         );
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["async"], true);
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["timeout"], 120);
@@ -1050,6 +1154,47 @@ mod tests {
         assert_eq!(
             display_args(&mcp_add_args(exe, false)),
             "mcp add remnifold -- \"/opt/Remnifold App/bin/remnifold\" mcp"
+        );
+    }
+
+    #[test]
+    fn the_registration_mode_defaults_to_auto_and_flags_invalid_values() {
+        assert_eq!(McpMode::from_setting(&Value::Null), (McpMode::Auto, true));
+        assert_eq!(
+            McpMode::from_setting(&json!("direct")),
+            (McpMode::Direct, true)
+        );
+        assert_eq!(McpMode::from_setting(&json!("off")), (McpMode::Off, true));
+        assert_eq!(McpMode::from_setting(&json!("Off")), (McpMode::Auto, false));
+        assert_eq!(
+            McpMode::from_setting(&json!(" off ")),
+            (McpMode::Auto, false)
+        );
+        assert_eq!(McpMode::from_setting(&json!("auto")), (McpMode::Auto, true));
+        assert_eq!(
+            McpMode::from_setting(&json!("sometimes")),
+            (McpMode::Auto, false)
+        );
+        assert_eq!(McpMode::from_setting(&json!(true)), (McpMode::Auto, false));
+    }
+
+    #[test]
+    fn a_manual_connect_only_reports_the_duplicate_when_toolport_serves_it() {
+        use crate::toolport::Detection;
+        let mut result = json!({"tool": "codex"});
+        attach_toolport_notice(&mut result, Detection::NotServed);
+        attach_toolport_notice(&mut result, Detection::Unknown("x".into()));
+        assert!(result.get("toolport").is_none());
+        attach_toolport_notice(
+            &mut result,
+            Detection::Served {
+                server_id: "remnifold-1".into(),
+                command: "C:/r.exe".into(),
+            },
+        );
+        assert_eq!(
+            result["toolport"],
+            json!({"serverId": "remnifold-1", "command": "C:/r.exe", "duplicate": true})
         );
     }
 }

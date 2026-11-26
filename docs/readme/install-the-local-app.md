@@ -2,7 +2,7 @@
 
 ## Setup installer (recommended)
 
-Setup needs no GitHub account. It registers Claude Code and Codex when their command-line tools are found; a tool installed later is registered at the next Remnifold start. See [updates and uninstalling](workflow.md).
+Setup needs no GitHub account. It registers Claude Code and Codex when their command-line tools are found; a tool installed later is registered at the next Remnifold start. On Windows, a client that already reaches Remnifold through the Toolport gateway gets no second, direct registration; see [MCP registration](configuration.md#mcp-registration). See [updates and uninstalling](workflow.md).
 
 - **Windows x64:** run [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe). It is publisher-signed, needs no administrator rights, installs under `%LOCALAPPDATA%\RemnifoldApp`, and opens a first-run guide.
 - **macOS Apple Silicon:** open `RemnifoldApp-osx-Setup.pkg`, signed and notarized with the publisher's Developer ID. "Install for me only" uses `~/Applications`; an all-users install uses `/Applications` and updates may ask for an administrator password. The app starts once to register its clients. Connect with `"/Applications/Remnifold.app/Contents/MacOS/remnifold" setup --base-url <URL>`, adjusting the path for `~/Applications`.

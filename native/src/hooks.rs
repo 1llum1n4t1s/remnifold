@@ -456,8 +456,74 @@ impl RecallState {
     }
 }
 
+/// 自動で許可する読み取り専用のツール。
+const READ_ONLY_TOOLS: [&str; 7] = [
+    "search_memory",
+    "listTopics",
+    "listSpaces",
+    "listMemories",
+    "listDocuments",
+    "getDocument",
+    "whoAmI",
+];
+
+/// Toolport ゲートウェイの汎用呼び出しツール（`tool_input` は `{name: "<serverId>__<tool>", arguments}`）。
+const TOOLPORT_CALL_TOOL: &str = "mcp__toolport__toolport_call_tool";
+
+/// "current" は今のセッション ID に解決する（空・無いときはそのまま。MCP が固定エラーにする）。
+fn resolve_current_session(tool: &str, input: &mut Value, session: &str) {
+    if tool == "search_memory" && input["sessionId"] == "current" && !session.is_empty() {
+        input["sessionId"] = json!(session);
+    }
+}
+
+fn allow_read(event: &str, updated: Value) -> Value {
+    json!({"hookSpecificOutput":{"hookEventName":event,"permissionDecision":"allow","permissionDecisionReason":"Memory index and document access is read-only.","updatedInput":updated}})
+}
+
+/// Toolport 経由の呼び出し。`name` が `<製品のサーバー id を Toolport の前置きに変換したもの>__<読み取り専用ツール>`
+/// と完全一致するときだけ許可する（`server_ids` は [`crate::toolport::product_server_ids`] の返す変換済み id）。
+/// 安い判定を先に行い、registry は読み取り専用ツール名に一致したときだけ読む。`updatedInput` は
+/// `tool_input` 全体の複製で、`arguments` の `sessionId` だけを置き換える。
+fn toolport_pretool(
+    event: &str,
+    payload: &Value,
+    server_ids: impl FnOnce() -> Vec<String>,
+) -> Value {
+    let Some(input) = payload["tool_input"].as_object() else {
+        return json!({});
+    };
+    let Some(name) = input.get("name").and_then(Value::as_str) else {
+        return json!({});
+    };
+    let Some((tool, prefix)) = READ_ONLY_TOOLS.iter().find_map(|tool| {
+        name.strip_suffix(tool)?
+            .strip_suffix("__")
+            .map(|prefix| (*tool, prefix))
+    }) else {
+        return json!({});
+    };
+    if prefix.is_empty() || !server_ids().iter().any(|id| id == prefix) {
+        return json!({});
+    }
+    let mut updated = payload["tool_input"].clone();
+    if updated["arguments"].is_object() {
+        let session = text(&payload["session_id"]).trim();
+        resolve_current_session(tool, &mut updated["arguments"], session);
+    }
+    allow_read(event, updated)
+}
+
 pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result<Value> {
     if event == "PreToolUse" {
+        if text(&payload["tool_name"]) == TOOLPORT_CALL_TOOL {
+            return Ok(toolport_pretool(event, payload, || {
+                crate::toolport::product_server_ids(
+                    &crate::connect::TOOLPORT_PRODUCT,
+                    &crate::toolport::Env::process(),
+                )
+            }));
+        }
         let name = text(&payload["tool_name"])
             .strip_prefix("mcp__remnifold__")
             .unwrap_or("");
@@ -466,28 +532,12 @@ pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result
             .filter(|v| truthy(v))
             .cloned()
             .unwrap_or(json!({}));
-        // "current" は今のセッション ID に解決する。入力全体を置換するため他の項目はそのまま返す。
-        let session = text(&payload["session_id"]).trim();
-        if name == "search_memory" && updated["sessionId"] == "current" && !session.is_empty() {
-            updated["sessionId"] = json!(session);
-        }
-        return Ok(
-            if [
-                "search_memory",
-                "listTopics",
-                "listSpaces",
-                "listMemories",
-                "listDocuments",
-                "getDocument",
-                "whoAmI",
-            ]
-            .contains(&name)
-            {
-                json!({"hookSpecificOutput":{"hookEventName":event,"permissionDecision":"allow","permissionDecisionReason":"Memory index and document access is read-only.","updatedInput":updated}})
-            } else {
-                json!({})
-            },
-        );
+        resolve_current_session(name, &mut updated, text(&payload["session_id"]).trim());
+        return Ok(if READ_ONLY_TOOLS.contains(&name) {
+            allow_read(event, updated)
+        } else {
+            json!({})
+        });
     }
     if !["SessionStart", "UserPromptSubmit", "Stop"].contains(&event) {
         return Ok(json!({}));
@@ -852,9 +902,18 @@ mod tests {
             json!({"query":"q","sessionId":"abc","includeProfile":true})
         );
         // ID が空・無いときと他のツールは "current" のまま返す（MCP が固定エラーにする）。
-        assert_eq!(resolve("mcp__remnifold__search_memory", json!("  "))["sessionId"], "current");
-        assert_eq!(resolve("mcp__remnifold__search_memory", Value::Null)["sessionId"], "current");
-        assert_eq!(resolve("mcp__remnifold__getDocument", json!("abc"))["sessionId"], "current");
+        assert_eq!(
+            resolve("mcp__remnifold__search_memory", json!("  "))["sessionId"],
+            "current"
+        );
+        assert_eq!(
+            resolve("mcp__remnifold__search_memory", Value::Null)["sessionId"],
+            "current"
+        );
+        assert_eq!(
+            resolve("mcp__remnifold__getDocument", json!("abc"))["sessionId"],
+            "current"
+        );
         // 具体的な ID は変えない。
         let explicit = run_hook(
             "PreToolUse",
@@ -862,7 +921,105 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(explicit["hookSpecificOutput"]["updatedInput"]["sessionId"], "other");
+        assert_eq!(
+            explicit["hookSpecificOutput"]["updatedInput"]["sessionId"],
+            "other"
+        );
+    }
+
+    fn through_toolport(input: Value, ids: &[&str]) -> Value {
+        let ids: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+        toolport_pretool(
+            "PreToolUse",
+            &json!({"tool_name":TOOLPORT_CALL_TOOL,"session_id":" abc ","tool_input":input}),
+            || ids,
+        )
+    }
+
+    #[test]
+    fn toolport_calls_are_allowed_only_for_this_products_read_only_tools() {
+        let input = json!({"name":"remnifold__search_memory","arguments":{"query":"q","sessionId":"current"},"extra":{"k":1}});
+        let allowed = through_toolport(input, &["remnifold"]);
+        assert_eq!(allowed["hookSpecificOutput"]["permissionDecision"], "allow");
+        // name など arguments 以外は複製のまま、sessionId だけが解決される。
+        assert_eq!(
+            allowed["hookSpecificOutput"]["updatedInput"],
+            json!({"name":"remnifold__search_memory","arguments":{"query":"q","sessionId":"abc"},"extra":{"k":1}})
+        );
+        // arguments が無くても許可し、tool_input をそのまま返す。
+        let bare = json!({"name":"remnifold__whoAmI"});
+        assert_eq!(
+            through_toolport(bare.clone(), &["remnifold"])["hookSpecificOutput"]["updatedInput"],
+            bare
+        );
+        // 独自名の id でも、registry の id と一致すれば許可する。
+        let custom = json!({"name":"my-memory__getDocument","arguments":{"id":"a"}});
+        assert_eq!(
+            through_toolport(custom, &["my-memory"])["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
+        // id に - などを含むときは、Toolport の前置き（英数字と _ 以外を _ にした形）で呼ばれる。
+        let dashed = json!({"name":"remnifold_dev__search_memory","arguments":{}});
+        assert_eq!(
+            through_toolport(dashed, &["remnifold_dev"])["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
+        // search_memory 以外の "current" は変えない。
+        let other = json!({"name":"remnifold__getDocument","arguments":{"sessionId":"current"}});
+        assert_eq!(
+            through_toolport(other, &["remnifold"])["hookSpecificOutput"]["updatedInput"]["arguments"]
+                ["sessionId"],
+            "current"
+        );
+    }
+
+    #[test]
+    fn toolport_calls_for_other_servers_write_tools_or_odd_input_are_not_allowed() {
+        let none = json!({});
+        for (input, ids) in [
+            // 別サーバーの同名ツール。
+            (
+                json!({"name":"other__search_memory","arguments":{}}),
+                vec!["remnifold"],
+            ),
+            // id の後ろにだけ一致する別の id。
+            (
+                json!({"name":"xremnifold__search_memory"}),
+                vec!["remnifold"],
+            ),
+            // 書込みツール。
+            (
+                json!({"name":"remnifold__save_memory","arguments":{}}),
+                vec!["remnifold"],
+            ),
+            (
+                json!({"name":"remnifold__deleteDocument"}),
+                vec!["remnifold"],
+            ),
+            // registry が読めない（id が空）。
+            (json!({"name":"remnifold__search_memory"}), vec![]),
+            // 変換前の id（- を含む）の前置きは Toolport が使わないので許可しない。
+            (
+                json!({"name":"remnifold-dev__search_memory"}),
+                vec!["remnifold_dev"],
+            ),
+            // 前置きが空。
+            (json!({"name":"__search_memory"}), vec![""]),
+            (json!({"name":"search_memory"}), vec!["remnifold"]),
+            // name が文字列でない・入力がオブジェクトでない。
+            (json!({"name":1}), vec!["remnifold"]),
+            (json!("remnifold__search_memory"), vec!["remnifold"]),
+        ] {
+            assert_eq!(through_toolport(input.clone(), &ids), none, "{input}");
+        }
+    }
+
+    #[test]
+    fn toolport_calls_do_not_read_the_registry_unless_the_name_is_a_reader() {
+        let payload =
+            json!({"tool_name":TOOLPORT_CALL_TOOL,"tool_input":{"name":"remnifold__save_memory"}});
+        let out = toolport_pretool("PreToolUse", &payload, || panic!("registry read"));
+        assert_eq!(out, json!({}));
     }
 
     #[test]

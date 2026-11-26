@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 変更
+
+- Windows の Setup が、Claude Code または Codex が Toolport ゲートウェイにつながっていて、Toolport の registry に `remnifold` を `mcp` 引数で起動する有効なサーバーがある（使われる全プロファイルで有効）ときは、`claude mcp add` / `codex mcp add` による直接登録を省くようにしました。Windows 以外では判定せず直接登録し、Windows でも判定できない場合は直接登録します。前回未完了（CLI が無かった・失敗した）のクライアントも同じ判定にかけます。既存の直接登録は外さず、Setup が一度直接登録したクライアントは、利用者が外しても自動では足し直しません（戻すのは Setup が省いたクライアントだけ）。省いたあとクライアントから Toolport ゲートウェイが消えた場合、または Toolport が指す `remnifold` の実行ファイルが無くなった場合は、次の起動時（`mcp` の起動・引数なしの起動・ログオン時の適用）に直接登録へ戻します。Toolport 側で無効化・削除した場合は足しません。Claude Code のフックは省いた場合も統合しますが、Claude Code の CLI も `~/.claude` フォルダーも無いときは作りません。`remnifold.json` の `mcpRegistration`（`auto` 既定 / `direct` / `off`）で止められます。手動の `connect` は常に直接登録し、Toolport が既に提供している場合は結果 JSON に `toolport` の重複の通知を付けます。
+- `PreToolUse` フックのマッチャーを `^mcp__remnifold__|^mcp__toolport__toolport_call_tool$` にし（表示文言は "Checking tool access..."）、Toolport ゲートウェイの `toolport_call_tool` 経由でも読み取り専用の7ツールを自動で許可し、`search_memory` の `sessionId: "current"` を解決するようにしました。許可と解決は、`name` が「registry 上の Remnifold サーバーの id を Toolport のツール名の前置きに変換したもの（`[A-Za-z0-9_]` 以外を `_` に置き換え。例: `-` は `_`）+ `__` + 読み取り専用の7ツール」と完全一致するときだけです。ゲートウェイのサーバー名が `toolport` でない場合と `toolport_run_script` 内の呼び出しは対象外です。マッチャーの更新は、Setup の版更新でのフックの張り直し、または現在の版での `connect claude-code --apply` で反映されます。
+
 ### 修正
 
 - 区切りのない長い語（両端の `*` を含む検索パターンが UTF-8 で50バイトを超えるもの）を検索すると、D1 の制限（`LIKE or GLOB pattern too complex`）で検索全体が 500 で失敗していた問題を直しました。上限を超える語だけ末尾を落とし、先頭部分の一致として検索します。上限以内の語の一致と重みは変わりません。
