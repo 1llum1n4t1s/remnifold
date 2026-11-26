@@ -23275,19 +23275,23 @@
       },
       {
         "operation": "sql",
-        "sql": "DELETE FROM facts\n       WHERE source_memory_id = ? AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)",
+        "sql": "UPDATE facts INDEXED BY idx_facts_identity\n     SET status = 'active', updated_at = ?\n     WHERE container_tag = ? AND status = 'superseded'\n       AND (subject_key, predicate_key) IN (\n         SELECT gone.subject_key, gone.predicate_key FROM facts AS gone INDEXED BY idx_facts_source\n         WHERE gone.source_memory_id IN (SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0) AND gone.is_exclusive = 1\n       )\n       AND source_memory_id NOT IN (SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)\n       AND NOT EXISTS (\n         SELECT 1 FROM fact_relations AS relation\n         JOIN facts AS newer ON newer.id = relation.from_fact_id\n         JOIN memories AS source ON source.id = newer.source_memory_id\n         WHERE relation.to_fact_id = facts.id\n           AND relation.relation = 'supersedes'\n           AND newer.status = 'active' AND source.is_forgotten = 0\n           AND newer.source_memory_id NOT IN (SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)\n       )",
         "values": [
+          "2026-10-21T01:00:00.000Z",
+          "memories",
           "enrich",
+          "00000000-0000-4000-8000-000000000001",
+          "enrich",
+          "00000000-0000-4000-8000-000000000001",
           "enrich",
           "00000000-0000-4000-8000-000000000001"
         ]
       },
       {
         "operation": "sql",
-        "sql": "UPDATE facts\n     SET status = 'active', updated_at = ?\n     WHERE container_tag = ? AND status = 'superseded'\n       AND EXISTS (\n         SELECT 1 FROM memories AS current\n         WHERE current.id = ? AND current.topic_revision = ? AND current.is_forgotten = 0\n       )\n       AND NOT EXISTS (\n         SELECT 1 FROM fact_relations AS relation\n         JOIN facts AS newer ON newer.id = relation.from_fact_id\n         JOIN memories AS source ON source.id = newer.source_memory_id\n         WHERE relation.to_fact_id = facts.id\n           AND relation.relation = 'supersedes'\n           AND newer.status = 'active' AND source.is_forgotten = 0\n       )",
+        "sql": "DELETE FROM facts\n       WHERE source_memory_id = ? AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)",
         "values": [
-          "2026-10-21T01:00:00.000Z",
-          "memories",
+          "enrich",
           "enrich",
           "00000000-0000-4000-8000-000000000001"
         ]
@@ -23649,19 +23653,23 @@
       },
       {
         "operation": "sql",
-        "sql": "DELETE FROM facts\n       WHERE source_memory_id = ? AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)",
+        "sql": "UPDATE facts INDEXED BY idx_facts_identity\n     SET status = 'active', updated_at = ?\n     WHERE container_tag = ? AND status = 'superseded'\n       AND (subject_key, predicate_key) IN (\n         SELECT gone.subject_key, gone.predicate_key FROM facts AS gone INDEXED BY idx_facts_source\n         WHERE gone.source_memory_id IN (SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0) AND gone.is_exclusive = 1\n       )\n       AND source_memory_id NOT IN (SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)\n       AND NOT EXISTS (\n         SELECT 1 FROM fact_relations AS relation\n         JOIN facts AS newer ON newer.id = relation.from_fact_id\n         JOIN memories AS source ON source.id = newer.source_memory_id\n         WHERE relation.to_fact_id = facts.id\n           AND relation.relation = 'supersedes'\n           AND newer.status = 'active' AND source.is_forgotten = 0\n           AND newer.source_memory_id NOT IN (SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)\n       )",
         "values": [
+          "2026-10-21T01:00:00.000Z",
+          "memories",
           "enrich",
+          "00000000-0000-4000-8000-000000000001",
+          "enrich",
+          "00000000-0000-4000-8000-000000000001",
           "enrich",
           "00000000-0000-4000-8000-000000000001"
         ]
       },
       {
         "operation": "sql",
-        "sql": "UPDATE facts\n     SET status = 'active', updated_at = ?\n     WHERE container_tag = ? AND status = 'superseded'\n       AND EXISTS (\n         SELECT 1 FROM memories AS current\n         WHERE current.id = ? AND current.topic_revision = ? AND current.is_forgotten = 0\n       )\n       AND NOT EXISTS (\n         SELECT 1 FROM fact_relations AS relation\n         JOIN facts AS newer ON newer.id = relation.from_fact_id\n         JOIN memories AS source ON source.id = newer.source_memory_id\n         WHERE relation.to_fact_id = facts.id\n           AND relation.relation = 'supersedes'\n           AND newer.status = 'active' AND source.is_forgotten = 0\n       )",
+        "sql": "DELETE FROM facts\n       WHERE source_memory_id = ? AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0)",
         "values": [
-          "2026-10-21T01:00:00.000Z",
-          "memories",
+          "enrich",
           "enrich",
           "00000000-0000-4000-8000-000000000001"
         ]

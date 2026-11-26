@@ -23,6 +23,7 @@ import "../capture-conflict-single-body.test.mjs";
 import "../consolidation-due.test.mjs";
 import "../fact-candidates.test.mjs";
 import "../fact-order.test.mjs";
+import "../fact-restore.test.mjs";
 import "../visibility-statements.test.mjs";
 import "../consolidation-targets.test.mjs";
 import "../add-memory-load.test.mjs";

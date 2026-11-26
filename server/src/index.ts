@@ -1550,6 +1550,12 @@ async function hardDeleteMemory(id: string, env: Env, ctx: ExecutionContext): Pr
     WHERE source.consolidation_id = consolidation.id AND source.memory_id = ?
   ))`;
   const results = await env.DB.batch([
+    // 消える記録の事実が直接置き換えていた事実を、DELETE の前に同じ batch で戻す。
+    // 存在しない ID では事実が無く、何も変えない。
+    restoreUnsupportedFactsStatement(env, current.container_tag, now, {
+      sql: "SELECT id FROM memories WHERE id = ?",
+      values: [id],
+    }),
     env.DB.prepare(
       `UPDATE memory_consolidation_projects
        SET active_consolidation_id = NULL, updated_at = ?
@@ -1585,7 +1591,8 @@ async function hardDeleteMemory(id: string, env: Env, ctx: ExecutionContext): Pr
     ).bind(now, id, id),
     env.DB.prepare("DELETE FROM memories WHERE id = ?").bind(id),
   ]);
-  if ((results[5]?.meta.changes ?? 0) === 0) throw new HttpError(404, "Document not found");
+  // 末尾の DELETE memories。先頭に文を足しても添字がずれないよう末尾で数える。
+  if ((results.at(-1)?.meta.changes ?? 0) === 0) throw new HttpError(404, "Document not found");
   const invalidated = await env.DB.prepare(
     `SELECT consolidation.memory_id AS memoryId, memory.container_tag AS containerTag
      FROM memory_consolidations AS consolidation
@@ -1607,22 +1614,33 @@ async function hardDeleteMemory(id: string, env: Env, ctx: ExecutionContext): Pr
   return new Response(null, { status: 204 });
 }
 
+// 版付きの経路が消す自分の記録（0件なら何も変えない）。sql は記録IDを返す版ガード込みの SELECT。
+type CurrentMemory = { sql: string; values: readonly (string | number)[] };
+
+// 復帰の判定条件は全件版と同じ。current があるときは、消える自分の排他的な事実と同じ
+// (container, subject_key, predicate_key) の組だけを見直す。DELETE の前に同じ batch で実行し、
+// 自分の事実が消える前なので、自分の事実は置き換え元として数えない。
 function restoreUnsupportedFactsStatement(
   env: Env,
   containerTag: string,
-  currentMemory?: Pick<EnrichmentMemory, "id" | "topicRevision">,
+  now: string,
+  current?: CurrentMemory,
 ): D1PreparedStatement {
-  const currentGuard = currentMemory
-    ? `AND EXISTS (
-         SELECT 1 FROM memories AS current
-         WHERE current.id = ? AND current.topic_revision = ? AND current.is_forgotten = 0
-       )`
+  const ids = current ? `(${current.sql})` : "";
+  const index = current ? " INDEXED BY idx_facts_identity" : "";
+  const samePair = current
+    ? `AND (subject_key, predicate_key) IN (
+         SELECT gone.subject_key, gone.predicate_key FROM facts AS gone INDEXED BY idx_facts_source
+         WHERE gone.source_memory_id IN ${ids} AND gone.is_exclusive = 1
+       )
+       AND source_memory_id NOT IN ${ids}`
     : "";
+  const notOwn = current ? `AND newer.source_memory_id NOT IN ${ids}` : "";
   const statement = env.DB.prepare(
-    `UPDATE facts
+    `UPDATE facts${index}
      SET status = 'active', updated_at = ?
      WHERE container_tag = ? AND status = 'superseded'
-       ${currentGuard}
+       ${samePair}
        AND NOT EXISTS (
          SELECT 1 FROM fact_relations AS relation
          JOIN facts AS newer ON newer.id = relation.from_fact_id
@@ -1630,15 +1648,15 @@ function restoreUnsupportedFactsStatement(
          WHERE relation.to_fact_id = facts.id
            AND relation.relation = 'supersedes'
            AND newer.status = 'active' AND source.is_forgotten = 0
+           ${notOwn}
        )`,
   );
-  return currentMemory
-    ? statement.bind(new Date().toISOString(), containerTag, currentMemory.id, currentMemory.topicRevision)
-    : statement.bind(new Date().toISOString(), containerTag);
+  const values = current ? [...current.values, ...current.values, ...current.values] : [];
+  return statement.bind(now, containerTag, ...values);
 }
 
 async function restoreUnsupportedFacts(env: Env, containerTag: string): Promise<void> {
-  await restoreUnsupportedFactsStatement(env, containerTag).run();
+  await restoreUnsupportedFactsStatement(env, containerTag, new Date().toISOString()).run();
 }
 
 type ReplaceFactsOptions = {
@@ -1666,11 +1684,14 @@ async function replaceFacts(
   const now = new Date().toISOString();
   const factUpdatedAt = options.factUpdatedAt ?? now;
   const statements: D1PreparedStatement[] = [
+    restoreUnsupportedFactsStatement(env, memory.containerTag, now, {
+      sql: "SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0",
+      values: [memory.id, memory.topicRevision],
+    }),
     env.DB.prepare(
       `DELETE FROM facts
        WHERE source_memory_id = ? AND EXISTS (${currentGuard})`,
     ).bind(memory.id, memory.id, memory.topicRevision),
-    restoreUnsupportedFactsStatement(env, memory.containerTag, memory),
   ];
   const supersedeStatements: D1PreparedStatement[] = [];
 
@@ -3006,6 +3027,10 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
       now,
       now,
     ),
+    restoreUnsupportedFactsStatement(env, containerTag, now, {
+      sql: "SELECT id FROM memories WHERE container_tag = ? AND custom_id = ? AND topic_revision = ? AND is_forgotten = 0",
+      values: [containerTag, customId, topicRevision],
+    }),
     env.DB.prepare(
       `DELETE FROM facts
        WHERE source_memory_id IN (
@@ -3013,23 +3038,6 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
          WHERE container_tag = ? AND custom_id = ? AND topic_revision = ? AND is_forgotten = 0
        )`,
     ).bind(containerTag, customId, topicRevision),
-    env.DB.prepare(
-      `UPDATE facts
-       SET status = 'active', updated_at = ?
-       WHERE container_tag = ? AND status = 'superseded'
-         AND EXISTS (
-           SELECT 1 FROM memories
-           WHERE container_tag = ? AND custom_id = ? AND topic_revision = ? AND is_forgotten = 0
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM fact_relations AS relation
-           JOIN facts AS newer ON newer.id = relation.from_fact_id
-           JOIN memories AS source ON source.id = newer.source_memory_id
-           WHERE relation.to_fact_id = facts.id
-             AND relation.relation = 'supersedes'
-             AND newer.status = 'active' AND source.is_forgotten = 0
-         )`,
-    ).bind(now, containerTag, containerTag, customId, topicRevision),
     ...dependentConsolidationStatements(
       env,
       "SELECT id FROM memories WHERE container_tag = ? AND custom_id = ? AND topic_revision = ? AND is_forgotten = 0",
@@ -3219,10 +3227,13 @@ async function retryEnrichment(
     )
       .bind(skipFacts ? "disabled" : "pending", topicRevision, id, row.updated_at, row.topic_revision),
     ...(skipFacts ? [
+      restoreUnsupportedFactsStatement(env, row.container_tag, now, {
+        sql: "SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0",
+        values: [id, topicRevision],
+      }),
       env.DB.prepare(
         `DELETE FROM facts WHERE source_memory_id = ? AND ${currentGuard}`,
       ).bind(id, id, topicRevision),
-      restoreUnsupportedFactsStatement(env, row.container_tag, { id, topicRevision }),
     ] : []),
     env.DB.prepare(
       `UPDATE memory_consolidation_projects SET active_consolidation_id = NULL, updated_at = ?
@@ -4373,6 +4384,10 @@ async function updateDocument(
         current.updated_at,
         current.topic_revision,
       ),
+    restoreUnsupportedFactsStatement(env, current.container_tag, updatedAt, {
+      sql: "SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0",
+      values: [id, topicRevision],
+    }),
     env.DB.prepare(
       `DELETE FROM facts
        WHERE source_memory_id = ?
@@ -4381,7 +4396,6 @@ async function updateDocument(
            WHERE id = ? AND topic_revision = ? AND is_forgotten = 0
          )`,
     ).bind(id, id, topicRevision),
-    restoreUnsupportedFactsStatement(env, current.container_tag, { id, topicRevision }),
     ...dependentConsolidationStatements(
       env, "SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0",
       [id, topicRevision], updatedAt,
@@ -4561,6 +4575,7 @@ async function forgetMemory(request: Request, env: Env, ctx: ExecutionContext): 
            vector_attempted_at = NULL, topic_revision = ?, updated_at = ?
        WHERE id = ? AND container_tag = ? AND is_forgotten = 0 AND topic_revision IS ? AND updated_at = ?`,
     ).bind(revision, now, row.id, containerTag, row.topic_revision, row.updated_at),
+    restoreUnsupportedFactsStatement(env, containerTag, now, { sql: forgottenSql, values: [row.id, revision] }),
     env.DB.prepare(`DELETE FROM facts WHERE source_memory_id IN (${forgottenSql})`).bind(row.id, revision),
     env.DB.prepare(`DELETE FROM memory_topics WHERE memory_id IN (${forgottenSql})`).bind(row.id, revision),
     ...dependentConsolidationStatements(env, forgottenSql, [row.id, revision], now),
