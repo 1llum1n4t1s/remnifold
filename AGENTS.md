@@ -22,3 +22,9 @@ Remnifold は、自分で運用する Cloudflare サーバーと、Claude Code�
 - Setup・自動更新・登録・リリースを変える前: [docs/agents/setup-installer-velopack.md](docs/agents/setup-installer-velopack.md)。
 - CI・R2 公開・信頼境界を変える前: [docs/agents/r2-publication-and-trust.md](docs/agents/r2-publication-and-trust.md)。
 - 依存・ツール版を変える前: [docs/agents/dependency-maintenance.md](docs/agents/dependency-maintenance.md)。
+- HTTP・MCP の API を変える前: [docs/agents/api-reference.md](docs/agents/api-reference.md)。
+- D1 のスキーマ・データを変える前: [docs/agents/data-model.md](docs/agents/data-model.md)。
+- 移行・トリガーを変える前: [docs/agents/migration-triggers.md](docs/agents/migration-triggers.md)。
+- リリースの前: [docs/agents/release-process.md](docs/agents/release-process.md)。
+- Setup を隔離環境で検証する前: [docs/agents/workflow.md](docs/agents/workflow.md)。
+- フックの Toolport 対応を変える前: [docs/agents/toolport-hook-rewriting.md](docs/agents/toolport-hook-rewriting.md)。

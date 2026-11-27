@@ -62,3 +62,7 @@ Worker の `/mcp` と OAuth。詳細は [docs/design/remote-mcp.md](docs/design/
 ### Release installation
 
 strict 経路は 1.0.32 で凍結し、既存の公開物と検証契約を保つ。詳細は [docs/design/release-process.md](docs/design/release-process.md)。
+
+## Cross-cutting topics
+
+構成は [architecture](docs/design/architecture.md)、コマンドは [commands](docs/design/commands.md)、設定は [configuration](docs/design/configuration.md)、信頼境界は [security](docs/design/security.md)、テストは [testing](docs/design/testing.md)、更新と公開の流れは [workflow](docs/design/workflow.md)。

@@ -2,11 +2,11 @@
 
 # Remnifold
 
-A self-hosted Cloudflare memory server with remote MCP access and a standalone local app for recalling useful implementation history in Claude Code and Codex. Completed work is saved in one shared collection with its project folder as provenance. See the [overview](docs/readme/overview.md).
+A self-hosted Cloudflare memory server with remote MCP access and a standalone local app for recalling useful implementation history in Claude Code and Codex. See the [overview](docs/readme/overview.md).
 
 ## Requirements
 
-The local app is one native executable for Windows x64, macOS Apple Silicon, or Linux x64/ARM64. The server needs your own Cloudflare account. See [requirements](docs/readme/requirements.md).
+Windows x64, macOS Apple Silicon or Linux x64/ARM64, plus your own Cloudflare account. See [requirements](docs/readme/requirements.md).
 
 ## Connect a remote MCP client
 
@@ -16,7 +16,7 @@ Use `https://<your-worker>/mcp` with OAuth or a Bearer key; nothing is installed
 
 ### Setup installer (recommended)
 
-On Windows, run [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe). Setup registers Claude Code and Codex and updates itself. For macOS, Linux, updates and uninstalling, see [Setup](docs/readme/install-the-local-app.md#setup-installer-recommended). Then connect your server:
+On Windows, run [`RemnifoldApp-win-Setup.exe`](https://remnifold-updates.kagayoi.com/velopack/RemnifoldApp-win-Setup.exe). For macOS, Linux and uninstalling, see [Setup](docs/readme/install-the-local-app.md#setup-installer-recommended). Then connect your server:
 
 ```sh
 remnifold setup --base-url https://your-worker.example.workers.dev
@@ -24,7 +24,7 @@ remnifold setup --base-url https://your-worker.example.workers.dev
 
 ### First installation
 
-The advanced strict route is frozen at 1.0.32; verify its bootstrap before running it. See [first installation](docs/readme/install-the-local-app.md#first-installation).
+The advanced strict route is frozen at 1.0.32. See [first installation](docs/readme/install-the-local-app.md#first-installation).
 
 ## Create or update a server
 
@@ -32,16 +32,20 @@ The advanced strict route is frozen at 1.0.32; verify its bootstrap before runni
 
 ## Memory behavior
 
-What is saved, redacted, searched and recalled is described in [memory behavior](docs/readme/memory-behavior.md). Review what you store: redaction only reduces accidental secret capture.
+What is saved and recalled: see [memory behavior](docs/readme/memory-behavior.md).
 
 ## Memory organization
 
-Organize memory on demand with the organize-memory skill; originals are never deleted. See [memory organization](docs/readme/memory-organization.md).
+Use the organize-memory skill; originals are kept. See [memory organization](docs/readme/memory-organization.md).
 
 ## Upgrading from 1.x names
 
 Older configuration and environment names remain readable. See [upgrading](docs/readme/upgrading-from-1-x-names.md).
 
-Remnifold implements its own API, independent of the hosted Supermemory service, and does not read or modify Codex's built-in memory files. Architecture: [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md). Contributing: [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md). Packaged copies omit `docs/`; read the [guides online](https://github.com/1llum1n4t1s/remnifold/tree/main/docs/readme).
+## More guides
+
+[Architecture](docs/readme/architecture.md), [commands](docs/readme/commands.md), [configuration](docs/readme/configuration.md), [MCP registration](docs/readme/mcp-registration.md), [recall settings](docs/readme/recall-settings.md), [API reference](docs/readme/api-reference.md), [data model](docs/readme/data-model.md), [security](docs/readme/security.md), [troubleshooting](docs/readme/troubleshooting.md), [workflow](docs/readme/workflow.md), [release process](docs/readme/release-process.md), [conventions](docs/readme/conventions.md).
+
+Remnifold implements its own API, independent of hosted Supermemory, and never touches Codex's built-in memory files. Architecture: [DESIGN.md](https://github.com/1llum1n4t1s/remnifold/blob/main/DESIGN.md). Contributing: [AGENTS.md](https://github.com/1llum1n4t1s/remnifold/blob/main/AGENTS.md). Packaged copies omit `docs/`; read the [guides online](https://github.com/1llum1n4t1s/remnifold/tree/main/docs/readme).
 
 Licensed under the [MIT License](LICENSE).
