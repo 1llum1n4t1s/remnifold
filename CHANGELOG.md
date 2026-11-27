@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.43 - 2026-11-27
+
 ### 変更
 
 - Toolport が、Setup が登録する実行ファイルとは別の実行ファイル（コピーなど）で `remnifold` を提供しているときも、直接登録は省いたまま `app-update.log` と初回の案内で警告し、状態に別の理由 `toolport-foreign` を記録するようにしました（同じ実体なら従来どおり `toolport`）。理由が `toolport` か `toolport-foreign` のクライアントは、起動のたびに（CLI の有無に関係なく）判定し直し、Toolport の提供が消えれば直接登録へ戻します。手動の `connect` が付ける `toolport` の通知には、同じ実体なら `true`、別の実体なら `false` の `sameExecutable` が加わります（どちらも `duplicate: true` で、登録は常に行います）。
