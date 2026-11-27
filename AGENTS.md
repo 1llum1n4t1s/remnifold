@@ -28,3 +28,4 @@ Remnifold は、自分で運用する Cloudflare サーバーと、Claude Code�
 - リリースの前: [docs/agents/release-process.md](docs/agents/release-process.md)。
 - Setup を隔離環境で検証する前: [docs/agents/workflow.md](docs/agents/workflow.md)。
 - フックの Toolport 対応を変える前: [docs/agents/toolport-hook-rewriting.md](docs/agents/toolport-hook-rewriting.md)。
+- Toolport 経由の MCP 登録を変える前: [docs/agents/toolport-mcp-registration.md](docs/agents/toolport-mcp-registration.md)。
