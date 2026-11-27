@@ -50,5 +50,6 @@
   "welcome.press_enter": "Zum Schließen die Eingabetaste drücken.",
   "welcome.prompt_url": "Server-URL (https://…). Leer lassen, um es später einzurichten: ",
   "welcome.run_setup": "Führen Sie `remnifold setup --base-url <URL>` in einem Terminal aus.",
+  "welcome.toolport_foreign": "Achtung: Toolport stellt Remnifold für {client} bereits über eine andere ausführbare Datei bereit ({command}); Remnifold hat sich deshalb nicht direkt registriert. Setzen Sie den Befehl (command) dieses Toolport-Servers auf {executable}.",
   "welcome.updates": "Updates werden automatisch heruntergeladen und bei der nächsten Anmeldung angewendet. Zum Abschalten auto_update in app-update.json auf false setzen."
 }

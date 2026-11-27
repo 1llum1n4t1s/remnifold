@@ -50,5 +50,6 @@
   "welcome.press_enter": "Enter で閉じます。",
   "welcome.prompt_url": "サーバーの URL（https://…）を入力してください。空のままなら後で設定します: ",
   "welcome.run_setup": "ターミナルで `remnifold setup --base-url <URL>` を実行してください。",
+  "welcome.toolport_foreign": "注意: {client} には Toolport が別の実行ファイル（{command}）で Remnifold を提供しているため、直接の登録は省きました。Toolport のその項目の command を {executable} へ向け直してください。",
   "welcome.updates": "更新は自動で取得し、パソコンへのログオン時に適用します。切るには app-update.json の auto_update を false にしてください。"
 }

@@ -50,5 +50,6 @@
   "welcome.press_enter": "Enter 키를 누르면 닫힙니다.",
   "welcome.prompt_url": "서버 URL(https://…)을 입력하세요. 비워 두면 나중에 설정합니다: ",
   "welcome.run_setup": "터미널에서 `remnifold setup --base-url <URL>`을 실행하세요.",
+  "welcome.toolport_foreign": "주의: {client}에는 Toolport가 이미 다른 실행 파일({command})로 Remnifold를 제공하고 있어 직접 등록을 건너뛰었습니다. 해당 Toolport 서버의 command를 {executable}(으)로 바꿔 주세요.",
   "welcome.updates": "업데이트는 자동으로 내려받아 다음 로그온 때 적용됩니다. 끄려면 app-update.json의 auto_update를 false로 설정하세요."
 }

@@ -12,12 +12,15 @@
 //! 区別しない）か Unix 形式（`/`・区別する）で扱い、実行する OS には依存しない。
 //!
 //! 判定の結果（[`Detection`]）:
-//! - `Served` — クライアントが Toolport ゲートウェイにつながっていて、Toolport がこの製品のサーバーを有効にして提供している。
+//! - `Served` — クライアントが Toolport ゲートウェイにつながっていて、Toolport が、自分と同じ実体の実行ファイル
+//!   （`detect` の `own_executable`。R13）でこの製品のサーバーを有効にして提供している。
+//! - `ServedElsewhere` — 同じく Toolport が提供しているが、自分以外の実行ファイルを指している（別の場所のコピーなど）。
+//!   呼び出し側は直接登録を省いたまま警告し、状態には別の理由（`toolport-foreign`）で記録して、起動のたびに判定し直す。
 //! - `NotConnected` — クライアントの設定に、実在する Toolport ゲートウェイが無い（実行ファイルが消えた場合を含む）。
 //! - `NotServed` — ゲートウェイにはつながっているが、この製品のサーバーは提供されていない（Toolport 側で無効化・削除された）。
 //! - `Unknown(理由)` — 読めない・形が想定外・registry が見つからないなど、確かめられない。
 //!
-//! 判定ルール（番号はテストの名前の接頭辞 `r1_`〜`r12_` と対応する）:
+//! 判定ルール（番号はテストの名前の接頭辞 `r1_`〜`r13_` と対応する）:
 //! - R1 対応外の OS（[`Os::Other`]）は何も読まず `Unknown("unsupported-os")`。R2 ホームを決められなければ `Unknown`
 //!   （Windows は `USERPROFILE`、無ければ `HOME`。macOS・Linux は `HOME`。絶対パスだけ）。
 //! - R3 ファイルは `fs::read` 相当（サイズ上限なし・リンクをたどる）。読めなければ `Unknown`、無ければ各段の「無い」扱い。
@@ -34,6 +37,10 @@
 //! - R8 registry は `version` が整数 3 で、`servers`・`profiles` が配列。R9 `clientScopes` は先に確かめる。
 //! - R10 使われるプロファイルの集合。R11 サーバーの一致（stdio・`command` のファイル名・`args`・`enabled`・
 //!   プロファイル）。R12 サーバーの `env` は読まず、結果にも含めない。
+//! - R13 実体の一致。有効な候補を registry の順にすべて調べ、実行ファイルが無いものは「無い」と覚え、自分と同じ実体の
+//!   ものがあればその場で `Served`、無ければ最初の別の実体を `ServedElsewhere`、次に「無い」を `NotConnected`、どれも
+//!   無ければ `NotServed`。同じ実体かは、両側を `Files::canonical`（失敗した側は元の文字列）にして `Env::os` の規則で
+//!   正規化して比べる。canonicalize の失敗を `Unknown` にしない（直接登録に進むと二重に起動するため）。
 //!
 //! `quarantine.json` は見ない。Toolport 側の設定には書かない。
 
@@ -79,8 +86,10 @@ impl ClientId {
 /// 判定の結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Detection {
-    /// Toolport が提供している（サーバーの id と command だけ。env は含めない）
+    /// Toolport が、自分と同じ実体の実行ファイルで提供している（サーバーの id と command だけ。env は含めない）
     Served { server_id: String, command: String },
+    /// Toolport が、自分以外の実行ファイルで提供している（id と command だけ。env は含めない）
+    ServedElsewhere { server_id: String, command: String },
     /// クライアントが Toolport ゲートウェイにつながっていない
     NotConnected,
     /// つながっているが、この製品のサーバーは提供されていない
@@ -90,10 +99,11 @@ pub enum Detection {
 }
 
 impl Detection {
-    /// ログ用の種類名（`served` / `not-connected` / `not-served` / `unknown`）
+    /// ログ用の種類名（`served` / `served-elsewhere` / `not-connected` / `not-served` / `unknown`）
     pub fn kind(&self) -> &'static str {
         match self {
             Detection::Served { .. } => "served",
+            Detection::ServedElsewhere { .. } => "served-elsewhere",
             Detection::NotConnected => "not-connected",
             Detection::NotServed => "not-served",
             Detection::Unknown(_) => "unknown",
@@ -107,6 +117,8 @@ pub trait Files {
     fn exists(&self, path: &str) -> bool;
     /// 全体を読む（サイズ上限なし、シンボリックリンクはたどる）
     fn read(&self, path: &str) -> io::Result<Vec<u8>>;
+    /// リンク・別名・大小・8.3 短縮名をたどった実体のパス。解決できなければ None
+    fn canonical(&self, path: &str) -> Option<String>;
 }
 
 /// 実際のファイルシステム
@@ -116,6 +128,16 @@ pub struct RealFiles;
 impl Files for RealFiles {
     fn exists(&self, path: &str) -> bool {
         Path::new(path).is_file()
+    }
+
+    fn canonical(&self, path: &str) -> Option<String> {
+        let resolved = std::fs::canonicalize(path).ok()?;
+        let text = resolved.to_string_lossy();
+        // Windows の拡張長パス接頭辞を取り除く（他 OS では現れない）
+        Some(match text.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned(),
+        })
     }
 
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
@@ -263,9 +285,10 @@ fn json_from(bytes: &[u8]) -> Option<Value> {
 // 判定
 // ---------------------------------------------------------------------------
 
-/// 判定する（設定ファイルと registry を `env` 経由で読む）。確かめられなければ `Unknown`
-pub fn detect(product: &Product, client: ClientId, env: &Env) -> Detection {
-    detect_inner(product, client, env).unwrap_or_else(Detection::Unknown)
+/// 判定する（設定ファイルと registry を `env` 経由で読む）。確かめられなければ `Unknown`。
+/// `own_executable` は直接登録に使うのと同じ絶対パス（[`Env::os`] の形式）
+pub fn detect(product: &Product, client: ClientId, env: &Env, own_executable: &str) -> Detection {
+    detect_inner(product, client, env, own_executable).unwrap_or_else(Detection::Unknown)
 }
 
 /// registry の中でこの製品を指すサーバーの、Toolport のツール名の前置き（`id` の `[A-Za-z0-9_]` 以外を
@@ -302,7 +325,12 @@ fn tool_prefix(id: &str) -> String {
         .collect()
 }
 
-fn detect_inner(product: &Product, client: ClientId, env: &Env) -> Result<Detection, String> {
+fn detect_inner(
+    product: &Product,
+    client: ClientId,
+    env: &Env,
+    own_executable: &str,
+) -> Result<Detection, String> {
     if env.os == Os::Other {
         return Err("unsupported-os".to_string());
     }
@@ -338,7 +366,14 @@ fn detect_inner(product: &Product, client: ClientId, env: &Env) -> Result<Detect
     };
     let registry_path = resolve_registry_path(&gateway.env, env)?;
     let registry = load_registry(env, &registry_path)?;
-    evaluate(product, client, &registry, &gateway.env, env)
+    evaluate(
+        product,
+        client,
+        &registry,
+        &gateway.env,
+        env,
+        own_executable,
+    )
 }
 
 fn client_config_path(client: ClientId, home: &str, env: &Env) -> String {
@@ -1106,13 +1141,14 @@ fn selected_enabled_ids<'a>(
         .collect()
 }
 
-/// R11: registry の内容から、この製品が提供されているかを決める
+/// R11・R13: registry の内容から、この製品が提供されているかを決める
 fn evaluate(
     product: &Product,
     client: ClientId,
     registry: &Value,
     gateway_env: &BTreeMap<String, String>,
     env: &Env,
+    own_executable: &str,
 ) -> Result<Detection, String> {
     check_client_scope(registry, client)?;
     let named: Vec<(&str, &str)> = registry["servers"]
@@ -1130,24 +1166,43 @@ fn evaluate(
     }
     let enabled_sets = selected_enabled_ids(registry, gateway_env, env)?;
     let mut missing_executable = false;
+    let mut elsewhere: Option<Detection> = None;
     for (id, command) in named {
         if !enabled_sets.iter().all(|ids| ids.contains(&id)) {
             continue;
         }
-        if existing_absolute_file(env, command) {
+        if !existing_absolute_file(env, command) {
+            missing_executable = true;
+        } else if same_executable(env, own_executable, command) {
+            // 自分と同じ実体があれば、並び順に関係なく Served（R13）
             return Ok(Detection::Served {
                 server_id: id.to_owned(),
                 command: command.to_owned(),
             });
+        } else if elsewhere.is_none() {
+            elsewhere = Some(Detection::ServedElsewhere {
+                server_id: id.to_owned(),
+                command: command.to_owned(),
+            });
         }
-        missing_executable = true;
     }
-    // 条件を満たすが実行ファイルが無いものだけ: Toolport が提供できない状態なので直接登録に戻す側（解釈）
-    Ok(if missing_executable {
+    // 別の実行ファイルで提供中 → 実行ファイルが無いだけ（直接登録に戻す側の解釈）→ 提供されていない
+    Ok(elsewhere.unwrap_or(if missing_executable {
         Detection::NotConnected
     } else {
         Detection::NotServed
-    })
+    }))
+}
+
+/// R13: 2 つの実行ファイルが同じ実体か。両側を `canonical`（失敗した側は元の文字列）にしてから、
+/// `Env::os` の規則で正規化して比べる。canonicalize の失敗を `Unknown` にしない（直接登録に進んで二重に
+/// 起動するため）
+fn same_executable(env: &Env, own: &str, other: &str) -> bool {
+    let resolve = |path: &str| {
+        let canonical = env.files.canonical(path);
+        normalize_command(env.os, canonical.as_deref().unwrap_or(path))
+    };
+    resolve(own) == resolve(other)
 }
 
 #[cfg(test)]
@@ -1194,11 +1249,26 @@ mod tests {
         os: Os,
         files: BTreeMap<String, Vec<u8>>,
         unreadable: BTreeSet<String>,
+        /// 別名の表（鍵は `os_key`）。値は実体のパス
+        aliases: BTreeMap<String, String>,
+        /// 存在しても canonicalize に失敗するパス（鍵は `os_key`）
+        uncanonical: BTreeSet<String>,
     }
 
     impl Files for FakeFiles {
         fn exists(&self, path: &str) -> bool {
             self.files.contains_key(&os_key(self.os, path))
+        }
+
+        fn canonical(&self, path: &str) -> Option<String> {
+            let k = os_key(self.os, path);
+            if self.uncanonical.contains(&k) {
+                return None;
+            }
+            match self.aliases.get(&k) {
+                Some(real) => Some(real.clone()),
+                None => self.exists(path).then(|| path.to_owned()),
+            }
         }
 
         fn read(&self, path: &str) -> io::Result<Vec<u8>> {
@@ -1221,6 +1291,10 @@ mod tests {
         }
 
         fn read(&self, _: &str) -> io::Result<Vec<u8>> {
+            panic!("読んではいけない")
+        }
+
+        fn canonical(&self, _: &str) -> Option<String> {
             panic!("読んではいけない")
         }
     }
@@ -1250,6 +1324,10 @@ mod tests {
         vars: BTreeMap<String, String>,
         home: Option<String>,
         os: Os,
+        /// 自分の実行ファイル（`detect` に渡す）
+        own: String,
+        aliases: BTreeMap<String, String>,
+        uncanonical: BTreeSet<String>,
     }
 
     impl World {
@@ -1261,6 +1339,9 @@ mod tests {
                 vars: BTreeMap::new(),
                 home: Some(HOME.to_string()),
                 os: Os::Windows,
+                own: PRODUCT_EXE.to_string(),
+                aliases: BTreeMap::new(),
+                uncanonical: BTreeSet::new(),
             };
             world.put(GATEWAY, "");
             world.put(PRODUCT_EXE, "");
@@ -1286,6 +1367,9 @@ mod tests {
                 vars: BTreeMap::new(),
                 home: Some(home.to_string()),
                 os,
+                own: UNIX_PRODUCT_EXE.to_string(),
+                aliases: BTreeMap::new(),
+                uncanonical: BTreeSet::new(),
             };
             world.put(UNIX_GATEWAY, "");
             world.put(UNIX_PRODUCT_EXE, "");
@@ -1362,16 +1446,18 @@ mod tests {
                     os: self.os,
                     files: self.files.clone(),
                     unreadable: self.unreadable.clone(),
+                    aliases: self.aliases.clone(),
+                    uncanonical: self.uncanonical.clone(),
                 }),
             }
         }
 
         fn detect(&self) -> Detection {
-            detect(&PRODUCT, ClientId::ClaudeCode, &self.env())
+            detect(&PRODUCT, ClientId::ClaudeCode, &self.env(), &self.own)
         }
 
         fn detect_codex(&self) -> Detection {
-            detect(&PRODUCT, ClientId::Codex, &self.env())
+            detect(&PRODUCT, ClientId::Codex, &self.env(), &self.own)
         }
 
         /// registry を書き換えて置く
@@ -1427,7 +1513,7 @@ mod tests {
         };
         for client in [ClientId::ClaudeCode, ClientId::Codex] {
             assert_eq!(
-                detect(&PRODUCT, client, &env),
+                detect(&PRODUCT, client, &env, PRODUCT_EXE),
                 Detection::Unknown("unsupported-os".to_string())
             );
         }
@@ -2089,6 +2175,7 @@ mod tests {
         assert_eq!(w.detect(), Detection::NotServed);
         // ファイル名は大小を区別せず .exe を除く。引数に mode_arg を含む
         w.put(r"C:\app\EDICTORA.EXE", "");
+        w.own = r"C:\app\EDICTORA.EXE".to_string();
         w.registry(|r| {
             r["servers"][0]["command"] = json!(r"C:\app\EDICTORA.EXE");
             r["servers"][0]["args"] = json!(["--x", "mcp"]);
@@ -2149,9 +2236,136 @@ mod tests {
         );
     }
 
+    fn elsewhere(command: &str) -> Detection {
+        Detection::ServedElsewhere {
+            server_id: "s1".to_string(),
+            command: command.to_string(),
+        }
+    }
+
+    /// 自分（PRODUCT_EXE）と他者の 2 つを有効にした registry を、`first_is_own` の順で置く
+    fn two_servers(w: &mut World, other: &str, own_first: bool) {
+        let own = json!({"id": "s1", "transport": "stdio", "command": PRODUCT_EXE, "args": ["mcp"], "enabled": true});
+        let theirs = json!({"id": "s2", "transport": "stdio", "command": other, "args": ["mcp"], "enabled": true});
+        w.registry(|r| {
+            r["servers"] = if own_first {
+                json!([own, theirs])
+            } else {
+                json!([theirs, own])
+            };
+            r["profiles"][0]["enabledServerIds"] = json!(["s1", "s2"]);
+        });
+    }
+
+    #[test]
+    fn r13_大文字小文字と区切りだけが違えばserved_別のパスならservedelsewhere() {
+        let mut w = World::new();
+        w.own = r"C:/APP/Current/EDICTORA.exe".to_string();
+        assert_eq!(w.detect(), served());
+        w.own = r"C:\other\edictora.exe".to_string();
+        assert_eq!(w.detect(), elsewhere(PRODUCT_EXE));
+        assert_eq!(w.detect().kind(), "served-elsewhere");
+        // Codex でも同じ
+        w.codex(CODEX_GATEWAY);
+        w.remove(CLAUDE_JSON);
+        assert_eq!(w.detect_codex(), elsewhere(PRODUCT_EXE));
+        // Unix は大小を区別する
+        let mut u = World::unix(Os::Linux);
+        u.own = "/opt/app/Edictora".to_string();
+        assert_eq!(
+            u.detect(),
+            Detection::ServedElsewhere {
+                server_id: "s1".to_string(),
+                command: UNIX_PRODUCT_EXE.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn r13_自分と他者が両方有効なら並び順に関係なくserved() {
+        let other = r"C:\other\edictora.exe";
+        for own_first in [true, false] {
+            let mut w = World::new();
+            w.put(other, "");
+            two_servers(&mut w, other, own_first);
+            assert_eq!(w.detect(), served(), "own_first={own_first}");
+            // 自分が無ければ、最初の他者が ServedElsewhere
+            w.own = r"C:\nobody\edictora.exe".to_string();
+            assert_eq!(
+                w.detect(),
+                if own_first {
+                    elsewhere(PRODUCT_EXE)
+                } else {
+                    Detection::ServedElsewhere {
+                        server_id: "s2".to_string(),
+                        command: other.to_string(),
+                    }
+                },
+                "own_first={own_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn r13_別名で同じ実体ならserved() {
+        let link = r"C:\link\edictora.exe";
+        let mut w = World::new();
+        w.put(link, "");
+        w.own = link.to_string();
+        assert_eq!(w.detect().kind(), "served-elsewhere");
+        w.aliases.insert(key(link), PRODUCT_EXE.to_string());
+        assert_eq!(w.detect(), served());
+        // registry 側が別名でも同じ
+        w.own = PRODUCT_EXE.to_string();
+        w.aliases.clear();
+        w.aliases.insert(key(PRODUCT_EXE), link.to_string());
+        w.registry(|r| r["servers"][0]["command"] = json!(link));
+        assert_eq!(
+            w.detect(),
+            Detection::Served {
+                server_id: "s1".to_string(),
+                command: link.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn r13_両側ともcanonicalizeに失敗したら字面で比べる() {
+        let mut w = World::new();
+        w.uncanonical.insert(key(PRODUCT_EXE));
+        w.own = r"C:/App/Current/Edictora.exe".to_string();
+        w.uncanonical.insert(key(&w.own));
+        assert_eq!(w.detect(), served());
+        // 失敗しても Unknown にはしない（直接登録に進んで二重に起動しない）
+        w.own = r"C:\other\edictora.exe".to_string();
+        w.uncanonical.insert(key(&w.own));
+        assert_eq!(w.detect(), elsewhere(PRODUCT_EXE));
+    }
+
+    #[test]
+    fn r13_他者の実行ファイルだけが無ければnotconnected() {
+        let other = r"C:\other\edictora.exe";
+        let mut w = World::new();
+        w.own = other.to_string();
+        w.remove(PRODUCT_EXE);
+        assert_eq!(w.detect(), Detection::NotConnected);
+        // 実在する別の候補があればそちらが ServedElsewhere
+        w.put(PRODUCT_EXE, "");
+        w.own = r"C:\nobody\edictora.exe".to_string();
+        two_servers(&mut w, other, true);
+        w.remove(other);
+        assert_eq!(w.detect(), elsewhere(PRODUCT_EXE));
+        w.remove(PRODUCT_EXE);
+        assert_eq!(w.detect(), Detection::NotConnected);
+        // 結果に env を含めない
+        let shown = format!("{:?}", elsewhere(PRODUCT_EXE));
+        assert!(!shown.contains("hunter2"));
+    }
+
     #[test]
     fn 種類名() {
         assert_eq!(served().kind(), "served");
+        assert_eq!(elsewhere(PRODUCT_EXE).kind(), "served-elsewhere");
         assert_eq!(Detection::NotConnected.kind(), "not-connected");
         assert_eq!(Detection::NotServed.kind(), "not-served");
         assert_eq!(Detection::Unknown(String::new()).kind(), "unknown");

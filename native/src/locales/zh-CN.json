@@ -50,5 +50,6 @@
   "welcome.press_enter": "按 Enter 键关闭。",
   "welcome.prompt_url": "请输入服务器 URL（https://…）。留空则稍后设置：",
   "welcome.run_setup": "请在终端中运行 `remnifold setup --base-url <URL>`。",
+  "welcome.toolport_foreign": "注意：Toolport 已通过另一个可执行文件（{command}）向 {client} 提供 Remnifold，因此已跳过直接注册。请把该 Toolport 服务器的 command 改为 {executable}。",
   "welcome.updates": "更新会自动下载，并在下次登录电脑时应用。要关闭，请在 app-update.json 中将 auto_update 设为 false。"
 }

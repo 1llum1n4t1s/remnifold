@@ -41,11 +41,13 @@
 //!   張り直しは、この実行ファイルを指す Remnifold のフックがある場合だけ書き込むので、Claude の登録が
 //!   `done` に無くても行う（利用者が `connect` で手動登録した場合も移行する）。
 //!
-//! - Toolport ゲートウェイが既に提供している CLI（[`crate::toolport`] の判定が `Served`）と、`remnifold.json` の
-//!   `mcpRegistration` が `off` の CLI は、直接登録（CLI 呼び出し）を省いて状態ファイルの `skipped` に理由を覚える
-//!   （Claude Code はフックだけを統合する）。`done` は外さない。`skipped=toolport` で `auto` のときだけ、起動のたびに
-//!   判定し直し、クライアントから Toolport が消えた（`NotConnected`）ら直接登録へ戻す。`direct` は `skipped` も
-//!   直接登録し、`off` は自動の追加・修復をしない。
+//! - Toolport ゲートウェイが既に提供している CLI（[`crate::toolport`] の判定が `Served`: 自分と同じ実体の実行ファイル、
+//!   `ServedElsewhere`: 別の実行ファイル）と、`remnifold.json` の `mcpRegistration` が `off` の CLI は、直接登録
+//!   （CLI 呼び出し）を省いて状態ファイルの `skipped` に理由（`toolport` / `toolport-foreign` / `off`）を覚える
+//!   （Claude Code はフックだけを統合する）。`done` は外さない。`skipped` が `toolport` か `toolport-foreign` で
+//!   `auto` のときは、CLI の有無に関係なく起動のたびに判定し直す。`Served` なら `toolport`、`ServedElsewhere` なら
+//!   `toolport-foreign`（記録した回だけ `app-update.log` に警告）へ記録し直し、クライアントから Toolport が消えた
+//!   （`NotConnected`）ら直接登録へ戻す。`direct` は `skipped` も直接登録し、`off` は自動の追加・修復をしない。
 //!
 //! 複数のセッションが同時に起動しても二重に登録しないよう、`setup-registration.lock` を try-lock する。
 use super::{SetupContext, log_line, logon};
@@ -78,8 +80,8 @@ pub struct State {
     /// Claude Code のフックを、自動想起が有効（true）・無効（false）のどちらの定義で登録したか。
     /// 未登録・古い状態ファイルでは None。
     pub recall: Option<bool>,
-    /// 直接登録を省いた CLI と理由（`"toolport"`: Toolport ゲートウェイが既に提供している、`"off"`: `mcpRegistration`
-    /// が off）。`done` とは別で、`done`（直接登録済み）の意味は変えない。古い状態ファイルでは空。
+    /// 直接登録を省いた CLI と理由（`"toolport"`: Toolport ゲートウェイが既に提供している、`"toolport-foreign"`: Toolport が
+    /// 別の実行ファイルで提供している、`"off"`: `mcpRegistration` が off）。`done` とは別で、`done`（直接登録済み）の意味は変えない。古い状態ファイルでは空。
     pub skipped: BTreeMap<String, String>,
 }
 
@@ -100,13 +102,14 @@ pub struct Plan {
 
 /// `skipped` の理由。
 const SKIP_TOOLPORT: &str = "toolport";
+const SKIP_TOOLPORT_FOREIGN: &str = "toolport-foreign";
 const SKIP_OFF: &str = "off";
 
 fn skip_reason(reason: &str) -> &'static str {
-    if reason == SKIP_TOOLPORT {
-        SKIP_TOOLPORT
-    } else {
-        SKIP_OFF
+    match reason {
+        SKIP_TOOLPORT => SKIP_TOOLPORT,
+        SKIP_TOOLPORT_FOREIGN => SKIP_TOOLPORT_FOREIGN,
+        _ => SKIP_OFF,
     }
 }
 
@@ -137,7 +140,7 @@ pub fn parse(bytes: &[u8]) -> State {
                     .iter()
                     .filter_map(|(tool, reason)| {
                         let reason = reason.as_str()?;
-                        [SKIP_TOOLPORT, SKIP_OFF]
+                        [SKIP_TOOLPORT, SKIP_TOOLPORT_FOREIGN, SKIP_OFF]
                             .contains(&reason)
                             .then(|| (tool.clone(), reason.to_owned()))
                     })
@@ -145,6 +148,11 @@ pub fn parse(bytes: &[u8]) -> State {
             })
             .unwrap_or_default(),
     }
+}
+
+/// 状態ファイルで `tool` が `toolport-foreign` として直接登録を省かれているか。
+pub fn is_toolport_foreign(state: &State, tool: &str) -> bool {
+    state.skipped.get(tool).map(String::as_str) == Some(SKIP_TOOLPORT_FOREIGN)
 }
 
 pub fn load(state_dir: &Path) -> State {
@@ -201,8 +209,8 @@ pub fn plan(
 /// `detect` は Toolport がその CLI（`claude` / `codex`）へ提供しているかの判定（どちらもテストで差し替える）。
 ///
 /// `done`（直接登録済み）の CLI は、どの方針でも外さず、触らない。判定（`detect`）を呼ぶのは、状態を作り直すとき
-/// （パスの変更）と、まだ登録も省略もしていない CLI（auto では CLI があるときだけ）、`skipped` の CLI だけで、
-/// 普段の起動では呼ばない。
+/// （パスの変更）と、まだ登録も省略もしていない CLI（auto では CLI があるときだけ）、`skipped` の CLI（理由が
+/// `toolport` / `toolport-foreign` の auto は CLI の有無に関係なく）だけで、普段の起動では呼ばない。
 ///
 /// 省く CLI のうち Claude Code は、フックだけを統合する。統合先が無い（`claude_hooks_target` が false: Claude Code の
 /// CLI も設定フォルダーも無い）ときは、フックを作らず `skipped` にも記録しない（次の起動でまた判断する）。
@@ -242,7 +250,12 @@ fn plan_unchecked(
     available: impl Fn(&str) -> bool,
     detect: impl Fn(&str) -> Detection,
 ) -> Option<Plan> {
-    let served = |tool: &str| matches!(detect(tool), Detection::Served { .. });
+    // 判定から、省く理由（Toolport が提供している）を決める。省かず直接登録するなら None。
+    let judge = |tool: &str| match detect(tool) {
+        Detection::Served { .. } => Some(SKIP_TOOLPORT),
+        Detection::ServedElsewhere { .. } => Some(SKIP_TOOLPORT_FOREIGN),
+        _ => None,
+    };
     if state.executable.as_deref() != Some(executable) {
         // 新規インストール・パス変更: 状態を作り直し、クライアントごとに決める。
         let mut tools = Vec::new();
@@ -250,8 +263,11 @@ fn plan_unchecked(
         for tool in connect::SETUP_TOOLS {
             match mode {
                 connect::McpMode::Off => skips.push((tool, SKIP_OFF)),
-                connect::McpMode::Auto if served(tool) => skips.push((tool, SKIP_TOOLPORT)),
-                _ => tools.push(tool),
+                connect::McpMode::Auto => match judge(tool) {
+                    Some(reason) => skips.push((tool, reason)),
+                    None => tools.push(tool),
+                },
+                connect::McpMode::Direct => tools.push(tool),
             }
         }
         return Some(Plan {
@@ -287,30 +303,38 @@ fn plan_unchecked(
                     tools.push(tool);
                 }
             }
-            // 省いた理由が toolport: 更新・通常起動では、クライアントから Toolport が消えた（NotConnected）ときだけ戻す。
-            (connect::McpMode::Auto, Some(SKIP_TOOLPORT)) => {
-                if available(tool) && matches!(detect(tool), Detection::NotConnected) {
-                    tools.push(tool);
-                } else if retry_hooks(tool) {
-                    skips.push((tool, SKIP_TOOLPORT));
-                }
-            }
-            // 省いた理由が off（方針が off から auto へ変わった）: CLI があるときだけ、新規と同じく判定する。
-            (connect::McpMode::Auto, Some(_)) => {
-                if available(tool) {
-                    if served(tool) {
-                        skips.push((tool, SKIP_TOOLPORT));
-                    } else {
-                        tools.push(tool);
+            // 省いた理由が toolport / toolport-foreign: CLI の有無に関係なく毎回判定する。理由が変わるときだけ記録し直し
+            // （同じ理由なら、フックの再試行以外は何もしない）、Toolport が消えた（NotConnected）ときだけ直接登録へ戻す。
+            (connect::McpMode::Auto, Some(previous))
+                if previous == SKIP_TOOLPORT || previous == SKIP_TOOLPORT_FOREIGN =>
+            {
+                let hooks = retry_hooks(tool);
+                match detect(tool) {
+                    Detection::Served { .. } => {
+                        if previous != SKIP_TOOLPORT || hooks {
+                            skips.push((tool, SKIP_TOOLPORT));
+                        }
+                    }
+                    Detection::ServedElsewhere { .. } => {
+                        if previous != SKIP_TOOLPORT_FOREIGN || hooks {
+                            skips.push((tool, SKIP_TOOLPORT_FOREIGN));
+                        }
+                    }
+                    Detection::NotConnected if available(tool) => tools.push(tool),
+                    _ => {
+                        if hooks {
+                            skips.push((tool, skip_reason(previous)));
+                        }
                     }
                 }
             }
-            (connect::McpMode::Auto, None) => {
+            // 省いた理由が off（方針が off から auto へ変わった）や、まだ登録も省略もしていない CLI:
+            // CLI があるときだけ、新規と同じく判定する。
+            (connect::McpMode::Auto, _) => {
                 if available(tool) {
-                    if served(tool) {
-                        skips.push((tool, SKIP_TOOLPORT));
-                    } else {
-                        tools.push(tool);
+                    match judge(tool) {
+                        Some(reason) => skips.push((tool, reason)),
+                        None => tools.push(tool),
                     }
                 }
             }
@@ -335,7 +359,8 @@ fn plan_unchecked(
 }
 
 /// `claude` / `codex` を Toolport の判定のクライアントへ変えて、環境から判定する。
-fn detect_tool(tool: &str) -> Detection {
+/// `executable` は直接登録に使うのと同じ絶対パスで、Toolport の提供が自分と同じ実体かを比べる。
+pub fn detect_tool(tool: &str, executable: &str) -> Detection {
     let client = match tool {
         "claude" => toolport::ClientId::ClaudeCode,
         "codex" => toolport::ClientId::Codex,
@@ -345,6 +370,7 @@ fn detect_tool(tool: &str) -> Detection {
         &connect::TOOLPORT_PRODUCT,
         client,
         &toolport::Env::process(),
+        executable,
     )
 }
 
@@ -356,6 +382,14 @@ fn detection_line(label: &str, tool: &str, detection: &Detection) -> String {
         }
         other => format!("{label}: {tool}: toolport detection {}", other.kind()),
     }
+}
+
+/// Toolport が別の実行ファイルで提供しているため直接登録を省いたことの警告（`app-update.log` 用）。
+/// Toolport 側の command は書かず、自分の実行ファイルのパスだけを書く。
+fn foreign_warning(label: &str, tool: &str, executable: &str) -> String {
+    format!(
+        "{label}: {tool}: Toolport serves a different remnifold executable; direct registration skipped. Point the Toolport server's command to {executable}"
+    )
 }
 
 /// 更新後のフック（Velopack は15秒で打ち切る）で、CLI の登録に使ってよい時間の予算。15秒より十分小さくし、
@@ -420,7 +454,7 @@ pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duratio
             claude_target,
         )
     };
-    if make_plan(&load(&state_dir), &detect_tool).is_none() {
+    if make_plan(&load(&state_dir), &|tool| detect_tool(tool, &executable)).is_none() {
         return;
     }
     // 他のプロセスが登録中なら任せる（二重に CLI を呼ばない）。
@@ -432,7 +466,7 @@ pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duratio
     // 決めるために判定したクライアントの結果を、判定を重ねずにそのまま記録する。
     let judged = std::cell::RefCell::new(Vec::new());
     let Some(plan) = make_plan(&previous, &|tool| {
-        let detection = detect_tool(tool);
+        let detection = detect_tool(tool, &executable);
         judged
             .borrow_mut()
             .push((tool.to_owned(), detection.clone()));
@@ -444,6 +478,7 @@ pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duratio
     for (tool, detection) in judged.borrow().iter() {
         log_line(&detection_line(label, tool, detection));
     }
+    let previous_skipped = previous.skipped.clone();
     let mut state = if plan.fresh {
         State {
             executable: Some(executable.clone()),
@@ -489,6 +524,11 @@ pub fn ensure_within(context: &SetupContext, label: &str, budget: Option<Duratio
         log_line(&format!(
             "{label}: {tool}: MCP registration not added ({reason})"
         ));
+        // 警告は、foreign を記録した回だけ出す（同じ理由のままフックだけ再試行した回は出さない）。
+        let recorded = previous_skipped.get(*tool).map(String::as_str);
+        if *reason == SKIP_TOOLPORT_FOREIGN && (plan.fresh || recorded != Some(*reason)) {
+            log_line(&foreign_warning(label, tool, &executable));
+        }
     }
     let (outcomes, skipped) = register_within(
         &plan.tools,
@@ -977,6 +1017,132 @@ mod tests {
             auto(|_| Detection::NotConnected).tools,
             vec!["claude", "codex"]
         );
+    }
+
+    fn elsewhere(_: &str) -> Detection {
+        Detection::ServedElsewhere {
+            server_id: "remnifold-2".into(),
+            command: "C:/other/r.exe".into(),
+        }
+    }
+
+    #[test]
+    fn toolport_foreign_is_recorded_and_judged_every_start_in_auto() {
+        let plan_for = |state: &State, available: bool, detect: fn(&str) -> Detection| {
+            super::plan(
+                state,
+                "/A.app/x",
+                "1.0.0",
+                false,
+                McpMode::Auto,
+                move |_| available,
+                detect,
+            )
+        };
+        // 新規（パスが違う）: ServedElsewhere は foreign を記録する。
+        let fresh = plan_for(&State::default(), true, elsewhere).unwrap();
+        assert!(fresh.tools.is_empty());
+        assert_eq!(
+            fresh.skips,
+            vec![
+                ("claude", "toolport-foreign"),
+                ("codex", "toolport-foreign")
+            ]
+        );
+        // toolport -> ServedElsewhere: foreign に変える。
+        let toolport = skipped(
+            &registered_state(),
+            &[("claude", "toolport"), ("codex", "toolport")],
+        );
+        let toolport = State {
+            done: BTreeSet::new(),
+            ..toolport
+        };
+        assert_eq!(
+            plan_for(&toolport, false, elsewhere).unwrap().skips,
+            vec![
+                ("claude", "toolport-foreign"),
+                ("codex", "toolport-foreign")
+            ]
+        );
+        let foreign = State {
+            done: BTreeSet::new(),
+            ..skipped(
+                &registered_state(),
+                &[
+                    ("claude", "toolport-foreign"),
+                    ("codex", "toolport-foreign"),
+                ],
+            )
+        };
+        // foreign -> Served: toolport に変える（CLI が無くても判定する）。
+        assert_eq!(
+            plan_for(&foreign, false, served).unwrap().skips,
+            vec![("claude", "toolport"), ("codex", "toolport")]
+        );
+        // foreign -> ServedElsewhere・NotServed・Unknown: 何もしない。
+        for detect in [
+            elsewhere as fn(&str) -> Detection,
+            |_| Detection::NotServed,
+            |_| Detection::Unknown("x".into()),
+        ] {
+            assert_eq!(plan_for(&foreign, true, detect), None);
+        }
+        // foreign -> NotConnected: CLI があれば直接登録し、無ければ何もしない。
+        assert_eq!(
+            plan_for(&foreign, true, |_| Detection::NotConnected)
+                .unwrap()
+                .tools,
+            vec!["claude", "codex"]
+        );
+        assert_eq!(plan_for(&foreign, false, |_| Detection::NotConnected), None);
+        // direct は直接登録し、off は何もしない。
+        let mode = |mode| {
+            super::plan(
+                &foreign,
+                "/A.app/x",
+                "1.0.0",
+                false,
+                mode,
+                |_| true,
+                elsewhere,
+            )
+        };
+        assert_eq!(
+            mode(McpMode::Direct).unwrap().tools,
+            vec!["claude", "codex"]
+        );
+        assert_eq!(mode(McpMode::Off), None);
+    }
+
+    #[test]
+    fn a_foreign_claude_keeps_its_reason_when_the_hooks_are_retried() {
+        let failed = State {
+            recall: None,
+            done: BTreeSet::new(),
+            ..skipped(
+                &registered_state(),
+                &[
+                    ("claude", "toolport-foreign"),
+                    ("codex", "toolport-foreign"),
+                ],
+            )
+        };
+        // 同じ判定のままでも、フックだけやり直すので、理由を保って記録し直す（Claude だけ）。
+        for (mode, detect) in [
+            (McpMode::Auto, elsewhere as fn(&str) -> Detection),
+            (McpMode::Auto, |_| Detection::NotServed),
+            (McpMode::Off, elsewhere),
+        ] {
+            let plan =
+                super::plan(&failed, "/A.app/x", "1.0.0", false, mode, |_| true, detect).unwrap();
+            assert!(plan.tools.is_empty());
+            assert_eq!(plan.skips, vec![("claude", "toolport-foreign")]);
+        }
+        // 状態ファイルは新しい理由を読み、旧版の知らない理由は捨てる。
+        let parsed = parse(br#"{"skipped":{"claude":"toolport-foreign","codex":"future"}}"#);
+        assert_eq!(parsed.skipped.len(), 1);
+        assert_eq!(parsed.skipped["claude"], "toolport-foreign");
     }
 
     #[test]

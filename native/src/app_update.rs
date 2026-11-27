@@ -31,7 +31,7 @@
 //!
 //! # フィード
 //! 更新元の生成は [`update_source`] の1か所に閉じる。
-use crate::{connect, paths::Roots};
+use crate::{connect, paths::Roots, toolport};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -556,6 +556,47 @@ pub fn update_apply() -> Result<ApplyOutcome> {
 
 // ───────────────────────── 案内（初回起動・引数なしの対話起動） ─────────────────────────
 
+/// Toolport が別の実行ファイルで Remnifold を提供しているクライアントごとの案内（`welcome.toolport_foreign`）。
+/// 直接登録は省かれているので、Toolport 側の command をこの実行ファイルへ向け直すよう促す。
+fn toolport_foreign_notices() -> Vec<String> {
+    let Some(context) = SetupContext::detect() else {
+        return Vec::new();
+    };
+    let executable = context.executable.to_string_lossy().into_owned();
+    let state = registration::load(&crate::paths::Roots::current().state);
+    foreign_clients(&state, |tool| registration::detect_tool(tool, &executable))
+        .into_iter()
+        .map(|(client, command)| {
+            crate::locale::tr_with(
+                "welcome.toolport_foreign",
+                &[
+                    ("client", client),
+                    ("command", &command),
+                    ("executable", &executable),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// 状態ファイルで `toolport-foreign` として直接登録を省いたクライアントだけを、表示名と Toolport 側の command で返す。
+/// 状態は案内の直前の登録処理が書いたものなので、direct・off・done のクライアントには案内しない。
+fn foreign_clients(
+    state: &registration::State,
+    detect: impl Fn(&str) -> toolport::Detection,
+) -> Vec<(&'static str, String)> {
+    let mut clients = Vec::new();
+    for (tool, client) in [("claude", "Claude Code"), ("codex", "Codex")] {
+        if !registration::is_toolport_foreign(state, tool) {
+            continue;
+        }
+        if let toolport::Detection::ServedElsewhere { command, .. } = detect(tool) {
+            clients.push((client, command));
+        }
+    }
+    clients
+}
+
 /// 利用者が直接起動したとき（Setup 直後の初回起動、スタートメニューからの起動）の案内。
 /// `mcp` として stdin を待たず、導入済み・登録済みであることと次の手順を示す。
 /// 端末が対話的で接続が未設定なら、そのまま `setup` を始める。
@@ -564,6 +605,9 @@ pub fn welcome(first_run: bool) -> Result<()> {
     use std::io::{BufRead, IsTerminal};
     println!("{}", tr("welcome.installed"));
     println!("{}", tr("welcome.updates"));
+    for line in toolport_foreign_notices() {
+        println!("{line}");
+    }
     let roots = Roots::current();
     let configured = crate::paths::config_file(&roots, &crate::common::codex_home())
         .ok()

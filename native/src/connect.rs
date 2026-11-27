@@ -204,10 +204,21 @@ pub const TOOLPORT_PRODUCT: crate::toolport::Product = crate::toolport::Product 
 };
 
 /// 手動の `connect` の結果へ、Toolport が既に提供している場合の重複の通知を付ける（登録は止めない）。
+/// `sameExecutable` は、提供が登録する実行ファイルと同じ実体か（`Served` は true、別の実行ファイル
+/// `ServedElsewhere` は false）。どちらも `duplicate: true`。
 fn attach_toolport_notice(result: &mut Value, detection: crate::toolport::Detection) {
-    if let crate::toolport::Detection::Served { server_id, command } = detection {
-        result["toolport"] = json!({"serverId": server_id, "command": command, "duplicate": true});
-    }
+    use crate::toolport::Detection;
+    let (server_id, command, same) = match detection {
+        Detection::Served { server_id, command } => (server_id, command, true),
+        Detection::ServedElsewhere { server_id, command } => (server_id, command, false),
+        _ => return,
+    };
+    result["toolport"] = json!({
+        "serverId": server_id,
+        "command": command,
+        "duplicate": true,
+        "sameExecutable": same
+    });
 }
 
 /// `recall` のときに登録するフックのイベント名。
@@ -299,7 +310,12 @@ pub fn run(args: &[String]) -> Result<()> {
     // 登録は判定に関わらず従来どおり行い、Toolport が既に提供しているときだけ重複を知らせる。
     attach_toolport_notice(
         &mut result,
-        crate::toolport::detect(&TOOLPORT_PRODUCT, client, &crate::toolport::Env::process()),
+        crate::toolport::detect(
+            &TOOLPORT_PRODUCT,
+            client,
+            &crate::toolport::Env::process(),
+            &executable.to_string_lossy(),
+        ),
     );
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -1194,7 +1210,19 @@ mod tests {
         );
         assert_eq!(
             result["toolport"],
-            json!({"serverId": "remnifold-1", "command": "C:/r.exe", "duplicate": true})
+            json!({"serverId": "remnifold-1", "command": "C:/r.exe", "duplicate": true, "sameExecutable": true})
+        );
+        // 別の実行ファイルで提供している場合も重複として知らせ、sameExecutable を false にする。
+        attach_toolport_notice(
+            &mut result,
+            Detection::ServedElsewhere {
+                server_id: "remnifold-2".into(),
+                command: "C:/other/r.exe".into(),
+            },
+        );
+        assert_eq!(
+            result["toolport"],
+            json!({"serverId": "remnifold-2", "command": "C:/other/r.exe", "duplicate": true, "sameExecutable": false})
         );
     }
 }
