@@ -20,6 +20,6 @@ Without a new connection, the first run copies a valid legacy one from Codex hom
 
 ## MCP registration
 
-`mcpRegistration` (`auto`, `direct` or `off`) controls whether Setup registers Remnifold directly or relies on the Toolport gateway on Windows. See [MCP registration](mcp-registration.md).
+`mcpRegistration` (`auto`, `direct` or `off`) controls whether Setup registers Remnifold directly or relies on the Toolport gateway on Windows, macOS and Linux. See [MCP registration](mcp-registration.md).
 
 `REMNIFOLD_LANGUAGE`, then `LC_ALL`, `LC_MESSAGES`, `LANG` and the OS language select recall wording: Japanese environments receive Japanese and all others English. Stored text is not translated.

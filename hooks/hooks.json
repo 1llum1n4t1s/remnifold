@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^mcp__remnifold__|^mcp__toolport__toolport_call_tool$",
+        "matcher": "^mcp__remnifold__|^mcp__toolport__toolport_(call_tool|run_script)$",
         "hooks": [
           {
             "type": "command",

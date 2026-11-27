@@ -514,8 +514,101 @@ fn toolport_pretool(
     allow_read(event, updated)
 }
 
+/// Toolport のスクリプト実行ツール（`tool_input` は `{script, data?, input?, ...}`）。
+const TOOLPORT_RUN_SCRIPT: &str = "mcp__toolport__toolport_run_script";
+/// 前置きを足した後の `script` の上限（バイト）。
+const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+/// `toolport.call` / `callAsync` の `search_memory` 呼び出しで、`sessionId: "current"` を今のセッション ID に
+/// 置き換える前置き（1行）。`<SID_JSON>` と `<NAMES_JSON>` は JSON として埋め込む。
+const SCRIPT_PRELUDE: &str = r#"(function(){try{var t=globalThis.toolport,s=<SID_JSON>,n=<NAMES_JSON>;if(!t)return;function f(x,a){if(n.indexOf(String(x))>=0&&a!==null&&typeof a==="object"&&!Array.isArray(a)&&a.sessionId==="current"){var b={};for(var k in a){if(Object.prototype.hasOwnProperty.call(a,k))b[k]=a[k];}b.sessionId=s;return b;}return a;}var c=t.call,d=t.callAsync;if(typeof c==="function")t.call=function(x,a){return c.call(t,x,f(x,a));};if(typeof d==="function")t.callAsync=function(x,a){return d.call(t,x,f(x,a));};}catch(e){}})();"#;
+
+/// 前置きを一度に組み立てる（片方の値の中身をもう片方の置換が書き換えない）。
+fn build_prelude(session_json: &str, names_json: &str) -> Option<String> {
+    let (head, rest) = SCRIPT_PRELUDE.split_once("<SID_JSON>")?;
+    let (middle, tail) = rest.split_once("<NAMES_JSON>")?;
+    Some(format!("{head}{session_json}{middle}{names_json}{tail}"))
+}
+
+/// 先頭（空白と `//`・`/* */` コメントを除く）が `"use strict"` 指示か。
+fn starts_with_use_strict(script: &str) -> bool {
+    let mut rest = script.trim_start_matches('\u{feff}');
+    loop {
+        rest = rest.trim_start();
+        if let Some(line) = rest.strip_prefix("//") {
+            rest = line.split_once('\n').map_or("", |(_, next)| next);
+        } else if let Some(block) = rest.strip_prefix("/*") {
+            match block.split_once("*/") {
+                Some((_, next)) => rest = next,
+                None => return false,
+            }
+        } else {
+            break;
+        }
+    }
+    rest.starts_with("\"use strict\"") || rest.starts_with("'use strict'")
+}
+
+/// `toolport_run_script` 経由の呼び出し。スクリプトが読み取り専用だけを呼ぶとは証明できないため、
+/// 許可は出さず（`permissionDecision` なし）、`script` の先頭へ前置きを足した `updatedInput` だけを返す。
+/// 前置きは行番号を変えないよう、元の先頭行へ改行なしで連結する。
+fn toolport_script_pretool(
+    event: &str,
+    payload: &Value,
+    server_ids: impl FnOnce() -> Vec<String>,
+) -> Value {
+    let Some(input) = payload["tool_input"].as_object() else {
+        return json!({});
+    };
+    let Some(script) = input.get("script").and_then(Value::as_str) else {
+        return json!({});
+    };
+    // auto モードでは、判定なしの updatedInput は呼び出しを拒否させる。strict 指示は前置きで外れる。
+    if payload["permission_mode"] == "auto" || starts_with_use_strict(script) {
+        return json!({});
+    }
+    let session = text(&payload["session_id"]).trim();
+    let raw = payload["tool_input"].to_string();
+    if session.is_empty()
+        || !raw.contains("current")
+        || !(raw.contains("search_memory") || raw.contains("searchMemory"))
+    {
+        return json!({});
+    }
+    let names: Vec<String> = server_ids()
+        .iter()
+        .flat_map(|id| {
+            [
+                format!("{id}__search_memory"),
+                format!("{id}__searchMemory"),
+            ]
+        })
+        .collect();
+    if names.is_empty() {
+        return json!({});
+    }
+    let Some(prelude) = build_prelude(&json!(session).to_string(), &json!(names).to_string())
+    else {
+        return json!({});
+    };
+    let combined = format!("{prelude}{script}");
+    if combined.len() > MAX_SCRIPT_BYTES {
+        return json!({});
+    }
+    let mut updated = payload["tool_input"].clone();
+    updated["script"] = json!(combined);
+    json!({"hookSpecificOutput":{"hookEventName":event,"updatedInput":updated}})
+}
+
 pub fn run_hook(event: &str, payload: &Value, config: Option<&Config>) -> Result<Value> {
     if event == "PreToolUse" {
+        if text(&payload["tool_name"]) == TOOLPORT_RUN_SCRIPT {
+            return Ok(toolport_script_pretool(event, payload, || {
+                crate::toolport::product_server_ids(
+                    &crate::connect::TOOLPORT_PRODUCT,
+                    &crate::toolport::Env::process(),
+                )
+            }));
+        }
         if text(&payload["tool_name"]) == TOOLPORT_CALL_TOOL {
             return Ok(toolport_pretool(event, payload, || {
                 crate::toolport::product_server_ids(
@@ -1020,6 +1113,67 @@ mod tests {
             json!({"tool_name":TOOLPORT_CALL_TOOL,"tool_input":{"name":"remnifold__save_memory"}});
         let out = toolport_pretool("PreToolUse", &payload, || panic!("registry read"));
         assert_eq!(out, json!({}));
+    }
+
+    fn through_script(payload_extra: Value, script: &str, ids: &[&str]) -> Value {
+        let ids: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+        let mut payload = json!({"tool_name":TOOLPORT_RUN_SCRIPT,"session_id":" a\"b\\c ","tool_input":{"script":script,"data":{"w":"save_memory"},"input":{"k":1}}});
+        for (key, value) in payload_extra.as_object().into_iter().flatten() {
+            payload[key] = value.clone();
+        }
+        toolport_script_pretool("PreToolUse", &payload, || ids)
+    }
+
+    const SEARCH_SCRIPT: &str =
+        "return toolport.call('remnifold__search_memory',{sessionId:'current'});";
+
+    #[test]
+    fn toolport_scripts_get_a_prelude_without_a_permission_decision() {
+        let out = through_script(json!({}), SEARCH_SCRIPT, &["remnifold", "a-b"]);
+        assert!(out["hookSpecificOutput"]["permissionDecision"].is_null());
+        let updated = &out["hookSpecificOutput"]["updatedInput"];
+        // script だけが置き換わり、data・input は保たれる。
+        assert_eq!(updated["data"], json!({"w":"save_memory"}));
+        assert_eq!(updated["input"], json!({"k":1}));
+        let script = updated["script"].as_str().unwrap();
+        assert!(script.ends_with(SEARCH_SCRIPT));
+        assert!(!script.contains('\n'));
+        // セッション ID と名前は JSON としてエスケープされる。
+        assert!(script.contains(r#"s="a\"b\\c","#));
+        assert!(script.contains(r#"n=["remnifold__search_memory","remnifold__searchMemory","a-b__search_memory","a-b__searchMemory"]"#));
+        assert!(!script.contains("<SID_JSON>") && !script.contains("<NAMES_JSON>"));
+    }
+
+    #[test]
+    fn toolport_scripts_are_left_alone_when_they_cannot_be_resolved_safely() {
+        let none = json!({});
+        let big = format!("{SEARCH_SCRIPT}//{}", "x".repeat(MAX_SCRIPT_BYTES));
+        for (extra, script, ids) in [
+            (json!({"permission_mode":"auto"}), SEARCH_SCRIPT, vec!["remnifold"]),
+            (json!({}), "\"use strict\";current search_memory", vec!["remnifold"]),
+            (json!({}), "  // c\n/* d */\n'use strict';current search_memory", vec!["remnifold"]),
+            (json!({}), "return 1; // search_memory", vec!["remnifold"]),
+            (json!({}), "return 'current'", vec!["remnifold"]),
+            (json!({}), SEARCH_SCRIPT, vec![]),
+            (json!({"session_id":" "}), SEARCH_SCRIPT, vec!["remnifold"]),
+            (json!({}), big.as_str(), vec!["remnifold"]),
+        ] {
+            assert_eq!(through_script(extra.clone(), script, &ids), none, "{extra} {script}");
+        }
+        // auto 以外のモードと、strict でない先頭コメントは前置きを付ける。
+        for (extra, script) in [
+            (json!({"permission_mode":"default"}), SEARCH_SCRIPT.to_owned()),
+            (json!({}), format!("// 'use strict'\n/* x */ {SEARCH_SCRIPT}")),
+            (json!({}), format!("/* open {SEARCH_SCRIPT}")),
+        ] {
+            let out = through_script(extra, &script, &["remnifold"]);
+            assert!(out["hookSpecificOutput"]["updatedInput"]["script"].is_string(), "{script}");
+        }
+        let payload = json!({"tool_name":TOOLPORT_RUN_SCRIPT,"tool_input":{"script":"x"}});
+        assert_eq!(
+            toolport_script_pretool("PreToolUse", &payload, || panic!("registry read")),
+            none
+        );
     }
 
     #[test]

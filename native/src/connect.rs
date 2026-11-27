@@ -109,7 +109,7 @@ type HookDef = (
 const HOOKS: [HookDef; 4] = [
     (
         "PreToolUse",
-        Some("^mcp__remnifold__|^mcp__toolport__toolport_call_tool$"),
+        Some("^mcp__remnifold__|^mcp__toolport__toolport_(call_tool|run_script)$"),
         5,
         false,
         "Checking tool access...",
@@ -1004,7 +1004,7 @@ mod tests {
         assert_eq!(start[1]["hooks"][0]["command"], expected);
         assert_eq!(
             settings["hooks"]["PreToolUse"][0]["matcher"],
-            "^mcp__remnifold__|^mcp__toolport__toolport_call_tool$"
+            "^mcp__remnifold__|^mcp__toolport__toolport_(call_tool|run_script)$"
         );
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["async"], true);
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["timeout"], 120);

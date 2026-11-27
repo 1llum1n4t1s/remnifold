@@ -8,7 +8,7 @@
 
 Codex は現在の ID だけを使う。Claude Code は再開に備えてトランスクリプト先頭（4 MiB、20000 行、1 行 256 KiB まで）の user/assistant 行から最大 8 個の ID を集め、サイドチェーンとメタ行を除く。コピー元の ID ごとに最後の行の時刻を `sessionUntil` とし、元ターンの時刻がその後か不明の記録を拒む。フォーク後の親の作業を混ぜないためで、余裕は設けない。現在の ID には上限がない。
 
-手動 `search_memory` の `sessionId` は検索本文とクライアントの両方で確かめる。`"current"` は Claude Code の `PreToolUse` だけが解決する（直接登録した `mcp__remnifold__search_memory` と、Toolport の `toolport_call_tool` 経由の呼び出し。[local-app-integration](local-app-integration.md)）。未解決なら固定エラーになる。
+手動 `search_memory` の `sessionId` は検索本文とクライアントの両方で確かめる。`"current"` は Claude Code の `PreToolUse` だけが解決する（直接登録した `mcp__remnifold__search_memory` と、Toolport の `toolport_call_tool` / `toolport_run_script` 経由の呼び出し。[local-app-integration](local-app-integration.md)）。未解決なら固定エラーになる。
 
 `all` は他セッションの最近のタスクを最大 2 件（`maxRecentTasks` は 0〜3）加える。話題一致ではないと明示し、1,000 UTF-16 単位を確保する。話題検索とは並行し、片方の失敗でもう片方を捨てず、重複抑制のハッシュも分ける。同じ応答の話題索引は繰り返さない。
 

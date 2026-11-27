@@ -13,7 +13,7 @@
 
 ## Toolport 判定と `mcpRegistration`
 
-判定は `native/src/toolport.rs`。Edictora の `crates/edictora/src/install/toolport.rs` を正本とするバイト同一の複製で、ここでは編集しない。クライアント設定（Claude Code の `.claude.json` の `mcpServers`、Codex の `config.toml` の `[mcp_servers.*]`）に実在する stdio の Toolport ゲートウェイがあり、registry（ゲートウェイの env、`TOOLPORT_REGISTRY` / `TOOLPORT_DATA_DIR`、`%APPDATA%\Toolport\registry.json` の順、`version` 3）で `remnifold mcp` を起動する有効なサーバーが使用中の全プロファイルの `enabledServerIds` にあれば `Served`。`command` が実在する絶対パスでなければ `NotConnected`、Toolport 側の無効化・削除は `NotServed`、Windows 以外や registry を読めないときは `Unknown`（直接登録）。サーバーの `env` と `quarantine.json` は見ない。
+判定は `native/src/toolport.rs`。Edictora の `crates/edictora/src/install/toolport.rs` を正本とするバイト同一の複製で、ここでは編集しない。クライアント設定（Claude Code の `.claude.json` の `mcpServers`、Codex の `config.toml` の `[mcp_servers.*]`）に実在する stdio の Toolport ゲートウェイがあり、registry（ゲートウェイの env、`TOOLPORT_REGISTRY` / `TOOLPORT_DATA_DIR`、既定の場所の順。既定は Windows が `%APPDATA%\Toolport\registry.json`、macOS が `~/Library/Application Support/Toolport/registry.json`、Linux が `$XDG_CONFIG_HOME/Toolport/registry.json`（絶対パスのとき。無ければ `~/.config/Toolport/registry.json`）、`version` 3）で `remnifold mcp` を起動する有効なサーバーが使用中の全プロファイルの `enabledServerIds` にあれば `Served`。`command` が実在する絶対パスでなければ `NotConnected`、Toolport 側の無効化・削除は `NotServed`、Windows・macOS・Linux 以外の OS や registry を読めないときは `Unknown`（直接登録）。サーバーの `env` と `quarantine.json` は見ない。
 
 `mcpRegistration`（`auto` 既定 / `direct` / `off`、小文字の完全一致。不正値はログを残して auto、null・未設定は auto）。状態ファイルの `skipped` はクライアントごとに `toolport` か `off` を持ち、`done` の意味は変えない。
 

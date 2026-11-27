@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 変更
+
+- `PreToolUse` フックのマッチャーを `^mcp__remnifold__|^mcp__toolport__toolport_(call_tool|run_script)$` に広げ、Toolport ゲートウェイの `toolport_run_script` 経由でも `search_memory` の `sessionId: "current"` を解決するようにしました。Remnifold の `search_memory` を `sessionId: "current"` で呼ぶスクリプトには、フックがスクリプトの先頭へ1行の JavaScript を足し、実行時に `toolport.call` / `callAsync`（`servers.<id>.*` のスタブと `callAll` もこれを経由）へ渡る `<前置き>__search_memory` / `searchMemory` の `sessionId: "current"` を実際のセッション ID に置き換えます。`updatedInput` で `script` だけを差し替え、`data`・`input` などは保ちます。`toolport_run_script` は読み取り専用のツールだけを呼ぶと証明できないため、自動では許可しません（`toolport_call_tool` 経由は従来どおり読み取り専用の7ツールだけ自動で許可）。auto モード（判定なしの `updatedInput` は拒否されるため）と、先頭が `"use strict"` のスクリプト（前置きで strict が外れるため）では、`run_script` 内の `"current"` を解決しません（従来の固定エラー）。ゲートウェイの Claude Code 登録名が `toolport` でない場合と `toolport_fetch_result` は対象外のままで、前置きが効かないときは `"current"` のまま届いて従来の固定エラーになります。マッチャーの更新は、Setup の版更新でのフックの張り直し、または現在の版での `connect claude-code --apply` で反映されます。Codex は変わりません。
+- Toolport の判定を Windows だけでなく macOS と Linux でも行うようにしました。registry の既定の場所は、Windows が `%APPDATA%\Toolport\registry.json`、macOS が `~/Library/Application Support/Toolport/registry.json`、Linux が `$XDG_CONFIG_HOME/Toolport/registry.json`（絶対パスのとき。無ければ `~/.config/Toolport/registry.json`）です。`TOOLPORT_REGISTRY` / `TOOLPORT_DATA_DIR` の優先は従来どおりで、クライアント設定は全 OS で `~/.claude.json`（`CLAUDE_CONFIG_DIR` 優先）と `~/.codex/config.toml`（`CODEX_HOME` 優先）を見ます。それ以外の OS は判定せず直接登録します。これに伴い、`toolport_call_tool` / `toolport_run_script` 経由のフックも macOS と Linux で効きます。
+
 ## 1.0.41 - 2026-11-27
 
 ### 変更

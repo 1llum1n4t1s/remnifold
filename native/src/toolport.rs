@@ -6,8 +6,10 @@
 //! - `D:\Dev\Plumivox\src\toolport.rs`
 //!
 //! 製品の差は、呼び出し側が渡す [`Product`] だけ。依存は `std`・`serde_json`・`regex` だけで、`crate::` の
-//! import も製品固有の補助関数も持たない。環境（ホーム・`%APPDATA%`・環境変数・ファイルの存在確認と読み取り）は
+//! import も製品固有の補助関数も持たない。環境（OS・ホーム・`%APPDATA%`・環境変数・ファイルの存在確認と読み取り）は
 //! [`Env`] で注入するので、テストはバイト列とパスだけで完結する（一時フォルダーを作らない）。
+//! 判定は Windows・macOS・Linux で行う。パスは [`Env::os`] に従って Windows 形式（`\`・ドライブ・大文字小文字を
+//! 区別しない）か Unix 形式（`/`・区別する）で扱い、実行する OS には依存しない。
 //!
 //! 判定の結果（[`Detection`]）:
 //! - `Served` — クライアントが Toolport ゲートウェイにつながっていて、Toolport がこの製品のサーバーを有効にして提供している。
@@ -16,16 +18,19 @@
 //! - `Unknown(理由)` — 読めない・形が想定外・registry が見つからないなど、確かめられない。
 //!
 //! 判定ルール（番号はテストの名前の接頭辞 `r1_`〜`r12_` と対応する）:
-//! - R1 Windows 以外は何も読まず `Unknown("non-windows")`。R2 ホームを決められなければ `Unknown`。
+//! - R1 対応外の OS（[`Os::Other`]）は何も読まず `Unknown("unsupported-os")`。R2 ホームを決められなければ `Unknown`
+//!   （Windows は `USERPROFILE`、無ければ `HOME`。macOS・Linux は `HOME`。絶対パスだけ）。
 //! - R3 ファイルは `fs::read` 相当（サイズ上限なし・リンクをたどる）。読めなければ `Unknown`、無ければ各段の「無い」扱い。
-//! - R4 Claude Code は `<CLAUDE_CONFIG_DIR>\.claude.json`（絶対パスのときだけ。無ければ `<ホーム>\.claude.json`）の最上位
+//! - R4 Claude Code は `<CLAUDE_CONFIG_DIR>/.claude.json`（絶対パスのときだけ。無ければ `<ホーム>/.claude.json`）の最上位
 //!   `mcpServers`。ゲートウェイ候補でない項目は形を問わず無視する。
-//! - R5 Codex は `<CODEX_HOME>\config.toml`（無ければ `<ホーム>\.codex\config.toml`）の `[mcp_servers.<名前>]` と
+//! - R5 Codex は `<CODEX_HOME>/config.toml`（無ければ `<ホーム>/.codex/config.toml`）の `[mcp_servers.<名前>]` と
 //!   `[mcp_servers.<名前>.env]` だけを読む。それ以外の `mcp_servers` 系、これらの節の中のドット付きキー・
 //!   インラインテーブル・複数行の文字列/配列は `Unknown`。節の外の複数行文字列は正しく読み飛ばす。
 //! - R6 ゲートウェイ候補は `command` のファイル名が `toolport-gateway[-…][.exe]`、または registry の
 //!   `clientManagedEntries[<ID>].command` と正規化一致する項目。実在する絶対パスのものだけが有効。
-//! - R7 registry の場所（ゲートウェイ env → プロセス env → `%APPDATA%\Toolport`）。`CONDUIT_*` があれば `Unknown`。
+//! - R7 registry の場所（ゲートウェイ env → プロセス env → OS ごとの設定フォルダーの `Toolport`。Windows は
+//!   `%APPDATA%`、macOS は `<ホーム>/Library/Application Support`、Linux は絶対パスの `XDG_CONFIG_HOME`、無ければ
+//!   `<ホーム>/.config`）。`CONDUIT_*` があれば `Unknown`。
 //! - R8 registry は `version` が整数 3 で、`servers`・`profiles` が配列。R9 `clientScopes` は先に確かめる。
 //! - R10 使われるプロファイルの集合。R11 サーバーの一致（stdio・`command` のファイル名・`args`・`enabled`・
 //!   プロファイル）。R12 サーバーの `env` は読まず、結果にも含めない。
@@ -96,7 +101,7 @@ impl Detection {
     }
 }
 
-/// ファイルの存在確認と読み取り（パスは Windows 形式の文字列）。テストは注入した内容を返す
+/// ファイルの存在確認と読み取り（パスは [`Env::os`] の形式の文字列）。テストは注入した内容を返す
 pub trait Files {
     /// ファイルとして存在するか
     fn exists(&self, path: &str) -> bool;
@@ -118,25 +123,51 @@ impl Files for RealFiles {
     }
 }
 
+/// 判定する OS（パスの形式と既定の場所を決める）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Windows,
+    MacOs,
+    Linux,
+    /// 対応外（何も読まず `Unknown("unsupported-os")`）
+    Other,
+}
+
+impl Os {
+    /// このプログラムを実行している OS
+    pub fn current() -> Os {
+        if cfg!(windows) {
+            Os::Windows
+        } else if cfg!(target_os = "macos") {
+            Os::MacOs
+        } else if cfg!(target_os = "linux") {
+            Os::Linux
+        } else {
+            Os::Other
+        }
+    }
+}
+
 /// 判定に使う環境。テストは任意の値を渡す
 pub struct Env {
-    /// Windows か（偽なら何も読まず `Unknown("non-windows")`）
-    pub windows: bool,
-    /// ホームフォルダー（`USERPROFILE`、無ければ `HOME`）
+    /// OS（[`Os::Other`] なら何も読まず `Unknown("unsupported-os")`）
+    pub os: Os,
+    /// ホームフォルダー（Windows は `USERPROFILE`、無ければ `HOME`。macOS・Linux は `HOME`）
     pub home: Option<String>,
-    /// `%APPDATA%`
+    /// `%APPDATA%`（Windows だけが使う）
     pub appdata: Option<String>,
-    /// 判定に関わるプロセスの環境変数（`CLAUDE_CONFIG_DIR`・`CODEX_HOME`・`TOOLPORT_*`・`CONDUIT_*`。
-    /// 設定されているものだけ。空文字も含む）
+    /// 判定に関わるプロセスの環境変数（`CLAUDE_CONFIG_DIR`・`CODEX_HOME`・`XDG_CONFIG_HOME`・`TOOLPORT_*`・
+    /// `CONDUIT_*`。設定されているものだけ。空文字も含む）
     pub vars: BTreeMap<String, String>,
     /// ファイルの存在確認と読み取り
     pub files: Box<dyn Files>,
 }
 
 /// [`Env::vars`] に取り込むプロセスの環境変数
-const PROCESS_VARS: [&str; 8] = [
+const PROCESS_VARS: [&str; 9] = [
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
+    "XDG_CONFIG_HOME",
     "TOOLPORT_REGISTRY",
     "TOOLPORT_DATA_DIR",
     "TOOLPORT_PROFILE",
@@ -152,9 +183,14 @@ impl Env {
     /// 実際のプロセスの環境から作る（本番の呼び出し側だけが使う）
     pub fn process() -> Env {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let os = Os::current();
         Env {
-            windows: cfg!(windows),
-            home: var("USERPROFILE").or_else(|| var("HOME")),
+            os,
+            home: if os == Os::Windows {
+                var("USERPROFILE").or_else(|| var("HOME"))
+            } else {
+                var("HOME")
+            },
             appdata: var("APPDATA"),
             vars: PROCESS_VARS
                 .iter()
@@ -166,10 +202,13 @@ impl Env {
 }
 
 // ---------------------------------------------------------------------------
-// パス（Windows の形式の文字列として扱う。実行する OS に依存しない）
+// パス（`Env::os` の形式の文字列として扱う。実行する OS に依存しない）
 // ---------------------------------------------------------------------------
 
-fn is_absolute(path: &str) -> bool {
+fn is_absolute(os: Os, path: &str) -> bool {
+    if os != Os::Windows {
+        return path.starts_with('/');
+    }
     let bytes = path.as_bytes();
     let drive = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -178,7 +217,10 @@ fn is_absolute(path: &str) -> bool {
     drive || path.starts_with("\\\\")
 }
 
-fn join(dir: &str, name: &str) -> String {
+fn join(os: Os, dir: &str, name: &str) -> String {
+    if os != Os::Windows {
+        return format!("{}/{name}", dir.trim_end_matches('/'));
+    }
     format!("{}\\{name}", dir.trim_end_matches(['\\', '/']))
 }
 
@@ -194,16 +236,17 @@ fn gateway_name_regex() -> &'static Regex {
     })
 }
 
-/// 比較用（前後の空白と `"` を除き、`/` を `\` に、小文字にする）
-fn normalize_command(command: &str) -> String {
-    command
-        .trim_matches(|c: char| c.is_whitespace() || c == '"')
-        .replace('/', "\\")
-        .to_lowercase()
+/// 比較用（前後の空白と `"` を除く。Windows はさらに `/` を `\` に、小文字にする。Unix は大小を区別する）
+fn normalize_command(os: Os, command: &str) -> String {
+    let trimmed = command.trim_matches(|c: char| c.is_whitespace() || c == '"');
+    if os != Os::Windows {
+        return trimmed.to_owned();
+    }
+    trimmed.replace('/', "\\").to_lowercase()
 }
 
 fn existing_absolute_file(env: &Env, command: &str) -> bool {
-    is_absolute(command) && env.files.exists(command)
+    is_absolute(env.os, command) && env.files.exists(command)
 }
 
 /// 空文字は「無い」扱い
@@ -229,7 +272,7 @@ pub fn detect(product: &Product, client: ClientId, env: &Env) -> Detection {
 /// `_` にしたもの）。判定は名前（`command` のファイル名）と `args` だけ。`enabled`・プロファイル・
 /// 実行ファイルの実在は見ない。registry はプロセスの環境と既定の場所だけで解決し、読めなければ空
 pub fn product_server_ids(product: &Product, env: &Env) -> Vec<String> {
-    if !env.windows {
+    if env.os == Os::Other {
         return Vec::new();
     }
     let Ok(path) = resolve_registry_path(&BTreeMap::new(), env) else {
@@ -260,13 +303,13 @@ fn tool_prefix(id: &str) -> String {
 }
 
 fn detect_inner(product: &Product, client: ClientId, env: &Env) -> Result<Detection, String> {
-    if !env.windows {
-        return Err("non-windows".to_string());
+    if env.os == Os::Other {
+        return Err("unsupported-os".to_string());
     }
     let home = env
         .home
         .as_deref()
-        .filter(|home| is_absolute(home))
+        .filter(|home| is_absolute(env.os, home))
         .ok_or_else(|| "ホームフォルダーを決められません".to_string())?;
     let path = client_config_path(client, home, env);
     let bytes = match env.files.read(&path) {
@@ -280,7 +323,7 @@ fn detect_inner(product: &Product, client: ClientId, env: &Env) -> Result<Detect
             || managed
                 .get_or_init(|| managed_command(client, env))
                 .as_deref()
-                .is_some_and(|managed| normalize_command(command) == managed)
+                .is_some_and(|managed| normalize_command(env.os, command) == managed)
     };
     let candidates = match client {
         ClientId::ClaudeCode => claude_candidates(&bytes, &is_candidate)?,
@@ -299,17 +342,19 @@ fn detect_inner(product: &Product, client: ClientId, env: &Env) -> Result<Detect
 }
 
 fn client_config_path(client: ClientId, home: &str, env: &Env) -> String {
-    let absolute_var = |name: &str| non_empty(&env.vars, name).filter(|v| is_absolute(v));
+    let os = env.os;
+    let absolute_var = |name: &str| non_empty(&env.vars, name).filter(|v| is_absolute(os, v));
     match client {
         ClientId::ClaudeCode => join(
+            os,
             absolute_var("CLAUDE_CONFIG_DIR").unwrap_or(home),
             ".claude.json",
         ),
         ClientId::Codex => {
             let dir = absolute_var("CODEX_HOME")
                 .map(str::to_owned)
-                .unwrap_or_else(|| join(home, ".codex"));
-            join(&dir, "config.toml")
+                .unwrap_or_else(|| join(os, home, ".codex"));
+            join(os, &dir, "config.toml")
         }
     }
 }
@@ -323,7 +368,7 @@ fn managed_command(client: ClientId, env: &Env) -> Option<String> {
         .get(client.as_str())?
         .get("command")?
         .as_str()?;
-    Some(normalize_command(command))
+    Some(normalize_command(env.os, command))
 }
 
 /// クライアント設定のゲートウェイ候補（env は呼び出し側が読む registry の場所の解決にだけ使う）
@@ -876,7 +921,32 @@ fn apply_assignment(
 // registry
 // ---------------------------------------------------------------------------
 
-/// registry.json の場所を決める（ゲートウェイ項目の env → プロセスの環境変数 → Windows 既定）。R7
+/// OS ごとの設定フォルダー（Toolport の `dirs::config_dir()` 相当）。決められなければ None。
+/// Windows は `%APPDATA%`、macOS は `<ホーム>/Library/Application Support`、Linux は絶対パスの
+/// `XDG_CONFIG_HOME`（無ければ `<ホーム>/.config`）
+fn config_base(env: &Env) -> Option<String> {
+    let os = env.os;
+    let home = || env.home.as_deref().filter(|home| is_absolute(os, home));
+    match os {
+        Os::Windows => env
+            .appdata
+            .as_deref()
+            .filter(|appdata| is_absolute(os, appdata))
+            .map(str::to_owned),
+        Os::MacOs => Some(join(
+            os,
+            &join(os, home()?, "Library"),
+            "Application Support",
+        )),
+        Os::Linux => match non_empty(&env.vars, "XDG_CONFIG_HOME").filter(|v| is_absolute(os, v)) {
+            Some(xdg) => Some(xdg.to_owned()),
+            None => Some(join(os, home()?, ".config")),
+        },
+        Os::Other => None,
+    }
+}
+
+/// registry.json の場所を決める（ゲートウェイ項目の env → プロセスの環境変数 → OS ごとの既定）。R7
 fn resolve_registry_path(
     gateway_env: &BTreeMap<String, String>,
     env: &Env,
@@ -886,9 +956,10 @@ fn resolve_registry_path(
     if has_conduit(gateway_env) || has_conduit(&env.vars) {
         return Err("Toolport ではなく Conduit の環境変数があります".to_string());
     }
+    let os = env.os;
     let located = |value: &str, is_dir: bool| {
         if is_dir {
-            join(value, "registry.json")
+            join(os, value, "registry.json")
         } else {
             value.to_owned()
         }
@@ -896,7 +967,7 @@ fn resolve_registry_path(
     let candidates = [("TOOLPORT_REGISTRY", false), ("TOOLPORT_DATA_DIR", true)];
     for (key, is_dir) in candidates {
         if let Some(value) = non_empty(gateway_env, key) {
-            return if is_absolute(value) {
+            return if is_absolute(os, value) {
                 Ok(located(value, is_dir))
             } else {
                 Err("ゲートウェイの env の Toolport の場所が相対パスです".to_string())
@@ -904,21 +975,18 @@ fn resolve_registry_path(
         }
     }
     for (key, is_dir) in candidates {
-        if let Some(value) = non_empty(&env.vars, key).filter(|v| is_absolute(v)) {
+        if let Some(value) = non_empty(&env.vars, key).filter(|v| is_absolute(os, v)) {
             return Ok(located(value, is_dir));
         }
     }
-    let appdata = env
-        .appdata
-        .as_deref()
-        .filter(|appdata| is_absolute(appdata))
+    let base = config_base(env)
         .ok_or_else(|| "Toolport の registry の既定の場所を決められません".to_string())?;
-    let default = join(&join(appdata, "Toolport"), "registry.json");
+    let default = join(os, &join(os, &base, "Toolport"), "registry.json");
     if env.files.exists(&default) {
         Ok(default)
     } else if env
         .files
-        .exists(&join(&join(appdata, "Conduit"), "registry.json"))
+        .exists(&join(os, &join(os, &base, "Conduit"), "registry.json"))
     {
         Err("Toolport の registry が無く、Conduit の registry だけがあります".to_string())
     } else {
@@ -1096,6 +1164,14 @@ mod tests {
     const REGISTRY: &str = r"C:\data\registry.json";
     const DEFAULT_REGISTRY: &str = r"C:\Users\u\AppData\Roaming\Toolport\registry.json";
     const PRODUCT_EXE: &str = r"C:\app\current\edictora.exe";
+    const LINUX_HOME: &str = "/home/u";
+    const MAC_HOME: &str = "/Users/u";
+    const UNIX_GATEWAY: &str = "/opt/tp/toolport-gateway";
+    const UNIX_PRODUCT_EXE: &str = "/opt/app/edictora";
+    const UNIX_REGISTRY: &str = "/data/registry.json";
+    const MAC_DEFAULT_REGISTRY: &str =
+        "/Users/u/Library/Application Support/Toolport/registry.json";
+    const LINUX_DEFAULT_REGISTRY: &str = "/home/u/.config/Toolport/registry.json";
     const PRODUCT: Product = Product {
         binary_stem: "edictora",
         mode_arg: "mcp",
@@ -1105,18 +1181,28 @@ mod tests {
         path.replace('/', "\\").to_lowercase()
     }
 
+    /// OS ごとの照合用の鍵（Windows は大小を区別せず `/` を `\` に、Unix はそのまま）
+    fn os_key(os: Os, path: &str) -> String {
+        if os == Os::Windows {
+            key(path)
+        } else {
+            path.to_string()
+        }
+    }
+
     struct FakeFiles {
+        os: Os,
         files: BTreeMap<String, Vec<u8>>,
         unreadable: BTreeSet<String>,
     }
 
     impl Files for FakeFiles {
         fn exists(&self, path: &str) -> bool {
-            self.files.contains_key(&key(path))
+            self.files.contains_key(&os_key(self.os, path))
         }
 
         fn read(&self, path: &str) -> io::Result<Vec<u8>> {
-            let k = key(path);
+            let k = os_key(self.os, path);
             if self.unreadable.contains(&k) {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
             }
@@ -1163,7 +1249,7 @@ mod tests {
         unreadable: BTreeSet<String>,
         vars: BTreeMap<String, String>,
         home: Option<String>,
-        windows: bool,
+        os: Os,
     }
 
     impl World {
@@ -1174,7 +1260,7 @@ mod tests {
                 unreadable: BTreeSet::new(),
                 vars: BTreeMap::new(),
                 home: Some(HOME.to_string()),
-                windows: true,
+                os: Os::Windows,
             };
             world.put(GATEWAY, "");
             world.put(PRODUCT_EXE, "");
@@ -1186,8 +1272,72 @@ mod tests {
             world
         }
 
+        /// macOS・Linux の標準の状態（Claude Code がゲートウェイにつながり、registry が製品を提供している）。
+        /// ゲートウェイの env が registry を指すので、既定の場所には何も置かない
+        fn unix(os: Os) -> World {
+            let home = if os == Os::MacOs {
+                MAC_HOME
+            } else {
+                LINUX_HOME
+            };
+            let mut world = World {
+                files: BTreeMap::new(),
+                unreadable: BTreeSet::new(),
+                vars: BTreeMap::new(),
+                home: Some(home.to_string()),
+                os,
+            };
+            world.put(UNIX_GATEWAY, "");
+            world.put(UNIX_PRODUCT_EXE, "");
+            world.put_json(
+                &format!("{home}/.claude.json"),
+                &json!({"mcpServers": {"toolport": {
+                    "type": "stdio", "command": UNIX_GATEWAY, "args": [],
+                    "env": {"TOOLPORT_REGISTRY": UNIX_REGISTRY}
+                }}}),
+            );
+            let mut value = registry();
+            value["servers"][0]["command"] = json!(UNIX_PRODUCT_EXE);
+            world.put_json(UNIX_REGISTRY, &value);
+            world
+        }
+
+        /// Unix の registry を書き換えて置く
+        fn registry_unix(&mut self, edit: impl FnOnce(&mut Value)) {
+            let mut value = registry();
+            value["servers"][0]["command"] = json!(UNIX_PRODUCT_EXE);
+            edit(&mut value);
+            self.put_json(UNIX_REGISTRY, &value);
+        }
+
+        /// Unix の Claude Code の設定のゲートウェイ項目を `command` だけ差し替えて置く
+        fn gateway_unix(&mut self, command: &str) {
+            let home = self.home.clone().expect("home");
+            self.put_json(
+                &format!("{home}/.claude.json"),
+                &json!({"mcpServers": {"toolport": {
+                    "type": "stdio", "command": command, "args": [],
+                    "env": {"TOOLPORT_REGISTRY": UNIX_REGISTRY}
+                }}}),
+            );
+        }
+
+        /// ゲートウェイの env を空にし、registry を既定の場所だけに置く
+        fn unix_default_registry(&mut self, default_path: &str) {
+            let home = self.home.clone().expect("home");
+            self.put_json(
+                &format!("{home}/.claude.json"),
+                &json!({"mcpServers": {"toolport": {"command": UNIX_GATEWAY, "env": {}}}}),
+            );
+            self.remove(UNIX_REGISTRY);
+            let mut value = registry();
+            value["servers"][0]["command"] = json!(UNIX_PRODUCT_EXE);
+            self.put_json(default_path, &value);
+        }
+
         fn put(&mut self, path: &str, text: &str) {
-            self.files.insert(key(path), text.as_bytes().to_vec());
+            self.files
+                .insert(os_key(self.os, path), text.as_bytes().to_vec());
         }
 
         fn put_json(&mut self, path: &str, value: &Value) {
@@ -1199,16 +1349,17 @@ mod tests {
         }
 
         fn remove(&mut self, path: &str) {
-            self.files.remove(&key(path));
+            self.files.remove(&os_key(self.os, path));
         }
 
         fn env(&self) -> Env {
             Env {
-                windows: self.windows,
+                os: self.os,
                 home: self.home.clone(),
-                appdata: Some(APPDATA.to_string()),
+                appdata: (self.os == Os::Windows).then(|| APPDATA.to_string()),
                 vars: self.vars.clone(),
                 files: Box::new(FakeFiles {
+                    os: self.os,
                     files: self.files.clone(),
                     unreadable: self.unreadable.clone(),
                 }),
@@ -1249,6 +1400,13 @@ mod tests {
         }
     }
 
+    fn unix_served() -> Detection {
+        Detection::Served {
+            server_id: "s1".to_string(),
+            command: UNIX_PRODUCT_EXE.to_string(),
+        }
+    }
+
     fn is_unknown(detection: &Detection) -> bool {
         matches!(detection, Detection::Unknown(_))
     }
@@ -1259,19 +1417,201 @@ mod tests {
     }
 
     #[test]
-    fn r1_windows以外は何も読まずunknown() {
+    fn r1_対応外のosは何も読まずunknown() {
         let env = Env {
-            windows: false,
+            os: Os::Other,
             home: Some(HOME.to_string()),
             appdata: None,
             vars: BTreeMap::new(),
             files: Box::new(PanicFiles),
         };
-        assert_eq!(
-            detect(&PRODUCT, ClientId::ClaudeCode, &env),
-            Detection::Unknown("non-windows".to_string())
-        );
+        for client in [ClientId::ClaudeCode, ClientId::Codex] {
+            assert_eq!(
+                detect(&PRODUCT, client, &env),
+                Detection::Unknown("unsupported-os".to_string())
+            );
+        }
         assert_eq!(product_server_ids(&PRODUCT, &env), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r1_macosとlinuxでも判定する() {
+        for os in [Os::MacOs, Os::Linux] {
+            assert_eq!(World::unix(os).detect(), unix_served(), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn r2_unixのホームはhomeの絶対パスだけ() {
+        for os in [Os::MacOs, Os::Linux] {
+            let mut w = World::unix(os);
+            w.home = None;
+            assert!(is_unknown(&w.detect()), "{os:?} none");
+            w.home = Some("relative".to_string());
+            assert!(is_unknown(&w.detect()), "{os:?} relative");
+            // Windows 形式のパスは Unix では絶対パスではない
+            w.home = Some(HOME.to_string());
+            assert!(is_unknown(&w.detect()), "{os:?} windows path");
+        }
+    }
+
+    #[test]
+    fn r4_unixのclaude_jsonの場所() {
+        for os in [Os::MacOs, Os::Linux] {
+            let mut w = World::unix(os);
+            let home = w.home.clone().expect("home");
+            let entry = json!({"mcpServers": {"toolport": {
+                "command": UNIX_GATEWAY, "env": {"TOOLPORT_REGISTRY": UNIX_REGISTRY}
+            }}});
+            w.remove(&format!("{home}/.claude.json"));
+            assert_eq!(w.detect(), Detection::NotConnected, "{os:?} 無い");
+            w.put_json("/cfg/.claude.json", &entry);
+            w.var("CLAUDE_CONFIG_DIR", "/cfg/");
+            assert_eq!(w.detect(), unix_served(), "{os:?} CLAUDE_CONFIG_DIR");
+            w.var("CLAUDE_CONFIG_DIR", "cfg");
+            assert_eq!(w.detect(), Detection::NotConnected, "{os:?} 相対");
+            // 大文字小文字は区別する
+            w.var("CLAUDE_CONFIG_DIR", "/CFG");
+            assert_eq!(w.detect(), Detection::NotConnected, "{os:?} case");
+        }
+    }
+
+    #[test]
+    fn r5_unixのcodexのconfig_tomlの場所() {
+        let toml = format!(
+            "[mcp_servers.toolport]\ncommand = '{UNIX_GATEWAY}'\nargs = []\n[mcp_servers.toolport.env]\nTOOLPORT_REGISTRY = '{UNIX_REGISTRY}'\n"
+        );
+        for os in [Os::MacOs, Os::Linux] {
+            let mut w = World::unix(os);
+            let home = w.home.clone().expect("home");
+            assert_eq!(w.detect_codex(), Detection::NotConnected, "{os:?} 無い");
+            w.put(&format!("{home}/.codex/config.toml"), &toml);
+            assert_eq!(w.detect_codex(), unix_served(), "{os:?} HOME");
+            w.put("/codex/config.toml", &toml);
+            w.remove(&format!("{home}/.codex/config.toml"));
+            w.var("CODEX_HOME", "/codex");
+            assert_eq!(w.detect_codex(), unix_served(), "{os:?} CODEX_HOME");
+            w.var("CODEX_HOME", "codex");
+            assert_eq!(w.detect_codex(), Detection::NotConnected, "{os:?} 相対");
+        }
+    }
+
+    #[test]
+    fn r6_unixのゲートウェイ候補は名前と実在で決める() {
+        let mac_helper = "/Applications/Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/MacOS/toolport-gateway";
+        let cases = [
+            (Os::Linux, "/opt/tp/toolport-gateway"),
+            (Os::Linux, "/opt/tp/bin/toolport-gateway-1.2.3"),
+            (Os::MacOs, "/opt/tp/toolport-gateway"),
+            (Os::MacOs, mac_helper),
+        ];
+        for (os, gateway) in cases {
+            let mut w = World::unix(os);
+            w.put(gateway, "");
+            w.gateway_unix(gateway);
+            assert_eq!(w.detect(), unix_served(), "{os:?} {gateway}");
+            // 実行ファイルが無い・相対パスは有効な候補ではない
+            w.remove(gateway);
+            assert_eq!(w.detect(), Detection::NotConnected, "{os:?} 実在しない");
+        }
+        let mut w = World::unix(Os::Linux);
+        w.gateway_unix("toolport-gateway");
+        assert_eq!(w.detect(), Detection::NotConnected);
+        // Unix では実在の照合が大文字小文字を区別する
+        w.gateway_unix("/opt/tp/Toolport-Gateway");
+        assert_eq!(w.detect(), Detection::NotConnected);
+    }
+
+    #[test]
+    fn r6_unixのclientmanagedentriesの正規化は大小を区別する() {
+        let mut w = World::unix(Os::Linux);
+        let home = w.home.clone().expect("home");
+        w.put("/opt/Tools/My Gate", "");
+        w.put_json(
+            &format!("{home}/.claude.json"),
+            &json!({"mcpServers": {"x": {"command": "/opt/Tools/My Gate", "env": {"TOOLPORT_REGISTRY": UNIX_REGISTRY}}}}),
+        );
+        w.var("TOOLPORT_REGISTRY", UNIX_REGISTRY);
+        w.registry_unix(|r| {
+            r["clientManagedEntries"] =
+                json!({"claude-code": {"command": r#" "/opt/Tools/My Gate" "#}})
+        });
+        assert_eq!(w.detect(), unix_served());
+        w.registry_unix(|r| {
+            r["clientManagedEntries"] = json!({"claude-code": {"command": "/opt/tools/my gate"}})
+        });
+        assert_eq!(w.detect(), Detection::NotConnected);
+    }
+
+    #[test]
+    fn r7_linuxの既定のregistryはxdg_config_home_無ければ_config() {
+        let xdg_registry = "/xdg/Toolport/registry.json";
+        let mut w = World::unix(Os::Linux);
+        w.unix_default_registry(LINUX_DEFAULT_REGISTRY);
+        assert_eq!(w.detect(), unix_served());
+        // 絶対パスの XDG_CONFIG_HOME が優先。置いていなければ見つからない
+        w.var("XDG_CONFIG_HOME", "/xdg");
+        assert!(is_unknown(&w.detect()));
+        let mut value = registry();
+        value["servers"][0]["command"] = json!(UNIX_PRODUCT_EXE);
+        w.put_json(xdg_registry, &value);
+        assert_eq!(w.detect(), unix_served());
+        // 相対パスと空文字は無視して ~/.config
+        for ignored in ["xdg", ""] {
+            w.var("XDG_CONFIG_HOME", ignored);
+            assert_eq!(w.detect(), unix_served(), "{ignored:?}");
+        }
+        assert_eq!(
+            product_server_ids(&PRODUCT, &w.env()),
+            vec!["s1".to_string()]
+        );
+        // ホームを決められなければ既定の場所も決められない
+        w.var("XDG_CONFIG_HOME", "");
+        w.home = None;
+        assert!(product_server_ids(&PRODUCT, &w.env()).is_empty());
+    }
+
+    #[test]
+    fn r7_macosの既定のregistryはapplication_support() {
+        let mut w = World::unix(Os::MacOs);
+        w.unix_default_registry(MAC_DEFAULT_REGISTRY);
+        assert_eq!(w.detect(), unix_served());
+        assert_eq!(
+            product_server_ids(&PRODUCT, &w.env()),
+            vec!["s1".to_string()]
+        );
+        // macOS は XDG_CONFIG_HOME を見ない
+        w.var("XDG_CONFIG_HOME", "/xdg");
+        assert_eq!(w.detect(), unix_served());
+        // Linux の既定の場所には読みに行かない
+        w.remove(MAC_DEFAULT_REGISTRY);
+        w.put_json(LINUX_DEFAULT_REGISTRY, &registry());
+        assert!(is_unknown(&w.detect()));
+    }
+
+    #[test]
+    fn r7_unixでconduitの登録だけがあればunknown() {
+        for (os, conduit) in [
+            (
+                Os::MacOs,
+                "/Users/u/Library/Application Support/Conduit/registry.json",
+            ),
+            (Os::Linux, "/home/u/.config/Conduit/registry.json"),
+        ] {
+            let mut w = World::unix(os);
+            let home = w.home.clone().expect("home");
+            w.put_json(
+                &format!("{home}/.claude.json"),
+                &json!({"mcpServers": {"toolport": {"command": UNIX_GATEWAY, "env": {}}}}),
+            );
+            w.remove(UNIX_REGISTRY);
+            w.put_json(conduit, &registry());
+            assert!(is_unknown(&w.detect()), "{os:?}");
+            assert!(product_server_ids(&PRODUCT, &w.env()).is_empty(), "{os:?}");
+            // どこにも無い
+            w.remove(conduit);
+            assert!(is_unknown(&w.detect()), "{os:?} 無い");
+        }
     }
 
     #[test]
@@ -1851,13 +2191,42 @@ mod tests {
 
     #[test]
     fn パスの補助() {
-        assert!(is_absolute(r"C:\a") && is_absolute("c:/a") && is_absolute(r"\\host\share"));
+        let w = Os::Windows;
         assert!(
-            !is_absolute("a") && !is_absolute(r"\a") && !is_absolute("C:a") && !is_absolute("")
+            is_absolute(w, r"C:\a") && is_absolute(w, "c:/a") && is_absolute(w, r"\\host\share")
         );
-        assert_eq!(join(r"C:\a\", "b"), r"C:\a\b");
-        assert_eq!(join("C:/", "b"), r"C:\b");
+        assert!(
+            !is_absolute(w, "a")
+                && !is_absolute(w, r"\a")
+                && !is_absolute(w, "C:a")
+                && !is_absolute(w, "")
+        );
+        assert_eq!(join(w, r"C:\a\", "b"), r"C:\a\b");
+        assert_eq!(join(w, "C:/", "b"), r"C:\b");
         assert_eq!(file_name_of(r"C:\a/b\c.exe"), "c.exe");
         assert_eq!(tool_prefix("a-b c_d9"), "a_b_c_d9");
+        assert_eq!(normalize_command(w, r#" "C:/A/b.EXE" "#), r"c:\a\b.exe");
+    }
+
+    #[test]
+    fn unixのパスの補助() {
+        for os in [Os::MacOs, Os::Linux] {
+            assert!(is_absolute(os, "/a") && is_absolute(os, "/"));
+            assert!(
+                !is_absolute(os, "a")
+                    && !is_absolute(os, "")
+                    && !is_absolute(os, r"C:\a")
+                    && !is_absolute(os, r"\\host\share")
+            );
+            assert_eq!(join(os, "/a/", "b"), "/a/b");
+            assert_eq!(join(os, "/", "b"), "/b");
+            assert_eq!(join(os, r"/a\", "b"), r"/a\/b");
+            assert_eq!(
+                normalize_command(os, r#" "/A/b c" "#),
+                "/A/b c",
+                "空白と引用符を除くだけ"
+            );
+            assert_eq!(normalize_command(os, r"C:\A/b"), r"C:\A/b");
+        }
     }
 }
